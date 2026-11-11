@@ -86,7 +86,10 @@ if args.xnu:
                 remove_oslog(nub)
 
 rvbar = entry & ~0xfff
-if rvbar != u.base:
+if not u.cpu_features.apple_sysregs_unlocked:
+    # RVBAR is locked to the entry point of the m1n1 that iBoot loaded (src/smp.c)
+    print("Secondary CPU RVBARs are locked, not writing them")
+elif rvbar != u.base:
     print("Setting secondary CPU RVBARs...")
 
     for cpu in u.adt["cpus"]:

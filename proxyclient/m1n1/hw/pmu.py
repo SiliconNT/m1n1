@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-import struct
+import os, struct
 
 from ..utils import *
 from .spmi import SPMI
@@ -26,6 +26,12 @@ class PMU:
         self.reg = u.adt[adt_path].reg[0]
 
     def reset_panic_counter(self):
+        # This is a write to the PMU that survives power-off, and every tool that
+        # imports m1n1.setup ends up here. Only do it when asked to.
+        if os.environ.get("M1N1_PMU_RESET") != "1":
+            print("PMU: boot error counters left alone (set M1N1_PMU_RESET=1 to clear them)")
+            return
+
         if self.primary and self.bus_type == "spmi":
             leg_scrpad = self.node.info_leg__scrpad[0]
             self.spmi.write8(self.reg, leg_scrpad + 2, 0) # error counts
