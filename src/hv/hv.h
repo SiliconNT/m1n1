@@ -83,6 +83,14 @@ bool hv_trace_irq(u32 type, u32 num, u32 count, u32 flags);
 void hv_aic_init(void);
 bool hv_aic_hook(void);
 
+/* Interrupts for a guest that expects a GICv3, through the virtual CPU interface */
+#define HV_VGIC_INTID_VTIMER 27   // PPI of the EL1 virtual timer
+#define HV_VGIC_PRIO_DEFAULT 0x80 // until the guest's priority registers are emulated
+void hv_vgic_init(void);
+bool hv_vgic_inject(u32 vintid, u8 priority);
+void hv_vgic_retract(u32 vintid);
+bool hv_vgic_handle_irq(void);
+
 /* AMCC interrupt filtering */
 bool hv_amcc_init(void);
 bool hv_amcc_handle_irq(u32 irq);

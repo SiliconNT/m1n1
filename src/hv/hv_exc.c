@@ -162,11 +162,17 @@ void hv_update_fiq(void)
         reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
     }
 
+    /*
+     * The guest's virtual timer is delivered as a GIC interrupt instead of a virtual FIQ.
+     * While its output is high the FIQ is kept off and the interrupt sits in a list register;
+     * once the guest has ended it and the output is still high, it is injected again.
+     */
     if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
-        fiq_pending = true;
         reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+        hv_vgic_inject(HV_VGIC_INTID_VTIMER, HV_VGIC_PRIO_DEFAULT);
     } else {
         reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+        hv_vgic_retract(HV_VGIC_INTID_VTIMER);
     }
 
     fiq_pending |= PERCPU(ipi_pending) || PERCPU(pmc_pending);
@@ -666,7 +672,9 @@ void hv_exc_irq(struct exc_info *ctx)
     hv_wdt_breadcrumb('I');
     hv_get_context(ctx);
     hv_exc_entry();
-    hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_IRQ, NULL);
+    /* With HCR_EL2.IMO set every physical IRQ lands here; the guest only sees list registers */
+    if (!hv_vgic_handle_irq())
+        hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_IRQ, NULL);
     hv_exc_exit(ctx);
     hv_wdt_breadcrumb('i');
 }

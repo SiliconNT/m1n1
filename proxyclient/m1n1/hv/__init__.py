@@ -1434,6 +1434,11 @@ class HV(Reloadable):
                 print(f"Disable iodev {iodev!s}")
                 self.p.iodev_set_usage(iodev, 0)
 
+        # hv_init() no longer starts the secondary CPUs by itself, so that a guest
+        # which only needs the boot CPU (self.smp = False) leaves them alone.
+        if self.smp:
+            self.p.smp_start_secondaries()
+
         print("Initializing hypervisor over iodev %s" % self.iodev)
         self.p.hv_sptm_set_mode(self.sptm_mode)
         self.p.hv_init()
@@ -1469,7 +1474,8 @@ class HV(Reloadable):
         hcr.TIDCP = 0
         hcr.TVM = 0
         hcr.FMO = 1
-        hcr.IMO = 0
+        # IRQs go to EL2 (src/hv/hv_vgic.c); the guest gets GIC virtual interrupts
+        hcr.IMO = 1
         hcr.TTLBOS = 1
         self.u.msr(HCR_EL2, hcr.value)
 

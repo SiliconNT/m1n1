@@ -145,7 +145,7 @@ void hv_init(void)
         display_shutdown(DCP_QUIESCED);
     // reenable hpm interrupts for the guest for unused iodevs
     usb_hpm_restore_irqs(0);
-    smp_start_secondaries();
+    // The secondary CPUs are started by the host before this, if it wants them at all
     smp_set_wfe_mode(true);
     hv_wdt_init();
 
@@ -160,8 +160,11 @@ void hv_init(void)
                  HCR_E2H | // VHE mode (forced)
                  HCR_RW |  // AArch64 guest
                  HCR_AMO | // Trap SError exceptions
+                 HCR_IMO | // Take IRQs to EL2, the guest gets them as virtual interrupts
                  HCR_VM);  // Enable stage 2 translation
     sysop("isb");
+
+    hv_vgic_init();
 
     if (hv_sptm_mode == SPTM_EMULATION) {
         hv_write_hcr(mrs(HCR_EL2) | HCR_EnSCXT);
@@ -326,6 +329,8 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     msr(MDCR_EL2, info->mdcr);
     msr(MDSCR_EL1, info->mdscr);
 
+    hv_vgic_init();
+
     if (cpu_features->apple_sysregs_unlocked) {
         msr(SYS_IMP_APL_AMX_CTL_EL2, info->amx_ctl);
         msr(SYS_IMP_APL_APVMKEYLO_EL2, info->apvmkeylo);
@@ -384,6 +389,11 @@ static void hv_enter_secondary(void *entry, u64 regs[4])
 
 void hv_start_secondary(int cpu, void *entry, u64 regs[4])
 {
+    if (!smp_is_alive(cpu)) {
+        printf("HV: CPU %d is not running m1n1, cannot enter the guest on it\n", cpu);
+        return;
+    }
+
     printf("HV: Initializing secondary %d\n", cpu);
     iodev_console_flush();
 

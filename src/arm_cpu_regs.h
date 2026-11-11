@@ -190,6 +190,57 @@
 
 #define HACR_TRAP_GENTER BIT(29)
 
+/* GICv3 virtualization control registers, Arm IHI 0069H.b section 12.4 */
+#define SYS_ICC_SRE_EL2 sys_reg(3, 4, 12, 9, 5)
+#define ICC_SRE_ENABLE  BIT(3)
+#define ICC_SRE_SRE     BIT(0)
+
+#define SYS_ICH_AP0R0_EL2 sys_reg(3, 4, 12, 8, 0)
+#define SYS_ICH_AP0R1_EL2 sys_reg(3, 4, 12, 8, 1)
+#define SYS_ICH_AP0R2_EL2 sys_reg(3, 4, 12, 8, 2)
+#define SYS_ICH_AP0R3_EL2 sys_reg(3, 4, 12, 8, 3)
+#define SYS_ICH_AP1R0_EL2 sys_reg(3, 4, 12, 9, 0)
+#define SYS_ICH_AP1R1_EL2 sys_reg(3, 4, 12, 9, 1)
+#define SYS_ICH_AP1R2_EL2 sys_reg(3, 4, 12, 9, 2)
+#define SYS_ICH_AP1R3_EL2 sys_reg(3, 4, 12, 9, 3)
+
+#define SYS_ICH_HCR_EL2 sys_reg(3, 4, 12, 11, 0)
+#define ICH_HCR_EN      BIT(0)
+
+#define SYS_ICH_VTR_EL2  sys_reg(3, 4, 12, 11, 1)
+#define ICH_VTR_PREBITS  GENMASK(28, 26)
+#define ICH_VTR_LISTREGS GENMASK(4, 0)
+
+#define SYS_ICH_MISR_EL2  sys_reg(3, 4, 12, 11, 2)
+#define SYS_ICH_EISR_EL2  sys_reg(3, 4, 12, 11, 3)
+#define SYS_ICH_ELRSR_EL2 sys_reg(3, 4, 12, 11, 5)
+#define SYS_ICH_VMCR_EL2  sys_reg(3, 4, 12, 11, 7)
+
+#define SYS_ICH_LR0_EL2  sys_reg(3, 4, 12, 12, 0)
+#define SYS_ICH_LR1_EL2  sys_reg(3, 4, 12, 12, 1)
+#define SYS_ICH_LR2_EL2  sys_reg(3, 4, 12, 12, 2)
+#define SYS_ICH_LR3_EL2  sys_reg(3, 4, 12, 12, 3)
+#define SYS_ICH_LR4_EL2  sys_reg(3, 4, 12, 12, 4)
+#define SYS_ICH_LR5_EL2  sys_reg(3, 4, 12, 12, 5)
+#define SYS_ICH_LR6_EL2  sys_reg(3, 4, 12, 12, 6)
+#define SYS_ICH_LR7_EL2  sys_reg(3, 4, 12, 12, 7)
+#define SYS_ICH_LR8_EL2  sys_reg(3, 4, 12, 13, 0)
+#define SYS_ICH_LR9_EL2  sys_reg(3, 4, 12, 13, 1)
+#define SYS_ICH_LR10_EL2 sys_reg(3, 4, 12, 13, 2)
+#define SYS_ICH_LR11_EL2 sys_reg(3, 4, 12, 13, 3)
+#define SYS_ICH_LR12_EL2 sys_reg(3, 4, 12, 13, 4)
+#define SYS_ICH_LR13_EL2 sys_reg(3, 4, 12, 13, 5)
+#define SYS_ICH_LR14_EL2 sys_reg(3, 4, 12, 13, 6)
+#define SYS_ICH_LR15_EL2 sys_reg(3, 4, 12, 13, 7)
+
+#define ICH_LR_STATE         GENMASK(63, 62)
+#define ICH_LR_STATE_PENDING 1
+#define ICH_LR_HW            BIT(61)
+#define ICH_LR_GROUP1        BIT(60)
+#define ICH_LR_PRIORITY      GENMASK(55, 48)
+#define ICH_LR_EOI           BIT(41) // only when HW == 0
+#define ICH_LR_VINTID        GENMASK(31, 0)
+
 #define SYS_ID_AA64PFR1_EL1 sys_reg(3, 0, 0, 4, 1)
 #define ID_AA64PFR1_MTE     GENMASK(11, 8)
 #define ID_AA64PFR1_MTE2    2
