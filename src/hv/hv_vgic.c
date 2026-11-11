@@ -25,6 +25,8 @@
 
 /* IRQs that arrive with neither an AIC event nor a maintenance interrupt, before giving up */
 #define VGIC_SPURIOUS_LIMIT 16
+/* AIC events without a GIC interrupt, before giving up: more than there are AIC lines */
+#define VGIC_UNMAPPED_LIMIT (2 * AIC_MAX_HW_NUM)
 
 struct hv_vgic_pcpu {
     u64 injected;
@@ -264,12 +266,14 @@ bool hv_vgic_handle_irq(void)
         if (FIELD_GET(AIC_EVENT_TYPE, event)) {
             /*
              * No AIC line is forwarded to the guest yet, so every line stays masked once it
-             * has fired.
+             * has fired. If they keep coming anyway, the masking did not work: stop.
              */
             handled = true;
             if (vgic_should_log(++VGIC_PERCPU(unmapped)))
                 printf("HV: vGIC: CPU %d: AIC event 0x%x has no GIC interrupt, left masked (#%ld)\n",
                        smp_id(), event, VGIC_PERCPU(unmapped));
+            if (VGIC_PERCPU(unmapped) >= VGIC_UNMAPPED_LIMIT)
+                return false;
         }
     }
 
