@@ -22,6 +22,10 @@ parser.add_argument("--shell", action="store_true",
                     help="interactive hypervisor shell on ^C or on a guest exception")
 parser.add_argument("--seconds", type=int, default=20,
                     help="how long the guest may run before it is stopped (default 20)")
+parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "build" / "m1n1.bin",
+                    help="the raw m1n1.bin that is supposed to be running on the target")
+parser.add_argument("--check-only", action="store_true",
+                    help="only check which m1n1 is running on the target, then exit")
 parser.add_argument("payload", type=pathlib.Path, nargs="?",
                     default=HERE / "build" / "irqtest.bin")
 args = parser.parse_args()
@@ -44,12 +48,34 @@ from m1n1.sysreg import *
 from m1n1.hv import HV
 from m1n1.hw.pmu import PMU
 
+# Where the version string sits in the image, and what it says in this build. The raw image
+# is loaded as it is, so an offset into the file is an offset from the base in memory. (An
+# m1n1 chainloaded from m1n1.macho has another layout and fails this check; on a machine
+# with locked RVBARs it must not be used anyway.)
+VERSION_MARK = b"##m1n1_ver##"
+m1n1_image = args.m1n1.read_bytes()
+version_off = m1n1_image.find(VERSION_MARK)
+if version_off < 0:
+    sys.exit(f"{args.m1n1}: no version string")
+version_want = m1n1_image[version_off:m1n1_image.index(b"\0", version_off)]
+
 iface = UartInterface()
 p = M1N1Proxy(iface, debug=False)
 bootstrap_port(iface, p)
 
 u = ProxyUtils(p, heap_size=128 * 1024 * 1024,
                m1n1_heap=128 * 1024 * 1024)
+
+# An m1n1 without the changes of this tree would start the secondary CPUs in hv_init() and
+# hand IRQs to the guest. Make sure it is this build before going anywhere near that.
+version_got = iface.readmem(u.base + version_off, len(version_want))
+print(f"m1n1 expected: {version_want[len(VERSION_MARK):].decode()}")
+print(f"m1n1 running:  {version_got[len(VERSION_MARK):].decode(errors='replace')!r}")
+if version_got != version_want:
+    sys.exit("The m1n1 on the target is not the one built from this tree: "
+             "chainload build/m1n1.bin first (chainload.py -r)")
+if args.check_only:
+    sys.exit(0)
 
 hv = HV(iface, p, u)
 # Boot CPU only: the secondary CPUs are neither started nor shown to the guest
