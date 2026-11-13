@@ -469,6 +469,19 @@ static void tests_delivery(void)
     pending = (rd32(gicr + GICR_ISPENDR0) >> SGI_A) & 1;
     result("SGI enabled: delivered once, no longer pending", 0, n == 1 && !pending);
 
+    /* Disabled while it already waits at the CPU interface: it has to be taken back */
+    irq_mask();
+    send_sgi(sgi_to(0, SGI_A));
+    delay_ms(1);
+    wr32(gicr + GICR_ICENABLER0, 1 << SGI_A);
+    irq_unmask();
+    n = wait_took(0, SGI_A, QUIET_MS);
+    pending = (rd32(gicr + GICR_ISPENDR0) >> SGI_A) & 1;
+    wr32(gicr + GICR_ISENABLER0, 1 << SGI_A);
+    m = wait_took(0, SGI_A, SOON_MS);
+    result("SGI disabled while pending with IRQs masked: stays pending, delivered once enabled", 0,
+           n == 0 && pending && m == 1);
+
     /* Two priorities and the priority mask of the CPU interface */
     wr8(gicr + GICR_IPRIORITYR + SGI_LOW, 0xa0);
     wr8(gicr + GICR_IPRIORITYR + SGI_HIGH, 0x40);
