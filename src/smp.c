@@ -456,6 +456,33 @@ void smp_start_secondaries(void)
     }
 }
 
+/*
+ * Start a single secondary CPU. Unlike smp_start_secondaries() this refuses when the core
+ * would not come up in this image, which is the case after chainloading an image with a
+ * different layout on a machine whose RVBARs are locked.
+ */
+bool smp_start_secondary(int cpu)
+{
+    if (!smp_initialized || cpu < 0 || cpu >= MAX_CPUS || cpu == boot_cpu_idx ||
+        !cpu_info[cpu].valid) {
+        printf("CPU %d cannot be started\n", cpu);
+        return false;
+    }
+
+    u64 rvbar = read64(cpu_info[cpu].impl_reg);
+
+    if (!cpu_features->apple_sysregs_unlocked && (rvbar & RVBAR_ADDR) != (u64)_vectors_start) {
+        printf("Not starting CPU %d: RVBAR (=0x%lx) is locked and differs from entry point "
+               "(=0x%lx)\n",
+               cpu, rvbar & RVBAR_ADDR, (u64)_vectors_start);
+        return false;
+    }
+
+    smp_start_cpu(cpu, &cpu_info[cpu]);
+
+    return smp_is_alive(cpu);
+}
+
 void smp_stop_secondaries(bool deep_sleep)
 {
     printf("Stopping secondary CPUs...\n");
