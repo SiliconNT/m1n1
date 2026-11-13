@@ -346,7 +346,8 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         /*
          * GICv3 SGIs. This register has no virtual counterpart, so every write by the guest
          * traps. The targets get the SGI through their list registers; hv_update_fiq() on the
-         * way out takes care of the ones for this core. A read is left to hv_exc_sync().
+         * way out takes care of the ones for this core. The register is write-only; on the M4
+         * the CPU itself makes a read UNDEFINED at EL1, so one that gets here is not expected.
          */
         case SYSREG_ISS(SYS_ICC_SGI1R_EL1):
             if (is_read)
@@ -477,60 +478,6 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
     }
 
     return hv_sprr_handle_msr(ctx, reg, rt, is_read);
-}
-
-/*
- * A read of a write-only register is UNDEFINED. ICC_SGI1R_EL1 is one: only the MSR form
- * exists (IHI 0069H.b 12.2.22; "WO" in DDI 0487 M.d D23.3).
- */
-static bool hv_msr_is_undefined(u64 iss)
-{
-    u64 reg = iss & (ESR_ISS_MSR_OP0 | ESR_ISS_MSR_OP2 | ESR_ISS_MSR_OP1 | ESR_ISS_MSR_CRn |
-                     ESR_ISS_MSR_CRm);
-
-    return reg == SYSREG_ISS(SYS_ICC_SGI1R_EL1) && (iss & ESR_ISS_MSR_DIR);
-}
-
-/*
- * Make the guest take the exception it would have taken had the instruction that trapped
- * been UNDEFINED at EL1: a synchronous exception to EL1h with an unknown reason. Of the
- * PSTATE bits an exception entry sets from SCTLR_EL1, only PAN and SSBS are done.
- */
-static bool hv_inject_undef(struct exc_info *ctx)
-{
-    u64 vector;
-
-    switch (FIELD_GET(SPSR_M, ctx->spsr)) {
-        case SPSR_M_EL1T:
-            vector = 0x000;
-            break;
-        case SPSR_M_EL1H:
-            vector = 0x200;
-            break;
-        default:
-            return false;
-    }
-
-    u64 sctlr = mrs(SYS_SCTLR_EL12);
-    u64 pstate = ctx->spsr & (SPSR_N | SPSR_Z | SPSR_C | SPSR_V | SPSR_DIT | SPSR_PAN);
-
-    pstate |= SPSR_D | SPSR_A | SPSR_I | SPSR_F | SPSR_M_EL1H;
-    if (supports_pan() && !(sctlr & SCTLR_SPAN))
-        pstate |= SPSR_PAN;
-    if (sctlr & SCTLR_DSSBS)
-        pstate |= SPSR_SSBS;
-
-    msr(ELR_EL12, ctx->elr);
-    msr(SPSR_EL12, ctx->spsr);
-    msr(SYS_ESR_EL12, FIELD_PREP(ESR_EC, ESR_EC_UNKNOWN) | ESR_IL);
-
-    printf("HV: CPU %d: UNDEFINED system register read at 0x%lx (ISS 0x%lx), given to the guest\n",
-           smp_id(), ctx->elr, FIELD_GET(ESR_ISS, ctx->esr));
-
-    ctx->elr = mrs(VBAR_EL12) + vector;
-    ctx->spsr = pstate;
-
-    return true;
 }
 
 static void hv_get_context(struct exc_info *ctx)
@@ -677,10 +624,7 @@ bool hv_exc_sync(struct exc_info *ctx)
             break;
         case ESR_EC_MSR:
             hv_wdt_breadcrumb('M');
-            if (hv_msr_is_undefined(FIELD_GET(ESR_ISS, ctx->esr)))
-                handled = protect_elr = hv_inject_undef(ctx);
-            else
-                handled = hv_handle_msr(ctx, FIELD_GET(ESR_ISS, ctx->esr));
+            handled = hv_handle_msr(ctx, FIELD_GET(ESR_ISS, ctx->esr));
             break;
         case ESR_EC_ERET:
             hv_wdt_breadcrumb('N');
