@@ -311,6 +311,7 @@ void hv_start(void *entry, u64 regs[4])
     }
 
     printf("HV: All CPUs exited\n");
+    hv_vgic_report();
     spin_unlock(&bhl);
 }
 

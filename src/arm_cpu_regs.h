@@ -235,11 +235,22 @@
 
 #define ICH_LR_STATE         GENMASK(63, 62)
 #define ICH_LR_STATE_PENDING 1
+#define ICH_LR_STATE_ACTIVE  2
 #define ICH_LR_HW            BIT(61)
 #define ICH_LR_GROUP1        BIT(60)
 #define ICH_LR_PRIORITY      GENMASK(55, 48)
 #define ICH_LR_EOI           BIT(41) // only when HW == 0
 #define ICH_LR_VINTID        GENMASK(31, 0)
+
+/* Write-only, and without a virtual counterpart: Arm IHI 0069H.b section 12.2.22 */
+#define SYS_ICC_SGI1R_EL1    sys_reg(3, 0, 12, 11, 5)
+#define ICC_SGI1R_AFF3       GENMASK(55, 48)
+#define ICC_SGI1R_RS         GENMASK(47, 44)
+#define ICC_SGI1R_IRM        BIT(40)
+#define ICC_SGI1R_AFF2       GENMASK(39, 32)
+#define ICC_SGI1R_INTID      GENMASK(27, 24)
+#define ICC_SGI1R_AFF1       GENMASK(23, 16)
+#define ICC_SGI1R_TARGETLIST GENMASK(15, 0)
 
 #define SYS_ID_AA64PFR1_EL1 sys_reg(3, 0, 0, 4, 1)
 #define ID_AA64PFR1_MTE     GENMASK(11, 8)

@@ -175,6 +175,9 @@ void hv_update_fiq(void)
         hv_vgic_retract(HV_VGIC_INTID_VTIMER);
     }
 
+    /* SGIs the guest sent to this core, from here or from another core */
+    hv_vgic_deliver_sgis();
+
     fiq_pending |= PERCPU(ipi_pending) || PERCPU(pmc_pending);
     fiq_pending |= hv_sprr_timer_pending();
 
@@ -338,6 +341,17 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 regs[rt] = PERCPU(ipi_pending) ? IPI_SR_PENDING : 0;
             else if (regs[rt] & IPI_SR_PENDING)
                 PERCPU(ipi_pending) = false;
+            return true;
+
+        /*
+         * GICv3 SGIs. This register has no virtual counterpart, so every write by the guest
+         * traps. The targets get the SGI through their list registers; hv_update_fiq() on the
+         * way out takes care of the ones for this core.
+         */
+        case SYSREG_ISS(SYS_ICC_SGI1R_EL1):
+            if (is_read)
+                return false;
+            hv_vgic_send_sgi(regs[rt]);
             return true;
 
         /* the hypervisor needs this one for breakpoints and single-stepping */
