@@ -7,6 +7,11 @@
 #define SYS_ACTLR_EL3  sys_reg(3, 6, 1, 0, 1)
 #define SYS_ACTLR_EL12 sys_reg(3, 5, 1, 0, 1)
 
+/* ISR_EL1: at EL2 these are the physical interrupts, pending whether masked or not */
+#define ISR_A BIT(8)
+#define ISR_I BIT(7)
+#define ISR_F BIT(6)
+
 #define SYS_CNTHCTL_EL2 sys_reg(3, 4, 14, 1, 0)
 // HCR_EL2.E2H == 1
 #define CNTHCTL_EVNTIS   BIT(17)
@@ -84,6 +89,13 @@
 #define ESR_EC_WATCH_LOWER  0b110100
 #define ESR_EC_WATCH        0b110101
 #define ESR_EC_BRK          0b111100
+
+/* Trapped WFI, WFE, WFIT or WFET: which of them */
+#define ESR_ISS_WFx_TI      GENMASK(1, 0)
+#define ESR_ISS_WFx_TI_WFI  0
+#define ESR_ISS_WFx_TI_WFE  1
+#define ESR_ISS_WFx_TI_WFIT 2
+#define ESR_ISS_WFx_TI_WFET 3
 
 #define ESR_ISS_DABORT_ISV   BIT(24)
 #define ESR_ISS_DABORT_SAS   GENMASK(23, 22)

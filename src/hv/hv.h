@@ -98,7 +98,13 @@ void hv_vgic_ppi_level(u32 intid, bool high);
 bool hv_vgic_handle_irq(void);
 void hv_vgic_send_sgi(u64 val);
 void hv_vgic_deliver(void);
+bool hv_vgic_irq_waiting(void);
 void hv_vgic_report(void);
+
+/* WFI of the guest: trapped, the core waits in EL2 */
+void hv_wfi_init(void);
+bool hv_handle_wfx(u64 iss);
+void hv_wfi_report(void);
 
 /* AMCC interrupt filtering */
 bool hv_amcc_init(void);

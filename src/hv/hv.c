@@ -161,6 +161,7 @@ void hv_init(void)
                  HCR_RW |  // AArch64 guest
                  HCR_AMO | // Trap SError exceptions
                  HCR_IMO | // Take IRQs to EL2, the guest gets them as virtual interrupts
+                 HCR_TWI | // Trap WFI: the core waits in EL2, see hv_wfi.c
                  HCR_VM);  // Enable stage 2 translation
     sysop("isb");
 
@@ -201,6 +202,9 @@ void hv_init(void)
 
         hv_secondary_tick_interval = hv_tick_interval;
     }
+
+    // After CNTHCTL_EL2 has been set up above: this adds the event stream
+    hv_wfi_init();
 
     // Set deep WFI back to defaults
     if (cpu_features->apple_sysregs_unlocked)
@@ -312,6 +316,7 @@ void hv_start(void *entry, u64 regs[4])
 
     printf("HV: All CPUs exited\n");
     hv_vgic_report();
+    hv_wfi_report();
     spin_unlock(&bhl);
 }
 

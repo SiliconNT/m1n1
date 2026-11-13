@@ -648,6 +648,10 @@ bool hv_exc_sync(struct exc_info *ctx)
                         handled = protect_elr = true;
             }
             break;
+        case ESR_EC_WFI:
+            hv_wdt_breadcrumb('W');
+            handled = hv_handle_wfx(FIELD_GET(ESR_ISS, ctx->esr));
+            break;
         case ESR_EC_HVC:
             hv_wdt_breadcrumb('H');
             handled = hv_hvc_dispatch(ctx, FIELD_GET(ESR_ISS, ctx->esr));

@@ -765,6 +765,35 @@ void hv_vgic_deliver(void)
         vgic_deliver_spis();
 }
 
+/*
+ * Is there an interrupt for the guest on this core that it would wake up from WFI for? Called
+ * after hv_vgic_deliver(), when the guest has executed WFI.
+ *
+ * Yes if a list register holds one that is pending, or if one that is pending and enabled did
+ * not get a list register. That is more than a GIC would wake the guest up for (it would not
+ * for a priority below ICC_PMR_EL1, nor with ICC_IGRPEN1_EL1 clear); the guest then simply
+ * executes its WFI again. An interrupt that is pending and not enabled is no reason, as with a
+ * GIC: whoever enables it calls this core into EL2 (vgic_kick()).
+ */
+bool hv_vgic_irq_waiting(void)
+{
+    int nr_lr = vgic_nr_lr();
+
+    for (int i = 0; i < nr_lr; i++)
+        if (FIELD_GET(ICH_LR_STATE, vgic_read_lr(i)) & ICH_LR_STATE_PENDING)
+            return true;
+
+    /* No list register was free, and only the guest can free one */
+    if (VGIC_PERCPU(spi_left))
+        return true;
+    if (vgic_grp1_enabled() && (__atomic_load_n(&VGIC_PERCPU(sgi_pending), __ATOMIC_SEQ_CST) &
+                                vgic_load(VGIC_PERCPU(enable))))
+        return true;
+
+    /* Something changed since hv_vgic_deliver() looked */
+    return __atomic_load_n(&VGIC_PERCPU(kick), __ATOMIC_SEQ_CST);
+}
+
 /* ---- The Distributor and the Redistributors as the guest sees them ---- */
 
 /* The interrupts that exist in one word of the Distributor's bitmaps */
