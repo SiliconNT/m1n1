@@ -460,6 +460,15 @@ bool hv_switch_cpu(int cpu)
     }
     printf("HV: switching to CPU #%d\n", cpu);
     hv_want_cpu = cpu;
+    /*
+     * hv_rendezvous() only sends IPIs while some core is in the guest. A core that waits out a
+     * WFI of its guest in EL2 (hv_wfi.c) is not, and would only look at hv_want_cpu at its
+     * next tick.
+     */
+    if (cpu != smp_id()) {
+        sysop("dsb ishst");
+        smp_send_ipi(cpu);
+    }
     hv_rendezvous();
     return true;
 }

@@ -9,8 +9,7 @@
  *
  * It waits with WFE, which keeps the state of the core ("when a WFE or WFET instruction is
  * executed, memory coherency and architectural state are not lost", Arm DDI 0487 M.d D1.7.1),
- * and with IRQs and FIQs masked, as everywhere in the hypervisor. Nothing is taken or
- * acknowledged here: the wait ends as soon as ISR_EL1 shows a physical interrupt, and the
+ * and with IRQs, FIQs and SErrors masked. Nothing is taken or acknowledged here: the wait ends as soon as ISR_EL1 shows a physical interrupt, and the
  * core takes that interrupt the usual way once it is back in the guest.
  *
  * Every source is a level that stays up until its handler has dealt with it, so looking at
@@ -127,8 +126,14 @@ bool hv_handle_wfx(u64 iss)
      *
      * The core is not in the guest (hv_exc_entry()) and must not keep the others out of the
      * hypervisor while it waits.
+     *
+     * SErrors are masked for the wait, like IRQs and FIQs. One that the hypervisor takes in
+     * EL2 ends in m1n1's own handler, which reboots the machine; one that is pending when the
+     * core is back in the guest goes to hv_exc_serr() and the host, as it did when the guest
+     * spent its idle time in WFI itself.
      */
     spin_unlock(&bhl);
+    sysop("msr daifset, 4");
 
     p->waits++;
     start = mrs(CNTPCT_EL0);
@@ -141,6 +146,9 @@ bool hv_handle_wfx(u64 iss)
     if (ticks > p->longest)
         p->longest = ticks;
 
+    /* As in hv_exc_entry(): SErrors back on in the hypervisor, unless one is pending */
+    if (!(mrs(ISR_EL1) & ISR_A))
+        sysop("msr daifclr, 4");
     spin_lock(&bhl);
     return true;
 }

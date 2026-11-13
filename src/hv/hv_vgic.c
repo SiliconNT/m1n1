@@ -778,16 +778,25 @@ void hv_vgic_deliver(void)
 bool hv_vgic_irq_waiting(void)
 {
     int nr_lr = vgic_nr_lr();
+    /* PPIs whose source is high: each has to be in a list register, or it is waiting for one */
+    u32 local = vgic_load(VGIC_PERCPU(ppi_level));
 
-    for (int i = 0; i < nr_lr; i++)
-        if (FIELD_GET(ICH_LR_STATE, vgic_read_lr(i)) & ICH_LR_STATE_PENDING)
+    for (int i = 0; i < nr_lr; i++) {
+        u64 lr = vgic_read_lr(i);
+        u64 state = FIELD_GET(ICH_LR_STATE, lr);
+        u32 intid = FIELD_GET(ICH_LR_VINTID, lr);
+
+        if (state & ICH_LR_STATE_PENDING)
             return true;
+        if (state && intid < VGIC_NR_LOCAL)
+            local &= ~BIT(intid);
+    }
 
     /* No list register was free, and only the guest can free one */
     if (VGIC_PERCPU(spi_left))
         return true;
-    if (vgic_grp1_enabled() && (__atomic_load_n(&VGIC_PERCPU(sgi_pending), __ATOMIC_SEQ_CST) &
-                                vgic_load(VGIC_PERCPU(enable))))
+    local |= __atomic_load_n(&VGIC_PERCPU(sgi_pending), __ATOMIC_SEQ_CST);
+    if (vgic_grp1_enabled() && (local & vgic_load(VGIC_PERCPU(enable))))
         return true;
 
     /* Something changed since hv_vgic_deliver() looked */
