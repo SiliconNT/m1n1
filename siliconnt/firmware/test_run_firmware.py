@@ -51,7 +51,7 @@ def make_fakes(case):
     """Fresh stand-in modules for one run. case: dict of overrides."""
     m1n1_image = M1N1_BIN.read_bytes()
     rec = types.SimpleNamespace(loaded=None, bootargs_top=None, hv_start=None, stopped=None,
-                                hv_inited=False, memory_map=None)
+                                hv_inited=False, memory_map=None, context_printed=False)
     heap_top = case.get("heap_top", M4["heap_top"])
 
     memory_map = FakeNode(**{
@@ -82,6 +82,10 @@ def make_fakes(case):
     class EXC_RET:
         EXIT_GUEST = "EXIT_GUEST"
 
+    class START:
+        HV = "HV"
+        EXCEPTION_LOWER = "EXCEPTION_LOWER"
+
     video = types.SimpleNamespace(base=case.get("fb_base", M4["fb_base"]), stride=M4["fb_stride"],
                                   width=M4["fb_width"], height=M4["fb_height"])
     ba = types.SimpleNamespace(phys_base=M4["ba_phys_base"], mem_size=M4["ba_mem_size"],
@@ -98,9 +102,15 @@ def make_fakes(case):
                 sysreg.CNTHCTL_EL2: 4,
                 sysreg.ICH_HCR_EL2: 1,
                 sysreg.ICH_VTR_EL2: 0x90580007,
+                # docs/lab/2026-11-11-r1-r2-plan/r1.txt, line 8
+                sysreg.SCTLR_EL12: case.get("sctlr_el1", 0x30d50980),
+                sysreg.CPACR_EL12: 0,
             }
         def mrs(self, reg):
             return self.regs.get(reg, 0)
+        def print_context(self, ctx, is_fault=True):
+            rec.context_printed = True
+            print(f"  ELR    = 0x{ctx.elr:x}")
 
     class HV:
         def __init__(self, iface, p, u):
@@ -130,6 +140,9 @@ def make_fakes(case):
             os.write(rec.master, b"Apple Silicon Project Mu Firmware (arm64/arm64e)\r\n"
                                  b"If you can see this")
             time.sleep(0.5)  # let the serial reader see it
+            # Stopped inside the image, by the timer or by an exception nobody handled
+            self.ctx = types.SimpleNamespace(elr=self.entry + 0x8600)
+            self.exc_reason = case.get("stop_reason", START.HV)
             rec.stopped = self.run_shell()
 
     class PMU:
@@ -139,7 +152,8 @@ def make_fakes(case):
             pass
 
     mods = {
-        "m1n1.proxy": dict(UartInterface=UartInterface, M1N1Proxy=M1N1Proxy, EXC_RET=EXC_RET),
+        "m1n1.proxy": dict(UartInterface=UartInterface, M1N1Proxy=M1N1Proxy, EXC_RET=EXC_RET,
+                           START=START),
         "m1n1.proxyutils": dict(ProxyUtils=ProxyUtils, bootstrap_port=lambda iface, p: None),
         "m1n1.hv": dict(HV=HV),
         "m1n1.hw": dict(),
@@ -197,6 +211,8 @@ check("check-only does not initialize the hypervisor", not rec.hv_inited)
 check("check-only prints the image base", f"firmware image       0x{IMAGE_BASE:x}" in out, out)
 check("check-only marks nothing inside guest RAM", "\n  * " not in out, out)
 check("16-byte memory-map entry was read", "preoslog" in out and "Something-odd" not in out)
+check("check-only prints the EL1 state the firmware starts in",
+      "SCTLR_EL12 = 0x30d50980 (M=0 C=0 I=0)" in out and "CPACR_EL12 = 0x0 (FPEN=0)" in out, out)
 
 # 2. the whole run
 rec, out, code = run({}, "--seconds", "30", *image_args)
@@ -215,6 +231,13 @@ check("memory-map DeviceTree and BootArgs updated",
       rec.memory_map.BootArgs == (BOOTARGS, 0x4000))
 check("everything below the firmware work area", BOOTARGS + 0x4000 <= MEM_TOP - 0x8000000)
 check("a stop leaves the guest", rec.stopped == "EXIT_GUEST")
+check("a stop by the timer says where the firmware was and prints the context",
+      f"Firmware stopped at PC 0x{IMAGE_BASE + 0x8600:x} (firmware image + 0x8600)" in out and
+      rec.context_printed, out[-900:])
+check("the final dump has the firmware's own exception registers",
+      all(f"{name:18s} = 0x" in out.split("==== firmware stopped ====")[-1]
+          for name in ("ELR_EL12", "ESR_EL12", "FAR_EL12", "SPSR_EL12", "CPACR_EL12", "SP_EL1")),
+      out[-1500:])
 check("firmware output is shown, complete lines and the unfinished last one",
       "FW> Apple Silicon Project Mu Firmware (arm64/arm64e)\n" in out and
       "FW> If you can see this\n" in out, out[-600:])
@@ -248,6 +271,17 @@ check("another m1n1 stops the run", code != 0 and not rec.hv_inited and rec.load
 rec, out, code = run({"heap_top": MEM_TOP - 0x8000000 - (40 << 20)}, *image_args)
 check("no room below the work area stops the run",
       code != 0 and "PROBLEM" in out and rec.loaded is None, out[-600:])
+
+# 9. stopped by an exception: HV.handle_exception() has printed the context, not again
+rec, out, code = run({"stop_reason": "EXCEPTION_LOWER"}, "--seconds", "30", *image_args)
+check("a stop by an exception does not print the context a second time",
+      code == 0 and "Firmware stopped at PC" in out and not rec.context_printed, out[-900:])
+
+# 10. EL1 MMU left on
+rec, out, code = run({"sctlr_el1": 0x30d50981}, *image_args)
+check("EL1 MMU on stops the run",
+      code != 0 and "PROBLEM: the EL1 MMU is on" in out and rec.loaded is None and
+      not rec.hv_inited, out[-600:])
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)

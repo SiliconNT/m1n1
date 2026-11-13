@@ -25,15 +25,21 @@ SEPFW, the trust cache and the preoslog buffer, which HV.load_raw() copies for m
 not copied: the firmware reads none of them.
 
 Before anything is written to the target, the script checks that these ranges fit in guest
-RAM, that the framebuffer lies outside it, and that nothing iBoot listed in
-/chosen/memory-map overlaps them. --check-only stops there.
+RAM, that the framebuffer lies outside it, that nothing iBoot listed in
+/chosen/memory-map overlaps them, and that the EL1 MMU is off, which the entry code
+expects. --check-only stops there.
 
 The firmware prints on the hypervisor's virtual UART. That goes to the secondary USB
 serial port (/dev/m1n1-sec), which this script reads and prints with a "FW> " prefix.
 
 The script needs no input: it lets the firmware run for --seconds, then interrupts the
-hypervisor, prints the list registers, leaves the guest and exits. An unhandled guest
-exception ends the run the same way.
+hypervisor, prints where the firmware was and the registers that tell what it was doing,
+leaves the guest and exits. An unhandled guest exception ends the run the same way.
+
+Until the firmware's CpuDxe driver installs exception vectors, VBAR_EL1 is 0 (hv_init()).
+An exception the firmware takes itself before that shows up as an instruction abort at
+0x200 that the hypervisor cannot handle; ELR_EL12, ESR_EL12 and FAR_EL12 in the final
+dump then describe the original exception.
 """
 import sys, os, pathlib, argparse, signal, struct, threading, hashlib
 
@@ -200,6 +206,23 @@ for name, value in sorted(u.adt["chosen"]["memory-map"]._properties.items()):
         if size and overlaps(base, size, used_base, used_size):
             problems.append(f"memory-map entry {name} overlaps the {used_name}")
 
+# The EL1 state the firmware starts in. The hypervisor leaves these two registers as it
+# finds them. The entry code runs with the MMU off until it has built its own page tables,
+# and enables FP/SIMD access itself, so CPACR_EL1 is only printed.
+print("EL1 state the firmware starts in:")
+try:
+    sctlr_el1 = u.mrs(SCTLR_EL12)
+    cpacr_el1 = u.mrs(CPACR_EL12)
+except Exception as e:
+    problems.append(f"SCTLR_EL12 and CPACR_EL12 cannot be read ({e})")
+else:
+    print(f"  SCTLR_EL12 = 0x{sctlr_el1:x} (M={sctlr_el1 & 1} C={sctlr_el1 >> 2 & 1} "
+          f"I={sctlr_el1 >> 12 & 1})")
+    print(f"  CPACR_EL12 = 0x{cpacr_el1:x} (FPEN={cpacr_el1 >> 20 & 3})")
+    if sctlr_el1 & 1:
+        problems.append("the EL1 MMU is on (SCTLR_EL12.M = 1); the firmware's entry code "
+                        "expects it off")
+
 if problems:
     for problem in problems:
         print(f"PROBLEM: {problem}")
@@ -267,7 +290,10 @@ def dump_state(title):
     for name in ("HCR_EL2", "ISR_EL1", "ICC_SRE_EL2", "ICH_VTR_EL2", "ICH_HCR_EL2",
                  "ICH_VMCR_EL2", "ICH_MISR_EL2", "ICH_EISR_EL2", "ICH_ELRSR_EL2",
                  "ICH_AP1R0_EL2", "CNTV_CTL_EL02", "CNTV_CVAL_EL02", "CNTP_CTL_EL02",
-                 "VM_TMR_FIQ_ENA_EL2", "CNTHCTL_EL2", "SCTLR_EL12", "VBAR_EL12"):
+                 "VM_TMR_FIQ_ENA_EL2", "CNTHCTL_EL2", "SCTLR_EL12", "CPACR_EL12",
+                 "TCR_EL12", "TTBR0_EL12", "VBAR_EL12", "SP_EL1",
+                 # the last exception the firmware took itself, in EL1
+                 "ELR_EL12", "SPSR_EL12", "ESR_EL12", "FAR_EL12"):
         print(f"{name:18s} = 0x{u.mrs(globals()[name]):x}")
     for i in range((u.mrs(ICH_VTR_EL2) & 0x1f) + 1):
         print(f"{f'ICH_LR{i}_EL2':18s} = 0x{u.mrs(globals()[f'ICH_LR{i}_EL2']):x}")
@@ -323,6 +349,17 @@ PMU(u).reset_panic_counter()
 # HV.handle_exception() calls run_shell() on a user interrupt and on anything it could not
 # handle. Report and leave the guest instead of waiting for input.
 def stop_guest(entry_msg=None, exit_msg=None):
+    ctx = hv.ctx
+    where = ""
+    if layout.image_base <= ctx.elr < layout.image_base + layout.image_size:
+        where = f" (firmware image + 0x{ctx.elr - layout.image_base:x})"
+    print(f"Firmware stopped at PC 0x{ctx.elr:x}{where}")
+    if hv.exc_reason == START.HV:
+        # The time ran out. For an exception, HV.handle_exception() has printed this already
+        try:
+            u.print_context(ctx, False)
+        except Exception as e:
+            print(f"(context not printed: {e})")
     dump_state("firmware stopped")
     return EXC_RET.EXIT_GUEST
 
