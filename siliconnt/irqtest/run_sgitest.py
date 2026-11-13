@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Run the sgitest guest (sgitest.c) under the hypervisor, or, given build/gictest.bin as the
-payload, the gictest guest (gictest.c): the two share their entry code and image header.
+"""Run the sgitest guest (sgitest.c) under the hypervisor, or, given build/gictest.bin or
+build/wfitest.bin as the payload, the gictest guest (gictest.c) or the wfitest guest
+(wfitest.c): the three share their entry code and image header.
 
 The m1n1 on the target has to be built from this tree: the test is about src/hv/hv_vgic.c.
 
@@ -61,7 +62,7 @@ GICR_BASE = 0x51_0000_0000
 
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
-    sys.exit(f"{args.payload}: not an sgitest or gictest image of this tree")
+    sys.exit(f"{args.payload}: not an sgitest, gictest or wfitest image of this tree")
 if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
     sys.exit(f"{args.payload}: UART base already filled in")
 secondary_entry_off = struct.unpack_from("<Q", image, SECONDARY_OFF)[0]
@@ -159,7 +160,8 @@ def dump_state(title):
     print(f"==== {title} ====")
     for name in ("HCR_EL2", "ISR_EL1", "ICC_SRE_EL2", "ICH_VTR_EL2", "ICH_HCR_EL2",
                  "ICH_VMCR_EL2", "ICH_MISR_EL2", "ICH_EISR_EL2", "ICH_ELRSR_EL2",
-                 "ICH_AP1R0_EL2", "CNTV_CTL_EL02", "CNTP_CTL_EL02", "VM_TMR_FIQ_ENA_EL2"):
+                 "ICH_AP1R0_EL2", "CNTV_CTL_EL02", "CNTP_CTL_EL02", "VM_TMR_FIQ_ENA_EL2",
+                 "CNTHCTL_EL2"):
         print(f"{name:18s} = 0x{u.mrs(globals()[name]):x}")
     for i in range((u.mrs(ICH_VTR_EL2) & 0x1f) + 1):
         print(f"{f'ICH_LR{i}_EL2':18s} = 0x{u.mrs(globals()[f'ICH_LR{i}_EL2']):x}")
@@ -169,8 +171,11 @@ dump_state(f"after hypervisor init, before the guest, on CPU {boot_index}")
 
 hcr = HCR(u.mrs(HCR_EL2))
 print(f"HCR_EL2: {hcr!s}")
-if not (hcr.IMO and hcr.FMO and hcr.VM):
-    sys.exit("HCR_EL2 is not IMO=1 FMO=1 VM=1: this m1n1 was not built from this tree")
+if not (hcr.IMO and hcr.FMO and hcr.VM and hcr.TWI):
+    sys.exit("HCR_EL2 is not IMO=1 FMO=1 VM=1 TWI=1: this m1n1 was not built from this tree")
+# The core waits out a WFI of the guest in WFE; the event stream is what ends a WFE for sure
+if not u.mrs(CNTHCTL_EL2) & 4:
+    sys.exit("CNTHCTL_EL2.EVNTEN is 0: this m1n1 was not built from this tree")
 if not u.mrs(ICH_HCR_EL2) & 1:
     sys.exit("ICH_HCR_EL2.En is 0: this m1n1 was not built from this tree")
 if u.mrs(ICH_MISR_EL2):
