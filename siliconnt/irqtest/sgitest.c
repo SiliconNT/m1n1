@@ -17,10 +17,7 @@
  */
 
 #include "sgitest.h"
-
-typedef unsigned long u64;
-typedef unsigned int u32;
-typedef unsigned char u8;
+#include "gic.h"
 
 #define NR_SGIS 16
 
@@ -71,6 +68,7 @@ enum {
 struct cpu {
     volatile u64 online;
     u64 mpidr;
+    u64 gicr; // its Redistributor, 0 if it has none
     u64 ctlr;
     u64 sctlr;
     u64 current_el;
@@ -166,7 +164,7 @@ static void delay_ms(u64 ms)
 /* ---- the GIC CPU interface ---- */
 
 /* The order and the values of HalpGic3InitializeLocalUnit, as in irqtest.S */
-static void gic_cpu_init(void)
+static void gic_cpu_init(u64 gicr)
 {
     u64 sre = read_sysreg(ICC_SRE_EL1);
 
@@ -176,12 +174,18 @@ static void gic_cpu_init(void)
     write_sysreg(ICC_IGRPEN1_EL1, 0);
     write_sysreg(ICC_PMR_EL1, 0);
     write_sysreg(ICC_BPR1_EL1, 3);
-    /* (Windows writes the Redistributor here; there is none yet) */
+    if (gicr)
+        gic_local_init(gicr);
     write_sysreg(ICC_CTLR_EL1, read_sysreg(ICC_CTLR_EL1) & ~2UL); // EOImode = 0
     write_sysreg(ICC_IGRPEN1_EL1, 1);
     /* HalpGic3SetPriority at the lowest level */
     write_sysreg(ICC_PMR_EL1, 0xf0);
     isb();
+
+    /* The test uses all 16 SGIs, where Windows registers 0-7 */
+    if (gicr)
+        for (u32 intid = 0; intid < NR_SGIS; intid++)
+            gic_enable_local(gicr, intid, 0x80);
 }
 
 static void send_sgi(u64 val)
@@ -357,7 +361,8 @@ static void cpu_init(int slot)
     c->mpidr = read_sysreg(mpidr_el1) & 0xff00ffffffUL;
     c->sctlr = read_sysreg(sctlr_el1);
     c->current_el = read_sysreg(CurrentEL);
-    gic_cpu_init();
+    c->gicr = gic_find_redist(c->mpidr);
+    gic_cpu_init(c->gicr);
     c->ctlr = read_sysreg(ICC_CTLR_EL1);
     irq_unmask();
     c->online = 1;
@@ -722,8 +727,10 @@ static void describe(int slot)
 
     line("cpu ");
     put_dec(slot);
-    put(": MPIDR CurrentEL SCTLR_EL1 ICC_CTLR_EL1 = ");
+    put(": MPIDR GICR CurrentEL SCTLR_EL1 ICC_CTLR_EL1 = ");
     put_hex(c->mpidr, 10);
+    put(" ");
+    put_hex(c->gicr, 10);
     put(" ");
     put_hex(c->current_el, 1);
     put(" ");
@@ -735,15 +742,26 @@ static void describe(int slot)
 
 void boot_main(void)
 {
+    int dist;
+
     nr_cpus = hdr_nr_cpus;
     if (nr_cpus < 1 || nr_cpus > MAX_CPUS)
         nr_cpus = 1;
 
+    /* The Distributor first, as HalpGic3InitializeIoUnit comes before the first local unit */
+    dist = gic_dist_init();
     cpu_init(0);
 
     line("start, cpus=");
     put_dec(nr_cpus);
     put("\n");
+    if (dist) {
+        line("FAIL Distributor not usable, check ");
+        put_dec(dist);
+        put("\n");
+        nr_fail++;
+        goto done;
+    }
     describe(0);
 
     for (u64 slot = 1; slot < nr_cpus; slot++) {
@@ -768,6 +786,11 @@ void boot_main(void)
     }
 
     for (u64 cpu = 0; cpu < nr_cpus; cpu++) {
+        if (!cpus[cpu].gicr) {
+            line("FAIL a CPU has no Redistributor\n");
+            nr_fail++;
+            goto done;
+        }
         if ((cpus[cpu].mpidr & 0xff) >= 16) {
             line("FAIL a CPU has Aff0 >= 16, which needs the range selector\n");
             nr_fail++;

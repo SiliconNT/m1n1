@@ -30,9 +30,16 @@ parser.add_argument("payload", type=pathlib.Path, nargs="?",
                     default=HERE / "build" / "irqtest.bin")
 args = parser.parse_args()
 
-MAGIC = b"SNTIRQ01"
+MAGIC = b"SNTIRQ02"
 MAGIC_OFF = 0x08
 UART_BASE_OFF = 0x10
+GICD_BASE_OFF = 0x18
+GICR_BASE_OFF = 0x20
+
+# Where the hypervisor puts the Distributor and the Redistributors: HV_VGIC_DIST_BASE and
+# HV_VGIC_REDIST_BASE in src/hv/hv.h
+GICD_BASE = 0x50_0000_0000
+GICR_BASE = 0x51_0000_0000
 
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
@@ -110,6 +117,9 @@ uart_base = hv.adt["/arm-io/uart0"].get_reg(0)[0]
 print(f"Virtual UART at 0x{uart_base:x}")
 
 struct.pack_into("<Q", image, UART_BASE_OFF, uart_base)
+struct.pack_into("<Q", image, GICD_BASE_OFF, GICD_BASE)
+struct.pack_into("<Q", image, GICR_BASE_OFF, GICR_BASE)
+print(f"GIC Distributor at 0x{GICD_BASE:x}, Redistributors from 0x{GICR_BASE:x}")
 hv.load_raw(bytes(image), entryoffset=0)
 
 # Does nothing unless M1N1_PMU_RESET=1 (proxyclient/m1n1/hw/pmu.py)

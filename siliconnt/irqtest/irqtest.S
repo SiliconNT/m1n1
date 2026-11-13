@@ -4,8 +4,10 @@
  * EL1 test guest for src/hv/hv_vgic.c: does a virtual timer interrupt, put into a list
  * register by the hypervisor, really arrive at EL1 as an IRQ exception?
  *
- * It sets up the GIC CPU interface the way the Windows kernel does on every processor
- * (HalpGic3InitializeLocalUnit, 10.0.26300.9457), arms the EL1 virtual timer, takes
+ * It sets up the GIC the way the Windows kernel does (HalpGic3InitializeIoUnit,
+ * HalpGic3InitializeLocalUnit, HalpGic3SetLineState, 10.0.26300.9457): the Distributor, the
+ * Redistributor and the CPU interface of this processor, and the PPI of the timer with a
+ * priority and enabled. Then it arms the EL1 virtual timer, takes
  * NR_IRQS interrupts through ICC_IAR1_EL1 / ICC_EOIR1_EL1 and reports what it saw on the
  * hypervisor's virtual UART. Lines start with "HVLOG: " so that the hypervisor copies them
  * to its own console (src/hv/hv_vuart.c).
@@ -13,8 +15,21 @@
  * Raw image, position independent, entered at offset 0 in EL1h with the MMU off. It never
  * executes WFI: M4 loses CPU state there (src/kboot.c).
  *
- * The loader (run_irqtest.py) writes the address of the virtual UART into the header.
+ * The loader (run_irqtest.py) writes the addresses of the virtual UART, of the GIC
+ * Distributor and of the first GIC Redistributor into the header.
  */
+
+#define VTIMER_PPI 27
+
+#define GICD_CTLR       0x0000
+#define GICR_TYPER      0x0008
+#define GICR_STRIDE     0x20000
+#define GICR_SGI_BASE   0x10000 /* the offsets below are from here */
+#define GICR_IGROUPR0   0x0080
+#define GICR_ISENABLER0 0x0100
+#define GICR_ICENABLER0 0x0180
+#define GICR_IPRIORITYR 0x0400
+#define GICR_ICFGR1     0x0c04
 
 #define UTXH 0x20
 
@@ -32,9 +47,13 @@
 image_start:
     b       _start
     .word   0
-    .ascii  "SNTIRQ01"              /* 0x08: magic */
+    .ascii  "SNTIRQ02"              /* 0x08: magic */
 uart_base:
     .quad   0                       /* 0x10: virtual UART base, filled in by the loader */
+gicd_base:
+    .quad   0                       /* 0x18: GIC Distributor, filled in by the loader */
+gicr_base:
+    .quad   0                       /* 0x20: first GIC Redistributor, filled in by the loader */
 
     .macro  bad_vector num
     .balign 0x80
@@ -83,6 +102,42 @@ _start:
     bl      put_hex8
     bl      put_nl
 
+    /*
+     * HalpGic3InitializeIoUnit, without the SPIs: the group enables off, affinity routing
+     * on (and read back), Group 1 on.
+     */
+    adr     x9, gicd_base
+    ldr     x9, [x9]
+    ldr     w8, [x9, #GICD_CTLR]
+    and     w10, w8, #0xfffffffc
+    cmp     w10, w8
+    b.eq    1f
+    mov     w8, w10
+    str     w8, [x9, #GICD_CTLR]
+1:  tbnz    w8, #4, 1f
+    orr     w8, w8, #0x10
+    str     w8, [x9, #GICD_CTLR]
+    ldr     w8, [x9, #GICD_CTLR]
+    tbz     w8, #4, no_gic
+1:  orr     w8, w8, #0x2
+    str     w8, [x9, #GICD_CTLR]
+
+    /* HalpGic3FindRedistributor: the frame whose GICR_TYPER has the affinity of this CPU */
+    adr     x23, gicr_base
+    ldr     x23, [x23]
+    mrs     x10, mpidr_el1
+    and     x11, x10, #0xffffff
+    ubfx    x12, x10, #32, #8
+    orr     x11, x11, x12, lsl #24
+1:  ldr     x12, [x23, #GICR_TYPER]
+    lsr     x13, x12, #32
+    cmp     x13, x11
+    b.eq    2f
+    tbnz    w12, #4, no_gic         /* Last */
+    add     x23, x23, #GICR_STRIDE
+    b       1b
+2:  add     x23, x23, #GICR_SGI_BASE /* x23 = SGI_base of this CPU */
+
     /* The order and the values of HalpGic3InitializeLocalUnit */
     mrs     x8, ICC_SRE_EL1
     tbnz    w8, #0, 1f
@@ -93,7 +148,10 @@ _start:
     msr     ICC_PMR_EL1, xzr
     mov     x8, #3
     msr     ICC_BPR1_EL1, x8
-    /* (Windows writes the Redistributor here; there is none yet) */
+    mov     w8, #0xffffffff
+    str     w8, [x23, #GICR_IGROUPR0]
+    mov     w8, #0xffff00ff         /* everything but SGIs 8-15 off */
+    str     w8, [x23, #GICR_ICENABLER0]
     mrs     x8, ICC_CTLR_EL1
     bic     x8, x8, #2              /* EOImode = 0 */
     msr     ICC_CTLR_EL1, x8
@@ -124,6 +182,15 @@ _start:
     mrs     x0, ICC_HPPIR1_EL1
     bl      put_hex8
     bl      put_nl
+
+    /* HalpGic3SetLineState for the timer: priority by the byte, level-sensitive, enabled */
+    mov     w8, #0x80
+    strb    w8, [x23, #(GICR_IPRIORITYR + VTIMER_PPI)]
+    ldr     w8, [x23, #GICR_ICFGR1]
+    bic     w8, w8, #(2 << (2 * (VTIMER_PPI - 16)))
+    str     w8, [x23, #GICR_ICFGR1]
+    mov     w8, #(1 << VTIMER_PPI)
+    str     w8, [x23, #GICR_ISENABLER0]
 
     /* Arm the EL1 virtual timer, TIMER_HZ times per second */
     mrs     x9, cntfrq_el0
@@ -227,6 +294,11 @@ done:
     bl      put_nl
 
 halt:
+    b       halt
+
+no_gic:
+    adr     x0, msg_no_gic
+    bl      puts
     b       halt
 
 /*
@@ -365,6 +437,8 @@ msg_done:
     .asciz  "HVLOG: irqtest: DONE irqs spurious RPR HPPIR1 = "
 msg_timeout:
     .asciz  "HVLOG: irqtest: TIMEOUT irqs ISR_EL1 HPPIR1 RPR CNTV_CTL = "
+msg_no_gic:
+    .asciz  "HVLOG: irqtest: FAIL no usable GIC Distributor or no Redistributor for this CPU\n"
 msg_exc:
     .asciz  "HVLOG: irqtest: EXCEPTION vector ESR ELR FAR SPSR = "
 

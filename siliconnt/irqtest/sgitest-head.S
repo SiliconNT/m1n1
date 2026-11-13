@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Entry points, exception vectors and the few things of sgitest that have to be exact
- * instructions. The test itself is sgitest.c.
+ * Entry points, exception vectors and the few things of sgitest and gictest that have to be
+ * exact instructions. The tests themselves are sgitest.c and gictest.c.
  *
  * Raw image, position independent, MMU off, EL1h. The boot CPU enters at offset 0. Every
  * other CPU enters at the offset stored at SECONDARY_OFF, with its slot number in x0.
@@ -19,7 +19,7 @@
 image_start:
     b       _start
     .word   0
-    .ascii  "SNTSGI01"              /* 0x08: magic */
+    .ascii  "SNTSGI02"              /* 0x08: magic */
     .globl  hdr_uart_base
 hdr_uart_base:
     .quad   0                       /* 0x10: virtual UART base, from the loader */
@@ -33,6 +33,12 @@ hdr_start_reg:
     .globl  hdr_start_val
 hdr_start_val:
     .fill   MAX_CPUS, 8, 0          /*       ...and what; register 0 = it starts by itself */
+    .globl  hdr_gicd_base
+hdr_gicd_base:
+    .quad   0                       /* GIC Distributor, from the loader */
+    .globl  hdr_gicr_base
+hdr_gicr_base:
+    .quad   0                       /* the first GIC Redistributor, from the loader */
 
     .macro  bad_vector num
     .balign 0x80

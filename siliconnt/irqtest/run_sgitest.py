@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Run the sgitest guest (sgitest.c) under the hypervisor.
+"""Run the sgitest guest (sgitest.c) under the hypervisor, or, given build/gictest.bin as the
+payload, the gictest guest (gictest.c): the two share their entry code and image header.
 
 The m1n1 on the target has to be built from this tree: the test is about src/hv/hv_vgic.c.
 
@@ -11,6 +12,9 @@ never waits in WFI (M4 loses CPU state there, src/kboot.c). The guest gets onto 
 upstream gets an Apple guest onto its secondary CPUs: it writes the CPU start register of the
 power manager, the hypervisor intercepts that, and this script answers with
 hv_start_secondary(). There is no PSCI in the hypervisor yet.
+
+The guest sets up the GIC itself, the way the Windows kernel does: the script tells it where
+the hypervisor emulates the Distributor and the Redistributors.
 
 The guest prints to the hypervisor's virtual UART; lines that start with "HVLOG: " come back
 on the proxy console, so they show up in the output of this script.
@@ -39,7 +43,7 @@ parser.add_argument("payload", type=pathlib.Path, nargs="?",
 args = parser.parse_args()
 
 # Layout of the image header, see sgitest-head.S
-MAGIC = b"SNTSGI01"
+MAGIC = b"SNTSGI02"
 MAGIC_OFF = 0x08
 UART_BASE_OFF = 0x10
 NR_CPUS_OFF = 0x18
@@ -47,10 +51,17 @@ SECONDARY_OFF = 0x20
 START_REG_OFF = 0x28
 MAX_CPUS = 4
 START_VAL_OFF = START_REG_OFF + 8 * MAX_CPUS
+GICD_BASE_OFF = START_VAL_OFF + 8 * MAX_CPUS
+GICR_BASE_OFF = GICD_BASE_OFF + 8
+
+# Where the hypervisor puts the Distributor and the Redistributors: HV_VGIC_DIST_BASE and
+# HV_VGIC_REDIST_BASE in src/hv/hv.h
+GICD_BASE = 0x50_0000_0000
+GICR_BASE = 0x51_0000_0000
 
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
-    sys.exit(f"{args.payload}: not an sgitest image")
+    sys.exit(f"{args.payload}: not an sgitest or gictest image of this tree")
 if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
     sys.exit(f"{args.payload}: UART base already filled in")
 secondary_entry_off = struct.unpack_from("<Q", image, SECONDARY_OFF)[0]
@@ -177,6 +188,9 @@ chip_id = u.adt["/chosen"].chip_id
 
 struct.pack_into("<Q", image, UART_BASE_OFF, uart_base)
 struct.pack_into("<Q", image, NR_CPUS_OFF, len(slots))
+struct.pack_into("<Q", image, GICD_BASE_OFF, GICD_BASE)
+struct.pack_into("<Q", image, GICR_BASE_OFF, GICR_BASE)
+print(f"GIC Distributor at 0x{GICD_BASE:x}, Redistributors from 0x{GICR_BASE:x}")
 for slot, index in enumerate(slots):
     if slot == 0:
         continue
