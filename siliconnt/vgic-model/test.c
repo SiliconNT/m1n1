@@ -1643,6 +1643,20 @@ static void wfi_tests(void)
     CHECK(taken(6, 2) == 1);
     printf("ok   WFI: an SGI waits for a list register: returns at once\n");
 
+    /* The same with the timer: its FIQ is off while its output is high, nothing else would come */
+    wfi_reset(1);
+    cur = 6;
+    guest_send(sgi_to(6, 1));
+    CHECK(guest_ack() == 1);
+    cores[6].timer = true;
+    settle(6);
+    CHECK(!lr_of(6, HV_VGIC_INTID_VTIMER) && !(isr(&cores[6]) & ISR_F));
+    CHECK(guest_wfi() == 0);
+    guest_eoi(1);
+    CHECK(physical_interrupt());
+    take_timer(6);
+    printf("ok   WFI: the timer has fired and waits for a list register: returns at once\n");
+
     /* WFIT does not wait; WFE and WFET are not this handler's */
     wfi_reset(8);
     cur = 6;

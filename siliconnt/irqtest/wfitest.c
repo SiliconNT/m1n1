@@ -9,8 +9,10 @@
  * in between the look and the WFI, in a loop, because a WFI may return for no reason at all
  * ("The PE is permitted to leave the low-power state for any reason", Arm DDI 0487 M.d
  * D1.7.2), and it unmasks IRQs afterwards. How long a wakeup took and how many WFIs were
- * executed is printed and not judged: under the hypervisor the boot CPU leaves WFI at every
- * tick of the hypervisor, a thousand times a second.
+ * executed is printed. Under the hypervisor the boot CPU leaves WFI at every tick of the
+ * hypervisor, a thousand times a second, so on it a wakeup that was missed looks like one that
+ * was a little late. The other CPUs have such a tick once a second: there a wakeup that takes
+ * longer than LATE_MS fails the test.
  *
  * The same image runs on QEMU's virt machine with an emulated GICv3 (`make qemu-wfi`,
  * `make qemu-wfi-smp`), where WFI is QEMU's own.
@@ -474,6 +476,7 @@ static u32 wait_took(int cpu, u32 intid, u64 timeout_ms)
 
 #define SOON_MS  500
 #define TIMER_MS 20
+#define LATE_MS  100
 
 /* ---- tests on the boot CPU ---- */
 
@@ -562,8 +565,8 @@ static void tests_pair(int b)
             worst = o->stamp - sent;
         m += wait_took(b, SGI_A, SOON_MS);
     }
-    result("cpu # idle in WFI, SGI from cpu 0, 50 times: out of WFI each time, 50 interrupts", b,
-           ok && m == 50);
+    result("cpu # idle in WFI, SGI from cpu 0, 50 times: out of WFI in time each time, 50 interrupts",
+           b, ok && m == 50 && worst < LATE_MS * ticks_per_ms);
     measured("latest out of WFI after the SGI was sent", b, worst);
     counted("WFI instructions executed for these 50", b, o->wfis - wfis);
 
@@ -600,8 +603,8 @@ static void tests_pair(int b)
             ok = 0;
         m += wait_took(b, PPI_VTIMER, SOON_MS);
     }
-    result("cpu # idle in WFI until its timer fires, 10 times: 10 interrupts, never early", b,
-           ok && m == 10 && !o->early);
+    result("cpu # idle in WFI until its timer fires, 10 times: 10 interrupts, never early or late",
+           b, ok && m == 10 && !o->early && o->late < LATE_MS * ticks_per_ms);
     measured("latest out of WFI after the timer had fired", b, o->late);
     counted("WFI instructions executed for these 10", b, o->wfis - wfis);
 }
