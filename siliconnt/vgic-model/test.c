@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 /*
- * Host-side model test for src/hv/hv_vgic.c. The file under test is the real one, compiled
- * against stand-in headers; this file plays the hardware (list registers, the Apple IPI), the
- * rest of the hypervisor (the MMIO hooks, the exit paths) and the guest (the Distributor and
- * Redistributor accesses of the Windows kernel, acknowledge, EOI), with one thread per core.
+ * Host-side model test for src/hv/hv_vgic.c and src/hv/hv_wfi.c. The files under test are the
+ * real ones, compiled against stand-in headers; this file plays the hardware (list registers,
+ * the Apple IPI, ISR_EL1, WFE), the rest of the hypervisor (the MMIO hooks, the exit paths) and
+ * the guest (the Distributor and Redistributor accesses of the Windows kernel, acknowledge,
+ * EOI, WFI), with one thread per core.
  *
  * What the "hypervisor exit paths" do here mirrors src/hv/hv_exc.c: an IPI is acknowledged
  * first (hv_exc_fiq), a maintenance interrupt goes to hv_vgic_handle_irq() (hv_exc_irq), a
  * trapped MMIO access runs its hook with the big hypervisor lock held (hv_exc_sync), and
  * every way back to the guest ends in hv_update_fiq(), which looks at the virtual timer and
- * calls hv_vgic_deliver().
+ * calls hv_vgic_deliver(). A trapped WFI goes to hv_handle_wfx() with that lock held.
+ *
+ * WFE is the worst one the architecture allows: an interrupt that is masked does not end it,
+ * only the event stream does. Every WFE here lasts one period of the event stream.
  */
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "aic.h"
 #include "cpu_regs.h"
@@ -35,6 +41,7 @@ struct core {
     bool masked;
     u32 pmr;    /* ICC_PMR_EL1: only priorities below this are taken */
     bool timer; /* the output of the guest's virtual timer */
+    bool timer_fiq; /* ...raises a FIQ when high: VM_TMR_FIQ_ENA_EL2, see hv_update_fiq() */
     atomic_uint count[NR_INTIDS];
     /* IPIs taken, to see the path was used */
     u64 fiqs, irqs;
@@ -84,6 +91,18 @@ static u64 eisr(struct core *c)
     return v;
 }
 
+/* ISR_EL1 as EL2 reads it: the physical interrupts that are pending, masked or not */
+static u64 isr(struct core *c)
+{
+    u64 v = 0;
+
+    if (atomic_load(&c->ipi) || (c->timer && c->timer_fiq))
+        v |= ISR_F;
+    if (eisr(c))
+        v |= ISR_I; /* the maintenance interrupt */
+    return v;
+}
+
 static int lr_index(int reg)
 {
     if (reg >= SYS_ICH_LR0_EL2 && reg <= SYS_ICH_LR7_EL2)
@@ -99,6 +118,25 @@ static int lr_index(int reg)
  */
 static void (*lr_read_hook)(void);
 static int lr_read_countdown;
+
+/* ...and right after it has read ISR_EL1 */
+static void (*isr_read_hook)(void);
+
+/* The counter and the WFEs of the core a thread plays */
+#define EVENT_PERIOD 65536 /* ticks: the event stream of bit 15 */
+static u64 cntfrq = 1000000000;
+static u64 cnthctl;
+static __thread u64 cntpct;
+static __thread u64 wfe_count;
+static void (*wfe_hook)(void);
+
+void mock_wfe(void)
+{
+    wfe_count++;
+    cntpct += EVENT_PERIOD;
+    if (wfe_hook)
+        wfe_hook();
+}
 
 u64 mock_mrs(int reg)
 {
@@ -128,6 +166,27 @@ u64 mock_mrs(int reg)
             return eisr(c);
         case SYS_ICH_MISR_EL2:
             return eisr(c) ? 1 : 0;
+        case ISR_EL1: {
+            u64 v = isr(c);
+
+            if (isr_read_hook) {
+                void (*hook)(void) = isr_read_hook;
+                int self = cur;
+
+                isr_read_hook = NULL;
+                hook();
+                cur = self;
+            }
+            return v;
+        }
+        case HCR_EL2:
+            return 0; /* nothing in the model raises the virtual FIQ */
+        case CNTFRQ_EL0:
+            return cntfrq;
+        case CNTPCT_EL0:
+            return cntpct;
+        case CNTHCTL_EL2:
+            return cnthctl;
     }
     return 0;
 }
@@ -136,6 +195,8 @@ void mock_msr(int reg, u64 val)
 {
     if (lr_index(reg) >= 0)
         cores[cur].lr[lr_index(reg)] = val;
+    else if (reg == CNTHCTL_EL2)
+        cnthctl = val;
 }
 
 #define CHECK(cond)                                                                                \
@@ -165,13 +226,19 @@ int hv_map_hook(u64 from, hv_hook_t *hook, u64 size)
 }
 
 /* The big hypervisor lock: held around the MMIO hooks, not on the other paths used here */
-static pthread_mutex_t bhl = PTHREAD_MUTEX_INITIALIZER;
+spinlock_t bhl = PTHREAD_MUTEX_INITIALIZER;
 
-/* hv_update_fiq(), on the current core */
+/* hv_update_fiq(), on the current core. The timer's FIQ is off for as long as its output is high */
 static void hv_exit(void)
 {
+    cores[cur].timer_fiq = !cores[cur].timer;
     hv_vgic_ppi_level(HV_VGIC_INTID_VTIMER, cores[cur].timer);
     hv_vgic_deliver();
+}
+
+void hv_update_fiq(void)
+{
+    hv_exit();
 }
 
 /* Take whatever physical interrupt is pending. Returns false if there was none. */
@@ -183,6 +250,11 @@ static bool physical_interrupt(void)
         /* hv_exc_fiq: acknowledge, then hv_exc_exit -> hv_update_fiq */
         atomic_store(&c->ipi, 0);
         c->fiqs++;
+        hv_exit();
+        return true;
+    }
+    if (c->timer && c->timer_fiq) {
+        /* hv_exc_fiq for the guest's timer: nothing to acknowledge, hv_update_fiq injects it */
         hv_exit();
         return true;
     }
@@ -403,8 +475,10 @@ static void reset_raw(int lrs)
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
     for (int i = 0; i < 10; i++)
         cores[i].mpidr = i < 6 ? (0x80000000UL | i) : (0x80010100UL | (i - 6));
-    for (int i = 0; i < MAX_CPUS; i++)
+    for (int i = 0; i < MAX_CPUS; i++) {
         cores[i].pmr = 0x100;
+        cores[i].timer_fiq = true;
+    }
     for (int i = 0; i < NR_STARTED; i++) {
         cur = started[i];
         hv_vgic_init();
@@ -1343,6 +1417,374 @@ static void stress(int lrs, int n, bool spis)
     hv_vgic_report();
 }
 
+/* ---- WFI ---- */
+
+/* The guest on the current core executes WFI: trap, hv_handle_wfx, hv_exc_exit. Returns the WFEs. */
+static u64 guest_wfi(void)
+{
+    u64 before = wfe_count;
+
+    pthread_mutex_lock(&bhl);
+    CHECK(hv_handle_wfx(ESR_ISS_WFx_TI_WFI));
+    hv_exit();
+    pthread_mutex_unlock(&bhl);
+    return wfe_count - before;
+}
+
+/* Something that happens elsewhere during the wfe_at-th WFE of a wait */
+static u64 wfe_at;
+static void (*wfe_action)(void);
+
+static void wfe_scripted(void)
+{
+    /* Nothing is coming any more: the core would wait forever */
+    CHECK(wfe_count <= 1000);
+
+    /* The core does not keep the others out of the hypervisor while it waits */
+    CHECK(pthread_mutex_trylock(&bhl) == 0);
+    pthread_mutex_unlock(&bhl);
+
+    if (wfe_action && wfe_count == wfe_at) {
+        void (*action)(void) = wfe_action;
+        int self = cur;
+
+        wfe_action = NULL;
+        action();
+        cur = self;
+    }
+}
+
+static void during_wfe(u64 n, void (*action)(void))
+{
+    wfe_at = wfe_count + n;
+    wfe_action = action;
+}
+
+static void wfi_reset(int lrs)
+{
+    reset(lrs);
+    cntfrq = 1000000000;
+    cnthctl = 0x1a400; /* what hv_init() leaves on the M4, findings/0015 section 10 */
+    cur = 6;
+    hv_wfi_init();
+    wfe_count = 0;
+    wfe_hook = wfe_scripted;
+    wfe_action = NULL;
+    isr_read_hook = NULL;
+}
+
+static void cpu0_sends_sgi2_to_6(void)
+{
+    cur = 0;
+    guest_send(sgi_to(6, 2));
+}
+
+static void cpu0_sends_sgi3_to_6(void)
+{
+    cur = 0;
+    guest_send(sgi_to(6, 3));
+}
+
+static void timer_of_6_fires(void)
+{
+    cores[6].timer = true;
+}
+
+static void cpu0_enables_timer_of_6(void)
+{
+    cur = 0;
+    wr32(GICR(6, GICR_ISENABLER0), BIT(HV_VGIC_INTID_VTIMER));
+}
+
+static void cpu0_enables_sgi5_of_6(void)
+{
+    cur = 0;
+    wr32(GICR(6, GICR_ISENABLER0), BIT(5));
+}
+
+static void cpu0_requests_spi40(void)
+{
+    cur = 0;
+    windows_request_spi(40);
+}
+
+/* The guest's handler for the timer: the output goes low before the EOI */
+static void take_timer(int cpu)
+{
+    cur = cpu;
+    CHECK(FIELD_GET(ICH_LR_STATE, lr_of(cpu, HV_VGIC_INTID_VTIMER)) == ICH_LR_STATE_PENDING);
+    CHECK(guest_ack() == HV_VGIC_INTID_VTIMER);
+    cores[cpu].timer = false;
+    guest_eoi(HV_VGIC_INTID_VTIMER);
+    settle(cpu);
+    CHECK(nr_valid_lrs(cpu) == 0);
+}
+
+static void wfi_tests(void)
+{
+    /* The event stream: one event per 65536 ticks at 1 GHz, per 2048 ticks at 24 MHz */
+    wfi_reset(8);
+    CHECK(cnthctl == (0x1a400 | CNTHCTL_EVNTEN | FIELD_PREP(CNTHCTL_EVNTI, 15)));
+    cntfrq = 24000000;
+    cnthctl = 0x1a400 | CNTHCTL_EVNTIS | CNTHCTL_EVNTDIR | FIELD_PREP(CNTHCTL_EVNTI, 3);
+    hv_wfi_init();
+    CHECK(cnthctl == (0x1a400 | CNTHCTL_EVNTEN | FIELD_PREP(CNTHCTL_EVNTI, 10)));
+    printf("ok   WFI: event stream, 65.5 us at 1 GHz and 85.3 us at 24 MHz\n");
+
+    /* An interrupt is there already, masked or not: no waiting */
+    wfi_reset(8);
+    cur = 6;
+    cores[6].masked = true;
+    guest_send(sgi_to(6, 1));
+    CHECK(guest_wfi() == 0);
+    CHECK(taken(6, 1) == 0);
+    cores[6].masked = false;
+    settle(6);
+    CHECK(taken(6, 1) == 1);
+    printf("ok   WFI: an SGI is pending and IRQs are masked: returns at once\n");
+
+    /* Nothing is there: the core waits, through wakeups for nothing, until another core sends */
+    wfi_reset(8);
+    cur = 6;
+    during_wfe(3, cpu0_sends_sgi2_to_6);
+    CHECK(guest_wfi() == 3);
+    CHECK(!wfe_action);
+    settle(6);
+    CHECK(taken(6, 2) == 1 && cores[6].fiqs == 1);
+    printf("ok   WFI: waits until an SGI from another core, taken once\n");
+
+    /* The guest's own timer */
+    wfi_reset(8);
+    cur = 6;
+    during_wfe(5, timer_of_6_fires);
+    CHECK(guest_wfi() == 5);
+    take_timer(6);
+    printf("ok   WFI: waits until the timer fires\n");
+
+    /* The timer is high already when the guest executes WFI */
+    wfi_reset(8);
+    cur = 6;
+    cores[6].timer = true;
+    CHECK(guest_wfi() == 0);
+    take_timer(6);
+    printf("ok   WFI: the timer has fired already: returns at once\n");
+
+    /* A source that is high but not enabled is nothing to wake up for, until it is enabled */
+    wfi_reset(8);
+    cur = 6;
+    wr32(GICR(6, GICR_ICENABLER0), BIT(HV_VGIC_INTID_VTIMER));
+    cores[6].timer = true;
+    settle(6);
+    CHECK(nr_valid_lrs(6) == 0);
+    during_wfe(4, cpu0_enables_timer_of_6);
+    CHECK(guest_wfi() == 4);
+    take_timer(6);
+    printf("ok   WFI: timer high with its PPI disabled: waits until another core enables the PPI\n");
+
+    wfi_reset(8);
+    cur = 6;
+    wr32(GICR(6, GICR_ICENABLER0), BIT(5));
+    cur = 0;
+    guest_send(sgi_to(6, 5));
+    settle(6);
+    CHECK(taken(6, 5) == 0 && nr_valid_lrs(6) == 0);
+    cur = 6;
+    during_wfe(3, cpu0_enables_sgi5_of_6);
+    CHECK(guest_wfi() == 3);
+    settle(6);
+    CHECK(taken(6, 5) == 1);
+    printf("ok   WFI: SGI pending but disabled: waits until another core enables it\n");
+
+    /* An SPI that another core requests */
+    wfi_reset(8);
+    cur = 6;
+    windows_enable_spi(40, 0x80, 6, true);
+    settle(6);
+    during_wfe(2, cpu0_requests_spi40);
+    CHECK(guest_wfi() == 2);
+    settle(6);
+    CHECK(taken(6, 40) == 1);
+    printf("ok   WFI: waits until another core requests an SPI routed here\n");
+
+    /*
+     * The SGI arrives after the core has looked and before it executes WFE. This WFE does not
+     * end early for it; the next look, one period of the event stream later, sees it.
+     */
+    wfi_reset(8);
+    cur = 6;
+    isr_read_hook = cpu0_sends_sgi3_to_6;
+    CHECK(guest_wfi() == 1);
+    CHECK(!isr_read_hook);
+    settle(6);
+    CHECK(taken(6, 3) == 1);
+    printf("ok   WFI: SGI between the look at ISR_EL1 and the WFE: noticed after one WFE\n");
+
+    /* The guest ended an interrupt and executes WFI before the maintenance interrupt is taken */
+    wfi_reset(8);
+    cur = 6;
+    guest_send(sgi_to(6, 1));
+    CHECK(guest_irq() == 1);
+    CHECK(eisr(&cores[6]));
+    CHECK(guest_wfi() == 0);
+    settle(6);
+    CHECK(!eisr(&cores[6]) && cores[6].irqs == 1);
+    printf("ok   WFI: a maintenance interrupt is pending: returns at once\n");
+
+    /* The only list register holds an active interrupt and an SGI waits: the guest has to go on */
+    wfi_reset(1);
+    cur = 6;
+    guest_send(sgi_to(6, 1));
+    CHECK(guest_ack() == 1);
+    guest_send(sgi_to(6, 2));
+    CHECK(!lr_of(6, 2));
+    CHECK(guest_wfi() == 0);
+    guest_eoi(1);
+    settle(6);
+    CHECK(taken(6, 2) == 1);
+    printf("ok   WFI: an SGI waits for a list register: returns at once\n");
+
+    /* WFIT does not wait; WFE and WFET are not this handler's */
+    wfi_reset(8);
+    cur = 6;
+    pthread_mutex_lock(&bhl);
+    CHECK(hv_handle_wfx(ESR_ISS_WFx_TI_WFIT));
+    CHECK(!hv_handle_wfx(ESR_ISS_WFx_TI_WFE));
+    CHECK(!hv_handle_wfx(ESR_ISS_WFx_TI_WFET));
+    pthread_mutex_unlock(&bhl);
+    CHECK(wfe_count == 0);
+    printf("ok   WFI: WFIT returns at once, WFE and WFET are refused\n");
+
+    wfe_hook = NULL;
+}
+
+/*
+ * Cores that do nothing but idle in WFI pass two SGIs around: whoever takes one sends it on to
+ * another core and goes back to WFI. A core that sleeps on an SGI stops it for good.
+ */
+#define NR_TOKENS 2
+#define SGI_STOP  15
+static atomic_long hops_left;
+static atomic_int ring_stop;
+static u64 ring_sent[MAX_CPUS][MAX_CPUS][NR_SGIS]; /* [sender][target][intid] */
+
+static void wfe_yield(void)
+{
+    sched_yield();
+}
+
+static void ring_forward(u32 token, unsigned *seed)
+{
+    int target;
+
+    if (atomic_fetch_sub(&hops_left, 1) <= 0) {
+        /* Done: wake everybody else up for the last time */
+        if (!atomic_exchange(&ring_stop, 1)) {
+            for (int i = 0; i < NR_STARTED; i++)
+                if (started[i] != cur)
+                    ring_sent[cur][started[i]][SGI_STOP]++;
+            guest_send(BIT(40) | ((u64)SGI_STOP << 24));
+        }
+        return;
+    }
+
+    do
+        target = started[rand_r(seed) % NR_STARTED];
+    while (target == cur);
+    ring_sent[cur][target][token]++;
+    guest_send(sgi_to(target, token));
+}
+
+static void *ring_thread(void *arg)
+{
+    int slot = (long)arg;
+    unsigned seed = 4321 + slot;
+    struct core *c;
+
+    cur = started[slot];
+    c = &cores[cur];
+
+    if (slot < NR_TOKENS)
+        ring_forward(slot, &seed);
+
+    while (!atomic_load(&ring_stop)) {
+        u32 intid;
+
+        /* Windows idles with IRQs masked and unmasks them after the WFI */
+        c->masked = rand_r(&seed) & 1;
+        guest_wfi();
+        c->masked = false;
+
+        for (;;) {
+            if (physical_interrupt())
+                continue;
+            intid = guest_irq();
+            if (intid == 1023)
+                break;
+            if (intid < NR_TOKENS)
+                ring_forward(intid, &seed);
+        }
+    }
+
+    atomic_fetch_add(&done_threads, 1);
+    return NULL;
+}
+
+static void wfi_stress(int lrs, long hops)
+{
+    pthread_t threads[NR_STARTED];
+    long last = hops;
+    double moved;
+
+    wfi_reset(lrs);
+    wfe_hook = wfe_yield;
+    memset(ring_sent, 0, sizeof(ring_sent));
+    atomic_store(&hops_left, hops);
+    atomic_store(&ring_stop, 0);
+    atomic_store(&done_threads, 0);
+
+    for (long i = 0; i < NR_STARTED; i++)
+        pthread_create(&threads[i], NULL, ring_thread, (void *)i);
+
+    moved = seconds();
+    while (atomic_load(&done_threads) < NR_STARTED) {
+        long now = atomic_load(&hops_left);
+
+        usleep(10000);
+        if (now != last) {
+            last = now;
+            moved = seconds();
+        } else if (seconds() - moved > 20) {
+            printf("FAIL WFI stress: nothing has moved for 20 s with %ld hops left: a core sleeps "
+                   "on an SGI\n",
+                   now);
+            exit(1);
+        }
+    }
+    for (int i = 0; i < NR_STARTED; i++)
+        pthread_join(threads[i], NULL);
+    wfe_hook = NULL;
+
+    for (int t = 0; t < NR_STARTED; t++) {
+        settle(started[t]);
+        for (int i = 0; i < NR_SGIS; i++) {
+            u64 want = 0;
+
+            for (int s = 0; s < NR_STARTED; s++)
+                want += ring_sent[started[s]][started[t]][i];
+            if (taken(started[t], i) != want) {
+                printf("FAIL WFI stress: cpu %d took SGI %d %u times, %lu were sent\n",
+                       started[t], i, taken(started[t], i), want);
+                exit(1);
+            }
+        }
+        CHECK(nr_valid_lrs(started[t]) == 0);
+    }
+    printf("ok   WFI stress, %d list registers, %ld hops: FIQs %lu %lu %lu %lu\n", lrs, hops,
+           cores[6].fiqs, cores[0].fiqs, cores[7].fiqs, cores[1].fiqs);
+    cur = 6;
+    hv_wfi_report();
+}
+
 int main(int argc, char **argv)
 {
     int n = argc > 1 ? atoi(argv[1]) : 200000;
@@ -1350,12 +1792,15 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     sgi_tests();
     dist_tests();
+    wfi_tests();
     stress(8, n, false);
     stress(2, n, false);
     stress(1, n / 4, false);
     stress(8, n / 4, true);
     stress(2, n / 4, true);
     stress(1, n / 8, true);
+    wfi_stress(8, n / 4);
+    wfi_stress(1, n / 8);
     printf("ALL OK\n");
     return 0;
 }
