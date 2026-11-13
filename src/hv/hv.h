@@ -84,14 +84,20 @@ void hv_aic_init(void);
 bool hv_aic_hook(void);
 
 /* Interrupts for a guest that expects a GICv3, through the virtual CPU interface */
-#define HV_VGIC_INTID_VTIMER 27   // PPI of the EL1 virtual timer
-#define HV_VGIC_PRIO_DEFAULT 0x80 // until the guest's priority registers are emulated
+#define HV_VGIC_INTID_VTIMER 27 // PPI of the EL1 virtual timer
+/*
+ * Where the guest finds the Distributor, and the Redistributor of the core with m1n1 index n:
+ * HV_VGIC_REDIST_BASE + n * HV_VGIC_REDIST_SIZE. Nothing of the M4 is at these addresses.
+ */
+#define HV_VGIC_DIST_BASE   0x5000000000UL
+#define HV_VGIC_DIST_SIZE   0x10000UL
+#define HV_VGIC_REDIST_BASE 0x5100000000UL
+#define HV_VGIC_REDIST_SIZE 0x20000UL
 void hv_vgic_init(void);
-bool hv_vgic_inject(u32 vintid, u8 priority);
-void hv_vgic_retract(u32 vintid);
+void hv_vgic_ppi_level(u32 intid, bool high);
 bool hv_vgic_handle_irq(void);
 void hv_vgic_send_sgi(u64 val);
-void hv_vgic_deliver_sgis(void);
+void hv_vgic_deliver(void);
 void hv_vgic_report(void);
 
 /* AMCC interrupt filtering */

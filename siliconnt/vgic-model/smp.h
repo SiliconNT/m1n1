@@ -5,3 +5,6 @@
 #define MAX_CPUS 32
 int smp_id(void);
 void smp_send_ipi(int cpu);
+bool smp_is_alive(int cpu);
+uint64_t smp_get_mpidr(int cpu);
+extern int boot_cpu_idx;

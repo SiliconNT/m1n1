@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Host-side model test for the SGI path of src/hv/hv_vgic.c. It compiles the real file for the
+# Host-side model test for src/hv/hv_vgic.c. It compiles the real file for the
 # build machine against stand-in headers and plays the hardware and the guest around it; see
 # test.c.
 #

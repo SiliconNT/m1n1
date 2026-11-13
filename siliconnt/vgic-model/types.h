@@ -12,7 +12,9 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int64_t s64;
 #define ALIGNED(x)             __attribute__((aligned(x)))
+#define UNUSED(x)              (void)(x)
 #define BIT(x)                 (1UL << (x))
+#define MASK(x)                (BIT(x) - 1)
 #define GENMASK(msb, lsb)      ((BIT((msb + 1) - (lsb)) - 1) << (lsb))
 #define _FIELD_LSB(field)      ((field) & ~((field)-1))
 #define FIELD_PREP(field, val) (((val) * (_FIELD_LSB(field))) & (field))

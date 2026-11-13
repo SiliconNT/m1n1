@@ -169,14 +169,14 @@ void hv_update_fiq(void)
      */
     if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
         reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
-        hv_vgic_inject(HV_VGIC_INTID_VTIMER, HV_VGIC_PRIO_DEFAULT);
+        hv_vgic_ppi_level(HV_VGIC_INTID_VTIMER, true);
     } else {
         reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
-        hv_vgic_retract(HV_VGIC_INTID_VTIMER);
+        hv_vgic_ppi_level(HV_VGIC_INTID_VTIMER, false);
     }
 
-    /* SGIs the guest sent to this core, from here or from another core */
-    hv_vgic_deliver_sgis();
+    /* SGIs and SPIs for this core, and whatever the guest changed about its interrupts */
+    hv_vgic_deliver();
 
     fiq_pending |= PERCPU(ipi_pending) || PERCPU(pmc_pending);
     fiq_pending |= hv_sprr_timer_pending();
