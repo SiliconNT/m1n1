@@ -37,7 +37,15 @@ RAM, that the framebuffer lies outside it, that nothing iBoot listed in
 expects. --check-only stops there.
 
 The firmware prints on the hypervisor's virtual UART. That goes to the secondary USB
-serial port (/dev/m1n1-sec), which this script reads and prints with a "FW> " prefix.
+serial port (/dev/m1n1-sec), which this script reads and prints with a "FW> " prefix,
+bytes that are not text as escapes.
+
+The same UART is the serial port of the Windows kernel debugger, and the debugger runs on
+Windows while the USB device is in WSL2. The script listens on 127.0.0.1, --kd-port, and
+passes bytes unchanged between one TCP connection at a time and the secondary serial port:
+WinDbgX -k com:ipport=51000,port=127.0.0.1. Start this script first: the debugger exits if
+nobody listens, and it does not connect again when its connection is closed. Lines that
+start with "KD> " say who connected and who left.
 
 The script needs no input: it lets the firmware run for --seconds, then interrupts the
 hypervisor, prints where the firmware was and the registers that tell what it was doing,
@@ -52,7 +60,7 @@ An exception the firmware takes itself before that shows up as an instruction ab
 0x200 that the hypervisor cannot handle; ELR_EL12, ESR_EL12 and FAR_EL12 in the final
 dump then describe the original exception.
 """
-import sys, os, pathlib, argparse, signal, struct, threading, hashlib, time
+import sys, os, pathlib, argparse, signal, struct, threading, hashlib, time, socket, select
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.append(str(HERE.parents[1] / "proxyclient"))
@@ -70,6 +78,9 @@ parser.add_argument("--serial", default=os.environ.get("M1N1SECDEVICE", "/dev/m1
                     help="the secondary USB serial port, where the firmware prints")
 parser.add_argument("--serial-log", type=pathlib.Path,
                     help="also write the raw bytes the firmware prints to this file")
+parser.add_argument("--kd-port", type=int, default=51000,
+                    help="the TCP port on 127.0.0.1 where the kernel debugger connects to "
+                         "the secondary serial port (default 51000); 0: no relay")
 parser.add_argument("--disk", type=pathlib.Path,
                     help="the image of a disk with a GPT, put into guest memory after the boot "
                          "arguments for the firmware to register as a RAM disk")
@@ -82,6 +93,8 @@ parser.add_argument("payload", type=pathlib.Path, nargs="?", default=DEFAULT_IMA
 args = parser.parse_args()
 if args.seconds < 0:
     parser.error("--seconds: not a time")
+if not 0 <= args.kd_port <= 65535:
+    parser.error("--kd-port: not a port")
 
 PAGE = 0x4000
 
@@ -284,36 +297,100 @@ if problems:
         print(f"PROBLEM: {problem}")
     sys.exit("Not going on: nothing was written to guest memory.")
 
-# ---- the firmware's serial output ----------------------------------------------------
+# ---- the firmware's serial output, and the kernel debugger ----------------------------
 
-class SerialReader:
-    """Prints what arrives on the secondary USB serial port, line by line."""
-    def __init__(self, path, log_path):
-        import serial
+class DebuggerRelay:
+    """Listens on 127.0.0.1 for the kernel debugger and passes bytes, as they are, between
+    it and the secondary serial port. One connection at a time; when it ends, the next one
+    is taken. Connections are taken from the moment the port is opened; bytes pass once
+    start() has been called."""
+    def __init__(self, port, dev):
+        self.where = f"127.0.0.1:{port}"
+        self.dev = dev
         try:
-            self.dev = serial.Serial(path, 115200, timeout=0.2)
-        except (OSError, serial.SerialException) as e:
-            sys.exit(f"{path}: cannot open the secondary serial port, where the firmware "
-                     f"prints ({e})")
-        self.log = open(log_path, "wb") if log_path else None
-        self.pending = b""
+            self.listener = socket.create_server(("127.0.0.1", port))
+        except OSError as e:
+            sys.exit(f"{self.where}: cannot listen for the kernel debugger ({e}); "
+                     "--kd-port 0 runs without")
+        self.client = None
+        self.lock = threading.Lock()
+        self.to_target = self.to_debugger = 0
         self.stopping = False
         self.thread = threading.Thread(target=self.run, daemon=True)
 
-    def emit(self, line):
-        print("FW> " + line.rstrip(b"\r").decode(errors="replace"), flush=True)
+    def say(self, text):
+        print("KD> " + text, flush=True)
+
+    def accept(self):
+        conn, addr = self.listener.accept()
+        with self.lock:
+            taken = self.client is not None
+            if not taken:
+                # send() below is not to wait for a debugger that does not read
+                conn.setblocking(False)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.client = conn
+        if taken:
+            conn.close()
+            self.say(f"a second connection, from {addr[0]}:{addr[1]}, was closed: a debugger "
+                     "is connected")
+        else:
+            self.say(f"debugger connected from {addr[0]}:{addr[1]}")
+
+    def drop(self, client, why):
+        with self.lock:
+            if self.client is not client:
+                return
+            self.client = None
+        client.close()
+        self.say(f"debugger gone: {why}")
 
     def run(self):
         while not self.stopping:
-            data = self.dev.read(4096)
-            if not data:
+            client = self.client
+            try:
+                ready = select.select([self.listener] + ([client] if client else []),
+                                      [], [], 0.2)[0]
+            except (OSError, ValueError):
+                # send_to_debugger() has dropped the client in the meantime
                 continue
-            if self.log:
-                self.log.write(data)
-                self.log.flush()
-            *lines, self.pending = (self.pending + data).split(b"\n")
-            for line in lines:
-                self.emit(line)
+            for sock in ready:
+                if sock is self.listener:
+                    self.accept()
+                    continue
+                try:
+                    data = sock.recv(65536)
+                except BlockingIOError:
+                    continue
+                except OSError as e:
+                    self.drop(sock, str(e))
+                    continue
+                if not data:
+                    self.drop(sock, "it closed the connection")
+                    continue
+                try:
+                    self.dev.write(data)
+                except Exception as e:
+                    self.say(f"{len(data)} bytes from the debugger not written to the serial "
+                             f"port ({e})")
+                    continue
+                self.to_target += len(data)
+
+    def send_to_debugger(self, data):
+        """Called by the thread that reads the serial port."""
+        client = self.client
+        if client is None:
+            return
+        try:
+            sent = client.send(data)
+        except BlockingIOError:
+            sent = 0
+        except OSError as e:
+            self.drop(client, str(e))
+            return
+        self.to_debugger += sent
+        if sent < len(data):
+            self.drop(client, "it does not read what the target sends")
 
     def start(self):
         self.thread.start()
@@ -322,16 +399,88 @@ class SerialReader:
         self.stopping = True
         if self.thread.is_alive():
             self.thread.join(2)
+            self.say(f"{self.to_target} bytes to the target, {self.to_debugger} bytes to the "
+                     "debugger")
+        if self.client:
+            self.client.close()
+        self.listener.close()
+
+# The debugger's protocol has no lines; this many bytes are shown at a time
+LINE_MAX = 512
+
+class SerialReader:
+    """Prints what arrives on the secondary USB serial port, line by line, and hands it to
+    the relay for the kernel debugger."""
+    def __init__(self, path, log_path, kd_port):
+        import serial
+        try:
+            self.dev = serial.Serial(path, 115200, timeout=0.2)
+        except (OSError, serial.SerialException) as e:
+            sys.exit(f"{path}: cannot open the secondary serial port, where the firmware "
+                     f"prints ({e})")
+        self.relay = DebuggerRelay(kd_port, self.dev) if kd_port else None
+        self.log = open(log_path, "wb") if log_path else None
+        self.pending = b""
+        self.stopping = False
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def emit(self, line):
+        """Text as it is; any other byte or character as an escape. The packets of the
+        debugger's protocol are binary, and they are not to be taken for commands by the
+        terminal this is printed on."""
+        line = line.rstrip(b"\r")
+        for start in range(0, max(len(line), 1), LINE_MAX):
+            text = line[start:start + LINE_MAX].decode(errors="backslashreplace")
+            print("FW> " + "".join(ch if ch.isprintable() or ch == "\t"
+                                   else ch.encode("unicode_escape").decode()
+                                   for ch in text), flush=True)
+
+    def run(self):
+        while not self.stopping:
+            # What is there, or the first byte within the timeout. Asking for more would
+            # hold a packet back until the timeout: a debugger waits for each one.
+            data = self.dev.read(self.dev.in_waiting or 1)
+            if not data:
+                continue
+            if self.log:
+                self.log.write(data)
+                self.log.flush()
+            if self.relay:
+                self.relay.send_to_debugger(data)
+            *lines, self.pending = (self.pending + data).split(b"\n")
+            for line in lines:
+                self.emit(line)
+            while len(self.pending) > LINE_MAX:
+                self.emit(self.pending[:LINE_MAX])
+                self.pending = self.pending[LINE_MAX:]
+
+    def start(self):
+        self.thread.start()
+        if self.relay:
+            self.relay.start()
+
+    def stop(self):
+        self.stopping = True
+        if self.thread.is_alive():
+            self.thread.join(2)
+        if self.relay:
+            self.relay.stop()
         if self.pending:
             self.emit(self.pending)
             self.pending = b""
         if self.log:
             self.log.close()
 
-reader = SerialReader(args.serial, args.serial_log)
+# Both are open from here on. m1n1 drops what the guest prints while nobody has the serial
+# port open, and the debugger gives up if nobody listens when it is started.
+reader = SerialReader(args.serial, args.serial_log, args.kd_port)
 print(f"Firmware output: {args.serial}")
+if reader.relay:
+    print(f"Kernel debugger: {reader.relay.where} "
+          f"(WinDbgX -k com:ipport={args.kd_port},port=127.0.0.1)")
 
 if args.check_only:
+    reader.stop()
     sys.exit(0)
 
 # ---- the hypervisor ------------------------------------------------------------------

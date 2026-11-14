@@ -4,13 +4,14 @@
 
 The proxy, ProxyUtils and HV are replaced by stand-ins that answer with the numbers the M4
 MacBook Pro reported on 2026-11-13 (R9a: SiliconNT docs/lab/2026-11-13-wfi-trap-plan/);
-m1n1.utils and m1n1.sysreg are the real ones. The secondary serial port is a pty. This
-checks what the script decides and what it would write where, not the hypervisor.
+m1n1.utils and m1n1.sysreg are the real ones. The secondary serial port is a pty, and the
+kernel debugger is a TCP client on this machine. This checks what the script decides, what
+it would write where and what it passes between the two, not the hypervisor.
 
 Usage: test_run_firmware.py [firmware image]   (needs build/m1n1.bin of this tree)
 """
 import sys, os, io, pathlib, runpy, struct, types, contextlib, threading, time, signal, enum
-import re, hashlib, tempfile
+import re, hashlib, tempfile, socket, select
 
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT = HERE / "run_firmware.py"
@@ -54,7 +55,7 @@ def make_fakes(case):
     rec = types.SimpleNamespace(loaded=None, bootargs_top=None, hv_start=None, stopped=None,
                                 hv_inited=False, memory_map=None, context_printed=False,
                                 entered=None, sigints=[], writes=[], writes_at_entry=None,
-                                readbacks=[])
+                                readbacks=[], printed=b"", kd={})
     heap_top = case.get("heap_top", M4["heap_top"])
 
     memory_map = FakeNode(**{
@@ -144,6 +145,8 @@ def make_fakes(case):
             assert self.smp is False
             self.mem_top = self.u.ba.phys_base + self.u.ba.mem_size
             rec.hv_inited = True
+            # The first thing after the checks, long before the guest runs
+            case.get("at_init", lambda rec: None)(rec)
         def _prepare_load(self):
             # as in proxyclient/m1n1/hv/__init__.py
             self.phys_base = guest_base = self.u.heap_top
@@ -161,8 +164,8 @@ def make_fakes(case):
             signal.signal(signal.SIGINT, lambda *a: rec.sigints.append(time.monotonic()))
             self.p.hv_start(self.entry, self.guest_base + self.bootargs_off)
             # The "firmware" prints once it runs: opening a serial port drops what came before
-            os.write(rec.master, b"Apple Silicon Project Mu Firmware (arm64/arm64e)\r\n"
-                                 b"If you can see this")
+            guest_prints(rec, b"Apple Silicon Project Mu Firmware (arm64/arm64e)\r\n"
+                              b"If you can see this")
             time.sleep(0.5)  # let the serial reader see it
             case.get("guest", lambda rec: None)(rec)
             # Stopped inside the image: by the timer or Ctrl-C (HV/USER_INTERRUPT), by the
@@ -195,10 +198,48 @@ def make_fakes(case):
         sys.modules[name] = mod
     return rec
 
-def run(case, *argv):
+def guest_prints(rec, data):
+    """The guest writes to its UART: bytes arrive on the secondary serial port."""
+    rec.printed += data
+    while data:
+        data = data[os.write(rec.master, data):]
+
+def guest_reads(rec, size, timeout=3):
+    """What has been written to the secondary serial port, which the guest's UART receives."""
+    data = b""
+    deadline = time.monotonic() + timeout
+    while len(data) < size and time.monotonic() < deadline:
+        if select.select([rec.master], [], [], 0.02)[0]:
+            data += os.read(rec.master, size - len(data))
+    return data
+
+def debugger_reads(sock, size, timeout=3):
+    """Up to size bytes from the relay; fewer if it closes the connection or nothing comes."""
+    data = b""
+    sock.settimeout(timeout)
+    try:
+        while len(data) < size:
+            more = sock.recv(size - len(data))
+            if not more:
+                return data + b"<closed>"
+            data += more
+    except TimeoutError:
+        return data + b"<nothing>"
+    return data
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+def run(case, *argv, kd_port=None):
+    """kd_port: None for a port that is free now, "default" to leave the option out."""
     rec = make_fakes(case)
     master, slave = os.openpty()
     rec.master = master
+    rec.kd_port = 51000 if kd_port == "default" else kd_port or free_port()
+    if kd_port != "default":
+        argv = ("--kd-port", str(rec.kd_port), *argv)
     out = io.StringIO()
     code = 0
     old_argv = sys.argv
@@ -501,6 +542,183 @@ check("a piece of the disk that arrives damaged stops the run before the guest i
 rec, out, code = run({"bad_readback": 2}, "--disk", disk_path, *image_args)
 check("a disk that reads back differently stops the run before the guest is entered",
       isinstance(code, str) and "reads back" in code and rec.hv_start is None, f"{code!r}")
+
+# ---- the relay for the kernel debugger -----------------------------------------------
+
+ALL = bytes(range(256))
+debugger = lambda rec: socket.create_connection(("127.0.0.1", rec.kd_port), timeout=3)
+PACKETS = [b"\x30\x30\x30\x30" + bytes([i]) for i in range(10)]
+ANSWERS = [b"\x69\x69\x69\x69" + bytes([i]) for i in range(10)]
+
+# 26. a debugger, a second one that has to wait its turn, and one after the first has left
+def kd_session(rec):
+    kd = rec.kd
+    a = debugger(rec)
+    a.sendall(ALL)
+    kd["to_target"] = guest_reads(rec, 256)
+    guest_prints(rec, b"\n" + ALL[::-1])
+    kd["to_debugger"] = debugger_reads(a, 257)
+    # the way the protocol goes: a packet from the target, an answer, the next packet
+    kd["packets"], kd["answers"] = [], []
+    started = time.monotonic()
+    for packet, answer in zip(PACKETS, ANSWERS):
+        guest_prints(rec, packet)
+        kd["packets"].append(debugger_reads(a, len(packet)))
+        a.sendall(answer)
+        kd["answers"].append(guest_reads(rec, len(answer)))
+    kd["exchange_time"] = time.monotonic() - started
+    b = debugger(rec)
+    kd["second"] = debugger_reads(b, 1)
+    b.close()
+    a.sendall(b"still here")
+    kd["first_after_second"] = guest_reads(rec, 10)
+    a.close()
+    time.sleep(0.5)
+    guest_prints(rec, b"\r\nprinted with no debugger\r\n")
+    time.sleep(0.3)
+    c = debugger(rec)
+    c.sendall(b"second debugger")
+    kd["again_to_target"] = guest_reads(rec, 15)
+    guest_prints(rec, b"for the second one\n")
+    kd["again_to_debugger"] = debugger_reads(c, 19)
+    kd["left_open"] = c
+
+log_path = pathlib.Path(tmp.name) / "serial.log"
+rec, out, code = run({"guest": kd_session}, "--serial-log", str(log_path), *image_args)
+kd = rec.kd
+check("a run with a debugger exits 0", code == 0, out[-900:])
+check("the script says where it listens",
+      f"Kernel debugger: 127.0.0.1:{rec.kd_port}" in out, out[:3000])
+check("debugger to target: all 256 byte values arrive unchanged", kd.get("to_target") == ALL,
+      f"{kd.get('to_target')}")
+check("target to debugger: all 256 byte values arrive unchanged",
+      kd.get("to_debugger") == b"\n" + ALL[::-1], f"{kd.get('to_debugger')}")
+check("ten packets and ten answers pass, one after the other",
+      kd.get("packets") == PACKETS and kd.get("answers") == ANSWERS,
+      f"{kd.get('packets')} {kd.get('answers')}")
+check("the ten exchanges take less than half a second", kd.get("exchange_time", 99) < 0.5,
+      f"{kd.get('exchange_time')}")
+check("a second connection is closed while a debugger is connected, and the first goes on",
+      kd.get("second") == b"<closed>" and kd.get("first_after_second") == b"still here",
+      f"{kd.get('second')} {kd.get('first_after_second')}")
+check("the script goes on when the debugger disconnects",
+      "FW> printed with no debugger\n" in out and rec.stopped == "EXIT_GUEST", out[-900:])
+check("another debugger can connect later, and bytes pass both ways",
+      kd.get("again_to_target") == b"second debugger" and
+      kd.get("again_to_debugger") == b"for the second one\n",
+      f"{kd.get('again_to_target')} {kd.get('again_to_debugger')}")
+check("the relay closes the connection when the run is over",
+      "left_open" in kd and debugger_reads(kd["left_open"], 1, 1) == b"<closed>")
+try:
+    with socket.create_server(("127.0.0.1", rec.kd_port)):
+        port_free = True
+except OSError:
+    port_free = False
+check("and no longer listens", port_free)
+check("who connected, who left and how much went through is reported",
+      out.count("KD> debugger connected") == 2 and out.count("KD> debugger gone") == 1 and
+      out.count("KD> a second connection") == 1 and
+      "KD> 331 bytes to the target, 326 bytes to the debugger" in out,
+      "\n".join(line for line in out.splitlines() if line.startswith("KD>")))
+check("what the target sends is shown without control characters: they are escaped",
+      all(ch.isprintable() or ch in "\n\t" for ch in out) and
+      "FW> \\xff\\xfe" in out and "\\x1b" in out and "\\x00" in out,
+      repr([line for line in out.splitlines() if line.startswith("FW>")])[:1500])
+check("text is shown as before",
+      "FW> Apple Silicon Project Mu Firmware (arm64/arm64e)\n" in out and
+      "FW> If you can see this\n" in out and "FW> for the second one\n" in out)
+check("the serial log has the raw bytes the target sent, all of them",
+      log_path.read_bytes() == rec.printed and len(rec.printed) > 400)
+
+# 27. a debugger that connects before the target has been touched; and data without lines
+def early(rec):
+    rec.kd["nothing_written"] = rec.loaded is None and rec.writes == []
+    try:
+        rec.kd["early"] = debugger(rec)
+        rec.kd["early"].sendall(b"\x69\x69\x69\x69early")
+    except OSError as e:
+        rec.kd["early_error"] = e
+
+FOR_EARLY = b"\nfor the early one\n" + b"\x01" * 2000 + b"\n"
+def early_guest(rec):
+    if "early" in rec.kd:
+        rec.kd["early_to_target"] = guest_reads(rec, 9)
+        guest_prints(rec, FOR_EARLY)
+        # Whether it also gets what the guest printed in the first moment is not decided
+        # here: the relay may or may not have taken the connection by then
+        got = debugger_reads(rec.kd["early"], len(rec.printed), 1)
+        rec.kd["early_to_debugger"] = got.removesuffix(b"<nothing>")
+
+rec, out, code = run({"at_init": early, "guest": early_guest}, "--disk", disk_path, *image_args)
+kd = rec.kd
+check("the relay listens before anything is written to the target",
+      code == 0 and kd.get("nothing_written") and "early" in kd, f"{kd.get('early_error')}")
+check("what a debugger sent before the guest ran reaches the guest",
+      kd.get("early_to_target") == b"\x69\x69\x69\x69early", f"{kd.get('early_to_target')}")
+check("and it gets what the guest prints",
+      kd.get("early_to_debugger", b"").endswith(FOR_EARLY) and
+      rec.printed.endswith(kd["early_to_debugger"]), f"{kd.get('early_to_debugger')}"[:300])
+check("data without line ends is shown in pieces, all of it",
+      out.count("\\x01") == 2000 and max(len(line) for line in out.splitlines()) <= 4 + 4 * 512,
+      f"{out.count(chr(92) + 'x01')} {max(len(line) for line in out.splitlines())}")
+
+# 28. a debugger that stops reading does not hold up the firmware's output
+def stuck(rec):
+    kd = rec.kd
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.connect(("127.0.0.1", rec.kd_port))
+    time.sleep(0.3)
+    writer = threading.Thread(target=guest_prints,
+                              args=(rec, b"\n" + (b"x" * 99 + b"\n") * 80000), daemon=True)
+    writer.start()
+    writer.join(30)
+    kd["all_printed"] = not writer.is_alive()
+    if not kd["all_printed"]:
+        # Held up after all. Closing the connection lets the output go on, so that this
+        # test comes to its end.
+        s.close()
+        writer.join(30)
+        return
+    time.sleep(0.5)
+    c = debugger(rec)
+    time.sleep(0.3)
+    guest_prints(rec, b"after the stuck one\n")
+    kd["after_stuck"] = debugger_reads(c, 20)
+    c.close()
+    s.close()
+
+rec, out, code = run({"guest": stuck}, *image_args)
+kd = rec.kd
+check("8 MB of output get through while a debugger does not read",
+      code == 0 and kd.get("all_printed") and out.count("FW> " + "x" * 99 + "\n") == 80000,
+      f"{kd.get('all_printed')} {out.count('FW> ' + 'x' * 99)}")
+check("the debugger that does not read is dropped, and the next one is served",
+      "KD> debugger gone: it does not read" in out and
+      kd.get("after_stuck") == b"after the stuck one\n", f"{kd.get('after_stuck')}")
+
+# 29. the port is taken
+with socket.create_server(("127.0.0.1", 0)) as taken:
+    for mode in ((), ("--check-only",)):
+        rec, out, code = run({}, *mode, *image_args, kd_port=taken.getsockname()[1])
+        check(f"a port that is taken stops the run {' '.join(mode)}".rstrip(),
+              isinstance(code, str) and f"127.0.0.1:{rec.kd_port}" in code and untouched(rec),
+              f"{code!r}")
+
+# 30. no relay
+rec, out, code = run({}, "--kd-port", "0", *image_args, kd_port="default")
+check("--kd-port 0: no relay, the firmware's output as before",
+      code == 0 and "KD>" not in out and "Kernel debugger" not in out and
+      "FW> If you can see this\n" in out, out[-600:])
+
+rec, out, code = run({}, "--kd-port", "70000", *image_args, kd_port="default")
+check("a port number that is none is refused", code != 0 and untouched(rec))
+
+# 31. the port when none is given. It may be taken on this machine; the refusal names it too.
+rec, out, code = run({}, "--check-only", *image_args, kd_port="default")
+check("the default port is 51000",
+      (code == 0 and "Kernel debugger: 127.0.0.1:51000" in out) or
+      (isinstance(code, str) and "127.0.0.1:51000" in code), f"{code!r}")
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)
