@@ -58,6 +58,9 @@ typedef enum _hv_entry_type {
     HV_CPU_SWITCH,
     HV_VIRTIO,
     HV_PANIC,
+    HV_GUEST_RESET, // the guest called PSCI SYSTEM_RESET
+    HV_GUEST_OFF,   // the guest called PSCI SYSTEM_OFF
+    HV_GUEST_HVC,   // the guest executed an hvc that must not return and cannot be carried out
 } hv_entry_type;
 
 /* VM */
@@ -105,6 +108,11 @@ void hv_vgic_report(void);
 void hv_wfi_init(void);
 bool hv_handle_wfx(u64 iss);
 void hv_wfi_report(void);
+
+/* PSCI for the guest, over hvc #0 */
+void hv_psci_init(void);
+bool hv_psci_hvc(struct exc_info *ctx, u16 imm);
+void hv_psci_report(void);
 
 /* AMCC interrupt filtering */
 bool hv_amcc_init(void);

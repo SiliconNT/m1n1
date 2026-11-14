@@ -654,7 +654,11 @@ bool hv_exc_sync(struct exc_info *ctx)
             break;
         case ESR_EC_HVC:
             hv_wdt_breadcrumb('H');
-            handled = hv_hvc_dispatch(ctx, FIELD_GET(ESR_ISS, ctx->esr));
+            /* A guest that is not macOS under the SPTM emulation gets PSCI and nothing else */
+            if (hv_sptm_mode == SPTM_NONE)
+                handled = hv_psci_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr));
+            else
+                handled = hv_hvc_dispatch(ctx, FIELD_GET(ESR_ISS, ctx->esr));
             protect_elr = true; // HVC alread leaves ELR past the instruction
             break;
     }

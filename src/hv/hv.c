@@ -205,6 +205,7 @@ void hv_init(void)
 
     // After CNTHCTL_EL2 has been set up above: this adds the event stream
     hv_wfi_init();
+    hv_psci_init();
 
     // Set deep WFI back to defaults
     if (cpu_features->apple_sysregs_unlocked)
@@ -317,6 +318,7 @@ void hv_start(void *entry, u64 regs[4])
     printf("HV: All CPUs exited\n");
     hv_vgic_report();
     hv_wfi_report();
+    hv_psci_report();
     spin_unlock(&bhl);
 }
 

@@ -39,6 +39,9 @@ class HV_EVENT(IntEnum):
     CPU_SWITCH = 5
     VIRTIO = 6
     PANIC = 7
+    GUEST_RESET = 8
+    GUEST_OFF = 9
+    GUEST_HVC = 10
 
 VMProxyHookData = Struct(
     "flags" / RegAdapter(MMIOTraceFlags),

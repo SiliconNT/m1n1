@@ -1457,6 +1457,12 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.CPU_SWITCH, self.handle_exception)
         self.iface.set_handler(START.HV, HV_EVENT.VIRTIO, self.handle_virtio)
         self.iface.set_handler(START.HV, HV_EVENT.PANIC, self.handle_bark)
+        # The hypervisor has stopped the guest for good (src/hv/hv_psci.c). Nothing handles
+        # these, so handle_exception() prints the context and runs the shell; whatever the
+        # answer, the guest does not run again.
+        self.iface.set_handler(START.HV, HV_EVENT.GUEST_RESET, self.handle_exception)
+        self.iface.set_handler(START.HV, HV_EVENT.GUEST_OFF, self.handle_exception)
+        self.iface.set_handler(START.HV, HV_EVENT.GUEST_HVC, self.handle_exception)
         self.iface.set_event_handler(EVENT.MMIOTRACE, self.handle_mmiotrace)
         self.iface.set_event_handler(EVENT.IRQTRACE, self.handle_irqtrace)
 
