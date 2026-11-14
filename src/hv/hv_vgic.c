@@ -457,8 +457,10 @@ static void vgic_retract(u32 vintid)
         u64 lr = vgic_read_lr(i);
 
         if (FIELD_GET(ICH_LR_STATE, lr) == ICH_LR_STATE_PENDING &&
-            FIELD_GET(ICH_LR_VINTID, lr) == vintid)
+            FIELD_GET(ICH_LR_VINTID, lr) == vintid) {
             vgic_write_lr(i, 0);
+            VGIC_PERCPU(retracted)++;
+        }
     }
 }
 

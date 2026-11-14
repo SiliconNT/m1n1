@@ -1417,6 +1417,159 @@ static void stress(int lrs, int n, bool spis)
     hv_vgic_report();
 }
 
+/* ---- a timer handler that ends the interrupt before it lowers the line ---- */
+
+struct vgic_counts {
+    long injected, maintenance, taken_back;
+};
+
+/* What hv_vgic_report() prints for one core; it leaves out a core that has done nothing */
+static struct vgic_counts report_counts(int cpu)
+{
+    struct vgic_counts n = {0, 0, 0};
+    char line[512], key[32];
+    FILE *f = tmpfile();
+    int saved;
+
+    CHECK(f);
+    fflush(stdout);
+    saved = dup(STDOUT_FILENO);
+    CHECK(saved >= 0 && dup2(fileno(f), STDOUT_FILENO) >= 0);
+    hv_vgic_report();
+    fflush(stdout);
+    CHECK(dup2(saved, STDOUT_FILENO) >= 0);
+    close(saved);
+
+    snprintf(key, sizeof(key), "HV: vGIC: CPU %d: ", cpu);
+    rewind(f);
+    while (fgets(line, sizeof(line), f))
+        if (!strncmp(line, key, strlen(key)))
+            CHECK(sscanf(line + strlen(key),
+                         "%*d ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, %ld taken back",
+                         &n.injected, &n.maintenance, &n.taken_back) == 3);
+    fclose(f);
+    return n;
+}
+
+static bool counts_grew(struct vgic_counts from, struct vgic_counts to, long injected,
+                        long maintenance, long taken_back)
+{
+    return to.injected - from.injected == injected &&
+           to.maintenance - from.maintenance == maintenance &&
+           to.taken_back - from.taken_back == taken_back;
+}
+
+/*
+ * One tick of the timer of core 6, handled the way ArmPkg/Drivers/TimerDxe does it: EOI first
+ * ("Signal end of interrupt early"), then read CNTV_CTL_EL0, then write the next compare value
+ * to CNTV_CVAL_EL0. With FEAT_ECV the hypervisor traps both timer registers
+ * (CNTHCTL_EL2.EL1TVT), and each trap ends in hv_update_fiq().
+ *
+ * The line is still high when the interrupt ends, so it is pending again, as with a GIC
+ * (IHI 0069H.b 4.1.2: "active and pending" if "the level has not been deasserted"), and it
+ * stops being pending when the line goes low (4.1.2, transition B1 or B2). The guest has IRQs
+ * masked throughout and must not see it a second time.
+ *
+ * trap_first: the trap of the read of CNTV_CTL_EL0 is taken before the maintenance interrupt
+ * of the EOI. That is the order the M4 showed in R10: at the Nth maintenance interrupt, 2N
+ * interrupts had been written to list registers.
+ */
+static void firmware_tick(bool trap_first)
+{
+    struct vgic_counts start = report_counts(6), now;
+
+    cur = 6;
+    cores[6].masked = true;
+    cores[6].timer = true;
+    CHECK(physical_interrupt()); /* the timer's FIQ */
+    CHECK(guest_ack() == HV_VGIC_INTID_VTIMER);
+    guest_eoi(HV_VGIC_INTID_VTIMER);
+
+    if (trap_first) {
+        hv_exit(); /* mrs CNTV_CTL_EL0 */
+        now = report_counts(6);
+        CHECK(counts_grew(start, now, 2, 0, 0));
+        CHECK(physical_interrupt()); /* the maintenance interrupt */
+        now = report_counts(6);
+        CHECK(counts_grew(start, now, 2, 1, 0));
+    } else {
+        CHECK(physical_interrupt());
+        now = report_counts(6);
+        CHECK(counts_grew(start, now, 2, 1, 0));
+        hv_exit();
+    }
+    cur = 6;
+    CHECK(FIELD_GET(ICH_LR_STATE, lr_of(6, HV_VGIC_INTID_VTIMER)) == ICH_LR_STATE_PENDING);
+    CHECK(nr_valid_lrs(6) == 1);
+
+    cores[6].timer = false;
+    hv_exit(); /* msr CNTV_CVAL_EL0 */
+    CHECK(nr_valid_lrs(6) == 0);
+    CHECK(!physical_interrupt());
+
+    cores[6].masked = false;
+    CHECK(guest_irq() == 1023);
+    now = report_counts(6);
+    CHECK(counts_grew(start, now, 2, 1, 1));
+}
+
+static void level_timer_tests(void)
+{
+    struct vgic_counts start, now;
+
+    /* The order of the test guests and of take_timer(): the line is low before the EOI */
+    reset(8);
+    start = report_counts(6);
+    for (int i = 0; i < 100; i++) {
+        cur = 6;
+        cores[6].timer = true;
+        CHECK(physical_interrupt());
+        CHECK(guest_ack() == HV_VGIC_INTID_VTIMER);
+        cores[6].timer = false;
+        hv_exit();
+        guest_eoi(HV_VGIC_INTID_VTIMER);
+        CHECK(physical_interrupt());
+        CHECK(!physical_interrupt() && nr_valid_lrs(6) == 0);
+    }
+    now = report_counts(6);
+    CHECK(counts_grew(start, now, 100, 100, 0));
+    printf("ok   timer lowered before the EOI, 100 ticks: 100 injected, 100 maintenance IRQs\n");
+
+    for (int order = 0; order < 2; order++) {
+        reset(8);
+        start = report_counts(6);
+        for (int i = 0; i < 100; i++)
+            firmware_tick(order);
+        now = report_counts(6);
+        CHECK(counts_grew(start, now, 200, 100, 100));
+        printf("ok   timer lowered after the EOI, %s first, 100 ticks: 200 injected, 100 "
+               "maintenance IRQs, 100 taken back, the guest sees each tick once\n",
+               order ? "the trap" : "the maintenance IRQ");
+    }
+
+    /* The same with one list register: the second one is not there to take the interrupt */
+    reset(1);
+    start = report_counts(6);
+    cur = 6;
+    cores[6].masked = true;
+    cores[6].timer = true;
+    CHECK(physical_interrupt());
+    CHECK(guest_ack() == HV_VGIC_INTID_VTIMER);
+    guest_eoi(HV_VGIC_INTID_VTIMER);
+    hv_exit(); /* mrs CNTV_CTL_EL0: the only list register still waits for the maintenance IRQ */
+    CHECK(nr_valid_lrs(6) == 0);
+    CHECK(physical_interrupt());
+    CHECK(FIELD_GET(ICH_LR_STATE, lr_of(6, HV_VGIC_INTID_VTIMER)) == ICH_LR_STATE_PENDING);
+    cores[6].timer = false;
+    hv_exit(); /* msr CNTV_CVAL_EL0 */
+    CHECK(nr_valid_lrs(6) == 0 && !physical_interrupt());
+    cores[6].masked = false;
+    CHECK(guest_irq() == 1023);
+    now = report_counts(6);
+    CHECK(counts_grew(start, now, 2, 1, 1));
+    printf("ok   the same with one list register\n");
+}
+
 /* ---- WFI ---- */
 
 /* The guest on the current core executes WFI: trap, hv_handle_wfx, hv_exc_exit. Returns the WFEs. */
@@ -1806,6 +1959,7 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     sgi_tests();
     dist_tests();
+    level_timer_tests();
     wfi_tests();
     stress(8, n, false);
     stress(2, n, false);
