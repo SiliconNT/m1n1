@@ -34,7 +34,11 @@ serial port (/dev/m1n1-sec), which this script reads and prints with a "FW> " pr
 
 The script needs no input: it lets the firmware run for --seconds, then interrupts the
 hypervisor, prints where the firmware was and the registers that tell what it was doing,
-leaves the guest and exits. An unhandled guest exception ends the run the same way.
+leaves the guest and exits. With --seconds 0 there is no limit and Ctrl-C does the same.
+An unhandled guest exception ends the run the same way, and so does a guest that the
+hypervisor has stopped for good: PSCI SYSTEM_OFF, SYSTEM_RESET, or a call it cannot carry
+out (HV_GUEST_OFF, HV_GUEST_RESET, HV_GUEST_HVC in src/hv/hv.h). The line that starts with
+"Run ended:" says which it was.
 
 Until the firmware's CpuDxe driver installs exception vectors, VBAR_EL1 is 0 (hv_init()).
 An exception the firmware takes itself before that shows up as an instruction abort at
@@ -51,7 +55,8 @@ DEFAULT_IMAGE = (pathlib.Path.home() / "src" / "siliconnt-firmware" / "Build" /
 
 parser = argparse.ArgumentParser(description="Run the SiliconNT UEFI firmware under the hypervisor")
 parser.add_argument("--seconds", type=int, default=120,
-                    help="how long the firmware may run before it is stopped (default 120)")
+                    help="how long the firmware may run before it is stopped (default 120); "
+                         "0: until Ctrl-C or until the guest stops by itself")
 parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "build" / "m1n1.bin",
                     help="the raw m1n1.bin that is supposed to be running on the target")
 parser.add_argument("--serial", default=os.environ.get("M1N1SECDEVICE", "/dev/m1n1-sec"),
@@ -65,6 +70,8 @@ parser.add_argument("--check-only", action="store_true",
                          "would go on this machine; write nothing to guest memory, then exit")
 parser.add_argument("payload", type=pathlib.Path, nargs="?", default=DEFAULT_IMAGE)
 args = parser.parse_args()
+if args.seconds < 0:
+    parser.error("--seconds: not a time")
 
 PAGE = 0x4000
 
@@ -346,16 +353,38 @@ load_firmware(hv, image, layout)
 # Does nothing unless M1N1_PMU_RESET=1 (proxyclient/m1n1/hw/pmu.py)
 PMU(u).reset_panic_counter()
 
+# The events with which the hypervisor says that it has stopped the guest for good
+# (src/hv/hv_psci.c), by their names in HV_EVENT (proxyclient/m1n1/hv/types.py)
+GUEST_STOPS = {
+    "GUEST_OFF": "the guest called PSCI SYSTEM_OFF",
+    "GUEST_RESET": "the guest called PSCI SYSTEM_RESET",
+    "GUEST_HVC": "the guest made a call that the hypervisor cannot carry out and that must "
+                 "not return: PSCI CPU_ON or CPU_OFF, or an hvc other than #0 (m1n1 has "
+                 "printed which)",
+}
+timed_out = threading.Event()
+
 # HV.handle_exception() calls run_shell() on a user interrupt and on anything it could not
-# handle. Report and leave the guest instead of waiting for input.
+# handle, which includes the three events above. Report and leave the guest instead of
+# waiting for input.
 def stop_guest(entry_msg=None, exit_msg=None):
     ctx = hv.ctx
+    event = getattr(hv.exc_code, "name", str(hv.exc_code))
+    # SIGINT, from the timer below or from the keyboard, comes back as this event
+    interrupted = hv.exc_reason == START.HV and event == "USER_INTERRUPT"
+    if interrupted:
+        why = f"--seconds {args.seconds} ran out" if timed_out.is_set() else "interrupted (Ctrl-C)"
+    elif hv.exc_reason == START.HV and event in GUEST_STOPS:
+        why = GUEST_STOPS[event]
+    else:
+        why = "a guest exception that nobody handled"
+    print(f"Run ended: {why} ({hv.exc_reason.name}/{event})")
     where = ""
     if layout.image_base <= ctx.elr < layout.image_base + layout.image_size:
         where = f" (firmware image + 0x{ctx.elr - layout.image_base:x})"
     print(f"Firmware stopped at PC 0x{ctx.elr:x}{where}")
-    if hv.exc_reason == START.HV:
-        # The time ran out. For an exception, HV.handle_exception() has printed this already
+    if interrupted:
+        # For everything else, HV.handle_exception() has printed this already
         try:
             u.print_context(ctx, False)
         except Exception as e:
@@ -367,13 +396,20 @@ hv.run_shell = stop_guest
 
 # Count from the moment the guest is entered: HV.start() has installed its SIGINT handler by
 # then, and the setup before that takes a while.
-timer = threading.Timer(args.seconds, lambda: os.kill(os.getpid(), signal.SIGINT))
+def time_out():
+    timed_out.set()
+    os.kill(os.getpid(), signal.SIGINT)
+
+timer = threading.Timer(args.seconds, time_out)
 timer.daemon = True
 enter_guest = p.hv_start
 
 def enter_guest_timed(*hv_start_args):
     print(f"Entering the firmware at 0x{hv_start_args[0]:x}, x0 = 0x{hv_start_args[1]:x}")
-    timer.start()
+    if args.seconds:
+        timer.start()
+    else:
+        print("No time limit: Ctrl-C ends the run")
     return enter_guest(*hv_start_args)
 
 p.hv_start = enter_guest_timed
@@ -382,6 +418,8 @@ reader.start()
 try:
     hv.start()
 finally:
+    # A run that has ended by itself is not to be interrupted afterwards
+    timer.cancel()
     reader.stop()
 
 print("Hypervisor exited.")
