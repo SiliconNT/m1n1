@@ -14,6 +14,7 @@ m1n1 occupies is not part of the memory the boot arguments describe:
     phys_base + 32 MB     Apple device tree, as edited by HV.setup_adt()
     next 2 MB boundary    the firmware image, entered at its first byte
     after the image       Apple boot arguments, one 16 KB page
+    next 2 MB boundary    the boot disk image, with --disk
     ...
     mem_top - 128 MB      the firmware's own work area: stack, hand-off blocks, DXE core
     mem_top               end of guest RAM
@@ -23,6 +24,12 @@ header leaves its load address in x1 and jumps to the entry code. The firmware u
 boot arguments and the device tree in place and reserves both ranges; it copies neither.
 SEPFW, the trust cache and the preoslog buffer, which HV.load_raw() copies for macOS, are
 not copied: the firmware reads none of them.
+
+The boot disk is where the Windows boot manager and loader read their files: an image of
+a disk with a GPT. The firmware has no storage driver; it is to register the memory the
+image lies in as a RAM disk, in place. It learns the address and the size in bytes from
+an entry RAMDisk in /chosen/memory-map of the device tree, next to DeviceTree and
+BootArgs. Without --disk there is no such entry.
 
 Before anything is written to the target, the script checks that these ranges fit in guest
 RAM, that the framebuffer lies outside it, that nothing iBoot listed in
@@ -45,7 +52,7 @@ An exception the firmware takes itself before that shows up as an instruction ab
 0x200 that the hypervisor cannot handle; ELR_EL12, ESR_EL12 and FAR_EL12 in the final
 dump then describe the original exception.
 """
-import sys, os, pathlib, argparse, signal, struct, threading, hashlib
+import sys, os, pathlib, argparse, signal, struct, threading, hashlib, time
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.append(str(HERE.parents[1] / "proxyclient"))
@@ -63,8 +70,11 @@ parser.add_argument("--serial", default=os.environ.get("M1N1SECDEVICE", "/dev/m1
                     help="the secondary USB serial port, where the firmware prints")
 parser.add_argument("--serial-log", type=pathlib.Path,
                     help="also write the raw bytes the firmware prints to this file")
+parser.add_argument("--disk", type=pathlib.Path,
+                    help="the image of a disk with a GPT, put into guest memory after the boot "
+                         "arguments for the firmware to register as a RAM disk")
 parser.add_argument("--image-only", action="store_true",
-                    help="only check the firmware image; do not open any port")
+                    help="only check the firmware image and the disk image; do not open any port")
 parser.add_argument("--check-only", action="store_true",
                     help="check the image, which m1n1 is running and where everything "
                          "would go on this machine; write nothing to guest memory, then exit")
@@ -83,6 +93,18 @@ GUEST_GAP = 32 << 20
 # Where the image goes: a multiple of every alignment its modules ask for (64 KB at most)
 IMAGE_ALIGN = 0x200000
 BOOTARGS_SIZE = PAGE
+
+# The boot disk starts on a 2 MB boundary like the image. The firmware's pages are 4 KB,
+# and it is to reserve exactly the pages the disk lies in.
+DISK_ALIGN = 0x200000
+DISK_PAGE = 0x1000
+# The primary GPT header is the second sector of a disk with 512-byte sectors
+GPT_OFFSET = 512
+GPT_SIGNATURE = b"EFI PART"
+# The disk goes up in pieces: a compressed piece has to fit into the 128 MB of the target's
+# memory that this script keeps as its heap (ProxyUtils below), and P_GZDEC takes its sizes
+# in 32 bits (src/proxy.c)
+DISK_PIECE = 16 << 20
 
 # ---- the image, offline --------------------------------------------------------------
 
@@ -115,6 +137,24 @@ entry_code = check_image(image)
 print(f"Firmware image: {args.payload}")
 print(f"  size 0x{len(image):x}, SHA-256 {hashlib.sha256(image).hexdigest()}")
 print(f"  entered at offset 0, entry code at offset 0x{entry_code:x}")
+
+disk = args.disk.read_bytes() if args.disk else None
+
+def check_disk(disk):
+    """What the firmware needs of the boot disk to register it and to find a partition."""
+    if not disk:
+        sys.exit(f"{args.disk}: empty")
+    if len(disk) % DISK_PAGE:
+        sys.exit(f"{args.disk}: size 0x{len(disk):x} is not a multiple of 0x{DISK_PAGE:x}")
+    if disk[GPT_OFFSET:GPT_OFFSET + len(GPT_SIGNATURE)] != GPT_SIGNATURE:
+        sys.exit(f"{args.disk}: no GPT header: no '{GPT_SIGNATURE.decode()}' at offset "
+                 f"{GPT_OFFSET}")
+
+if disk is not None:
+    check_disk(disk)
+    print(f"Boot disk: {args.disk}")
+    print(f"  size 0x{len(disk):x} ({len(disk) / (1 << 20):.1f} MB), "
+          f"SHA-256 {hashlib.sha256(disk).hexdigest()}")
 if args.image_only:
     sys.exit(0)
 
@@ -159,7 +199,7 @@ def overlaps(a_base, a_size, b_base, b_size):
 class Layout:
     """Mirrors HV._prepare_load(), so that it can be checked before the hypervisor is
     initialized. load_firmware() asserts that the two agree."""
-    def __init__(self, u, image_len):
+    def __init__(self, u, image_len, disk_len):
         self.phys_base = u.heap_top
         self.mem_top = u.ba.phys_base + u.ba.mem_size
         self.adt_base = self.phys_base + GUEST_GAP
@@ -168,6 +208,10 @@ class Layout:
         self.image_size = image_len
         self.bootargs = self.image_base + align(image_len)
         self.end = self.bootargs + BOOTARGS_SIZE
+        self.disk_base = align_up(self.end, DISK_ALIGN)
+        self.disk_size = disk_len
+        # top_of_kernel_data in the boot arguments: where what was put here ends
+        self.top = align(self.disk_base + disk_len) if disk_len else self.end
         self.uefi_base = self.mem_top - UEFI_REGION_SIZE
         self.used = [
             ("device tree", self.adt_base, self.adt_size),
@@ -175,8 +219,10 @@ class Layout:
             ("boot arguments", self.bootargs, BOOTARGS_SIZE),
             ("firmware work area", self.uefi_base, UEFI_REGION_SIZE),
         ]
+        if disk_len:
+            self.used.insert(3, ("boot disk", self.disk_base, self.disk_size))
 
-layout = Layout(u, len(image))
+layout = Layout(u, len(image), len(disk) if disk is not None else 0)
 problems = []
 
 print(f"m1n1: base 0x{u.base:x}, iBoot's memory 0x{u.ba.phys_base:x} .. 0x{layout.mem_top:x}")
@@ -188,6 +234,9 @@ for name, base, size in layout.used:
         problems.append(f"{name} does not fit in guest RAM")
 if layout.end > layout.uefi_base:
     problems.append("the image and the boot arguments reach into the firmware work area")
+elif layout.disk_size and layout.disk_base + layout.disk_size > layout.uefi_base:
+    problems.append("the boot disk reaches into the firmware work area: there is room for "
+                    f"{max(layout.uefi_base - layout.disk_base, 0) >> 20} MB")
 
 # The firmware declares all of guest RAM as memory and maps the framebuffer separately
 video = u.ba.video
@@ -323,7 +372,38 @@ if u.mrs(ICH_MISR_EL2):
 uart_base = hv.adt["/arm-io/uart0"].get_reg(0)[0]
 print(f"Virtual UART at 0x{uart_base:x}")
 
-def load_firmware(hv, image, layout):
+def load_disk(disk, base):
+    """The boot disk goes up the way the image does, compressed, but in pieces. Each piece
+    is checked where it lands: a gzip stream ends with the CRC-32 of the data, m1n1
+    compares that with the CRC-32 of what it has unpacked (tinf_gzip_uncompress(),
+    src/tinf/tinfgzip.c) and P_GZDEC returns an error instead of the size if they differ,
+    which ProxyUtils.compressed_writemem() asserts it does not. The two ends are read back
+    as well: that says the disk is at this address, which a checksum does not."""
+    print(f"Loading the boot disk (0x{len(disk):x} bytes) at 0x{base:x}...", flush=True)
+    started = shown = time.monotonic()
+    for off in range(0, len(disk), DISK_PIECE):
+        piece = disk[off:off + DISK_PIECE]
+        try:
+            u.compressed_writemem(base + off, piece)
+        except AssertionError:
+            sys.exit(f"Boot disk: the piece at offset 0x{off:x} did not arrive intact. "
+                     "The guest was not entered.")
+        now = time.monotonic()
+        if now - shown >= 5:
+            shown = now
+            done = off + len(piece)
+            print(f"  0x{done:x} bytes ({100 * done // len(disk)}%) after "
+                  f"{now - started:.0f} s", flush=True)
+    elapsed = max(time.monotonic() - started, 0.001)
+    for off in sorted({0, len(disk) - DISK_PAGE}):
+        if iface.readmem(base + off, DISK_PAGE) != disk[off:off + DISK_PAGE]:
+            sys.exit(f"Boot disk: the page at offset 0x{off:x} reads back as something else. "
+                     "The guest was not entered.")
+    print(f"Boot disk: 0x{len(disk):x} bytes in {elapsed:.1f} s, "
+          f"{len(disk) / (1 << 20) / elapsed:.1f} MB/s; every piece passed m1n1's CRC-32 "
+          "check, the first and the last page read back the same")
+
+def load_firmware(hv, image, disk, layout):
     """What HV.load_raw() does, without the parts only macOS needs, entering the image at
     its first byte."""
     hv._prepare_load()
@@ -345,10 +425,14 @@ def load_firmware(hv, image, layout):
     memory_map = hv.adt["chosen"]["memory-map"]
     memory_map.DeviceTree = (layout.adt_base, layout.adt_size)
     memory_map.BootArgs = (layout.bootargs, BOOTARGS_SIZE)
+    if disk is not None:
+        load_disk(disk, layout.disk_base)
+        # The size in bytes, not rounded: it is the size of the disk
+        memory_map.RAMDisk = (layout.disk_base, layout.disk_size)
 
-    hv._write_boot_args(layout.end)
+    hv._write_boot_args(layout.top)
 
-load_firmware(hv, image, layout)
+load_firmware(hv, image, disk, layout)
 
 # Does nothing unless M1N1_PMU_RESET=1 (proxyclient/m1n1/hw/pmu.py)
 PMU(u).reset_panic_counter()
