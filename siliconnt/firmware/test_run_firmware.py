@@ -697,6 +697,40 @@ check("the debugger that does not read is dropped, and the next one is served",
       "KD> debugger gone: it does not read" in out and
       kd.get("after_stuck") == b"after the stuck one\n", f"{kd.get('after_stuck')}")
 
+# 28b. a debugger that falls behind for a moment is kept, and misses nothing. The debugger
+# does not connect again once its connection is closed, so a burst of the firmware's output
+# must not cost it the connection.
+BURST = b"\n" + b"".join(b"%07d " % i + b"y" * 91 + b"\n" for i in range(10000))
+def behind(rec):
+    kd = rec.kd
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.connect(("127.0.0.1", rec.kd_port))
+    time.sleep(0.3)
+    writer = threading.Thread(target=guest_prints, args=(rec, BURST), daemon=True)
+    writer.start()
+    time.sleep(1.0)
+    s.settimeout(5)
+    got = b""
+    try:
+        while len(got) < len(BURST):
+            piece = s.recv(65536)
+            if not piece:
+                break
+            got += piece
+    except OSError:
+        pass
+    writer.join(30)
+    kd["behind_got"] = got
+    s.close()
+
+rec, out, code = run({"guest": behind}, *image_args)
+kd = rec.kd
+check("a debugger that falls behind by 1 MB for a second is not dropped and gets every byte",
+      code == 0 and kd.get("behind_got") == BURST and "it does not read" not in out,
+      f"{len(kd.get('behind_got', b''))} of {len(BURST)}; "
+      f"{[l for l in out.splitlines() if l.startswith('KD>')]}")
+
 # 29. the port is taken
 with socket.create_server(("127.0.0.1", 0)) as taken:
     for mode in ((), ("--check-only",)):
