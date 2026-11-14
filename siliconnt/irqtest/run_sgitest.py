@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Run the sgitest guest (sgitest.c) under the hypervisor, or, given build/gictest.bin or
-build/wfitest.bin as the payload, the gictest guest (gictest.c) or the wfitest guest
-(wfitest.c): the three share their entry code and image header.
+"""Run the sgitest guest (sgitest.c) under the hypervisor, or, given build/gictest.bin,
+build/wfitest.bin or build/pscitest.bin as the payload, the gictest guest (gictest.c), the
+wfitest guest (wfitest.c) or the pscitest guest (pscitest.c): the four share their entry
+code and image header.
 
-The m1n1 on the target has to be built from this tree: the test is about src/hv/hv_vgic.c.
+The m1n1 on the target has to be built from this tree: the tests are about src/hv/hv_vgic.c,
+src/hv/hv_wfi.c and src/hv/hv_psci.c.
+
+pscitest takes an argument, --guest-arg: 0x100 makes it expect exactly the answers of the
+hypervisor's PSCI, and the low four bits choose the call it ends with (0 SYSTEM_OFF,
+1 SYSTEM_RESET, 2 hvc #1, 3 CPU_ON, 4 CPU_OFF). None of those calls comes back: the
+hypervisor stops the guest and says why, and this script leaves the guest right then.
 
 Without --secondary the guest runs on the boot CPU only and no other CPU is touched. Each
 --secondary N adds the CPU with that m1n1 index (the cpu-id of its ADT node): the script
@@ -12,7 +19,7 @@ starts it, one at a time and only after putting m1n1's idle loop into WFE mode, 
 never waits in WFI (M4 loses CPU state there, src/kboot.c). The guest gets onto it the way
 upstream gets an Apple guest onto its secondary CPUs: it writes the CPU start register of the
 power manager, the hypervisor intercepts that, and this script answers with
-hv_start_secondary(). There is no PSCI in the hypervisor yet.
+hv_start_secondary(). The hypervisor's PSCI has no CPU_ON yet.
 
 The guest sets up the GIC itself, the way the Windows kernel does: the script tells it where
 the hypervisor emulates the Distributor and the Redistributors.
@@ -22,7 +29,8 @@ on the proxy console, so they show up in the output of this script.
 
 The script needs no input: it lets the guest run for --seconds, then interrupts the
 hypervisor, prints the list registers of the boot CPU, leaves the guest and exits. An
-unhandled guest exception ends the run the same way.
+unhandled guest exception ends the run the same way, and so does a guest that the hypervisor
+has stopped for good (HV_GUEST_RESET, HV_GUEST_OFF, HV_GUEST_HVC in src/hv/hv.h).
 """
 import sys, os, pathlib, argparse, signal, struct, threading
 
@@ -36,6 +44,8 @@ parser.add_argument("--seconds", type=int, default=60,
                     help="how long the guest may run before it is stopped (default 60)")
 parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "build" / "m1n1.bin",
                     help="the raw m1n1.bin that is supposed to be running on the target")
+parser.add_argument("--guest-arg", type=lambda s: int(s, 0), default=0, metavar="N",
+                    help="what goes into the argument field of the image header (default 0)")
 parser.add_argument("--check-only", action="store_true",
                     help="only check which m1n1 is running and, for each --secondary, where "
                          "that CPU would start; then exit")
@@ -54,6 +64,7 @@ MAX_CPUS = 4
 START_VAL_OFF = START_REG_OFF + 8 * MAX_CPUS
 GICD_BASE_OFF = START_VAL_OFF + 8 * MAX_CPUS
 GICR_BASE_OFF = GICD_BASE_OFF + 8
+ARG_OFF = GICR_BASE_OFF + 8
 
 # Where the hypervisor puts the Distributor and the Redistributors: HV_VGIC_DIST_BASE and
 # HV_VGIC_REDIST_BASE in src/hv/hv.h
@@ -62,7 +73,7 @@ GICR_BASE = 0x51_0000_0000
 
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
-    sys.exit(f"{args.payload}: not an sgitest, gictest or wfitest image of this tree")
+    sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest or pscitest image of this tree")
 if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
     sys.exit(f"{args.payload}: UART base already filled in")
 secondary_entry_off = struct.unpack_from("<Q", image, SECONDARY_OFF)[0]
@@ -195,7 +206,9 @@ struct.pack_into("<Q", image, UART_BASE_OFF, uart_base)
 struct.pack_into("<Q", image, NR_CPUS_OFF, len(slots))
 struct.pack_into("<Q", image, GICD_BASE_OFF, GICD_BASE)
 struct.pack_into("<Q", image, GICR_BASE_OFF, GICR_BASE)
+struct.pack_into("<Q", image, ARG_OFF, args.guest_arg)
 print(f"GIC Distributor at 0x{GICD_BASE:x}, Redistributors from 0x{GICR_BASE:x}")
+print(f"Guest argument: 0x{args.guest_arg:x}")
 for slot, index in enumerate(slots):
     if slot == 0:
         continue
@@ -235,6 +248,9 @@ PMU(u).reset_panic_counter()
 # handle. Report and leave the guest instead of waiting for input.
 def stop_guest(entry_msg=None, exit_msg=None):
     cpu = hv.ctx.cpu_id if hv.ctx is not None else "?"
+    # START.HV with USER_INTERRUPT: the time ran out. With GUEST_RESET, GUEST_OFF or
+    # GUEST_HVC: the hypervisor has stopped the guest for good (src/hv/hv_psci.c)
+    print(f"Guest stopped: {hv.exc_reason.name}/{getattr(hv.exc_code, 'name', hv.exc_code)}")
     dump_state(f"guest stopped, on CPU {cpu}")
     return EXC_RET.EXIT_GUEST
 

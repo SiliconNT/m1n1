@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# EL1 test guests for src/hv/hv_vgic.c and src/hv/hv_wfi.c.
+# EL1 test guests for src/hv/hv_vgic.c, src/hv/hv_wfi.c and src/hv/hv_psci.c.
 #
-#   make               build/irqtest.bin, build/sgitest.bin, build/gictest.bin and
-#                      build/wfitest.bin, the raw images that run_irqtest.py and
-#                      run_sgitest.py load under the hypervisor
+#   make               build/irqtest.bin, build/sgitest.bin, build/gictest.bin,
+#                      build/wfitest.bin and build/pscitest.bin, the raw images that
+#                      run_irqtest.py and run_sgitest.py load under the hypervisor
 #   make qemu          run irqtest.bin on QEMU's virt machine (GICv3) to check the guest itself
 #   make qemu-sgi      the same for sgitest.bin, on one CPU
 #   make qemu-sgi-smp  ...and on QEMU_SMP_CPUS CPUs
@@ -12,6 +12,10 @@
 #   make qemu-gic-smp  ...and on QEMU_SMP_CPUS CPUs
 #   make qemu-wfi      the same for wfitest.bin, on one CPU
 #   make qemu-wfi-smp  ...and on QEMU_SMP_CPUS CPUs
+#   make qemu-psci     the same for pscitest.bin, which ends with SYSTEM_OFF
+#   make qemu-psci-reset   ...and with SYSTEM_RESET
+#   make qemu-psci-strict  pscitest.bin expecting the hypervisor's answers, which QEMU's
+#                      PSCI does not give: shows that those checks can fail
 
 ARCH ?= aarch64-linux-gnu-
 QEMU ?= qemu-system-aarch64
@@ -24,16 +28,16 @@ OBJCOPY := $(ARCH)objcopy
 QEMU_FLAGS := -M virt,gic-version=3 -cpu cortex-a72 -m 64 -nodefaults \
 	-display none -monitor none -serial stdio
 
-# sgitest.c, gictest.c and wfitest.c run with the MMU off (unaligned accesses fault) at an address
+# sgitest.c, gictest.c, wfitest.c and pscitest.c run with the MMU off (unaligned accesses fault) at an address
 # they do not know
 SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp clean
+.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp \n	qemu-psci qemu-psci-reset qemu-psci-strict clean
 .SECONDARY:
 
-all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin
+all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin
 
 build/irqtest.o: irqtest.S
 	@mkdir -p build
@@ -55,14 +59,14 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/wfitest.o: build/%.o: %.c sgitest.h gic.h
+build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o: build/%.o: %.c sgitest.h gic.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
-build/sgitest.elf build/gictest.elf build/wfitest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
+build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
 	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/$*.o
 
-build/sgitest.bin build/gictest.bin build/wfitest.bin: build/%.bin: build/%.elf
+build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin: build/%.bin: build/%.elf
 	$(OBJCOPY) -O binary $< $@
 
 # build/<image>-qemu-<cpus>.elf
@@ -74,6 +78,13 @@ build/gictest-qemu-%.o: sgitest-qemu.S sgitest.h build/gictest.bin
 
 build/wfitest-qemu-%.o: sgitest-qemu.S sgitest.h build/wfitest.bin
 	$(CC) -c -Wall -Werror -DNR_CPUS=$* -DIMAGE='"build/wfitest.bin"' -o $@ $<
+
+# build/pscitest-qemu-<argument for the image header>.elf, on one CPU
+build/pscitest-qemu-%.o: sgitest-qemu.S sgitest.h build/pscitest.bin
+	$(CC) -c -Wall -Werror -DNR_CPUS=1 -DGUEST_ARG=$* -DIMAGE='"build/pscitest.bin"' -o $@ $<
+
+build/pscitest-qemu-%.elf: build/pscitest-qemu-%.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
 
 build/sgitest-qemu-%.elf: build/sgitest-qemu-%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
@@ -105,6 +116,16 @@ qemu-wfi: build/wfitest-qemu-1.elf
 
 qemu-wfi-smp: build/wfitest-qemu-$(QEMU_SMP_CPUS).elf
 	-timeout 60 $(QEMU) $(QEMU_FLAGS) -smp $(QEMU_SMP_CPUS) -kernel $<
+
+# pscitest ends with a call that makes QEMU exit; with -no-reboot a reset does too
+qemu-psci: build/pscitest-qemu-0x0.elf
+	-timeout 20 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-psci-reset: build/pscitest-qemu-0x1.elf
+	-timeout 20 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-psci-strict: build/pscitest-qemu-0x100.elf
+	-timeout 20 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
 clean:
 	rm -rf build

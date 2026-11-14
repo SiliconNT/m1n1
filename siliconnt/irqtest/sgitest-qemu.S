@@ -1,15 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Runs sgitest.bin or gictest.bin (IMAGE) on QEMU's "virt" machine with a real (emulated)
- * GICv3, on NR_CPUS CPUs, to check the guest itself before it goes anywhere near the
- * hypervisor: `make qemu-sgi`, `make qemu-sgi-smp`, `make qemu-gic`, `make qemu-gic-smp`.
+ * Runs sgitest.bin, gictest.bin, wfitest.bin or pscitest.bin (IMAGE) on QEMU's "virt" machine
+ * with a real (emulated) GICv3, on NR_CPUS CPUs, to check the guest itself before it goes
+ * anywhere near the hypervisor: `make qemu-sgi`, `make qemu-sgi-smp`, `make qemu-gic`,
+ * `make qemu-gic-smp`, `make qemu-wfi`, `make qemu-wfi-smp`, `make qemu-psci`,
+ * `make qemu-psci-reset`. GUEST_ARG, if there is one, goes into the argument field of the
+ * image header.
  *
  * QEMU enters this at EL1 on CPU 0 with the other CPUs off. It does what firmware does before
  * Windows starts: it wakes the Redistributor of each CPU, which Windows never does. The
  * Distributor and the rest of the Redistributors are the guest's business. Then it fills in
  * the header of the image, starts the other CPUs through QEMU's PSCI and jumps to the image.
- * On the hypervisor there is no PSCI yet; the loader starts the other CPUs there
+ * The hypervisor's PSCI has no CPU_ON yet; the loader starts the other CPUs there
  * (run_sgitest.py).
  */
 
@@ -30,6 +33,7 @@
 #define HDR_SECONDARY_OFF 0x20
 #define HDR_GICD_BASE     (0x28 + 16 * MAX_CPUS)
 #define HDR_GICR_BASE     (0x30 + 16 * MAX_CPUS)
+#define HDR_ARG           (0x38 + 16 * MAX_CPUS)
 
     .text
     .globl  _start
@@ -47,6 +51,10 @@ _start:
     str     x1, [x20, #HDR_GICD_BASE]
     ldr     x1, =GICR_BASE
     str     x1, [x20, #HDR_GICR_BASE]
+#ifdef GUEST_ARG
+    ldr     x1, =GUEST_ARG
+    str     x1, [x20, #HDR_ARG]
+#endif
 
     /* On this machine CPU n has MPIDR_EL1.Aff0 == n, and the rest of the affinity is 0 */
     mov     x21, #1

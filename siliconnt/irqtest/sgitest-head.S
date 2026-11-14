@@ -3,6 +3,7 @@
 /*
  * Entry points, exception vectors and the few things of sgitest, gictest and wfitest that
  * have to be exact instructions. The tests themselves are sgitest.c, gictest.c and wfitest.c.
+ * pscitest.c uses the entry points, the vectors and the header.
  *
  * Raw image, position independent, MMU off, EL1h. The boot CPU enters at offset 0. Every
  * other CPU enters at the offset stored at SECONDARY_OFF, with its slot number in x0.
@@ -40,6 +41,9 @@ hdr_gicd_base:
     .globl  hdr_gicr_base
 hdr_gicr_base:
     .quad   0                       /* the first GIC Redistributor, from the loader */
+    .globl  hdr_arg
+hdr_arg:
+    .quad   0                       /* what the test makes of it; 0 unless the loader says */
 
     .macro  bad_vector num
     .balign 0x80
