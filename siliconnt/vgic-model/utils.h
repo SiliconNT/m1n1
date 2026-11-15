@@ -23,4 +23,5 @@ typedef pthread_mutex_t spinlock_t;
 #define CNTFRQ_EL0  sys_reg(3, 3, 14, 0, 0)
 #define CNTPCT_EL0  sys_reg(3, 3, 14, 0, 1)
 #define CNTHCTL_EL2 sys_reg(3, 4, 14, 1, 0)
+#define CNTVOFF_EL2 sys_reg(3, 4, 14, 0, 3)
 #endif

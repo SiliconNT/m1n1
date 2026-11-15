@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Host-side model tests for src/hv/hv_vgic.c and src/hv/hv_wfi.c (test.c) and for
-# src/hv/hv_psci.c (psci_test.c). They compile the real files for the build machine against
+# src/hv/hv_psci.c (psci_test.c) and src/hv/hv_pmu.c (pmu_test.c). They compile the real files for the build machine against
 # stand-in headers and play the hardware, the guest and the host around them.
 #
 #   make        build them and run them
@@ -15,10 +15,21 @@ SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -pthread -I. -Ibuild
 ROUNDS ?= 200000
 
-.PHONY: all psci tsan clean
+.PHONY: all psci pmu tsan clean
 
-all: build/model psci
+all: build/model psci pmu
 	build/model $(ROUNDS)
+
+# make pmu PMU_FILES="a.efi b.exe" also counts the accesses in those files
+pmu: build/pmu-model
+	build/pmu-model $(PMU_FILES)
+
+build/hv_pmu.c: $(SRC)/hv/hv_pmu.c
+	@mkdir -p build
+	cp $< $@
+
+build/pmu-model: pmu_test.c $(wildcard *.h) build/hv_pmu.c
+	$(CC) $(CFLAGS) -o $@ pmu_test.c build/hv_pmu.c
 
 psci: build/psci-model
 	build/psci-model
