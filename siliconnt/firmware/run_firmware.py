@@ -87,6 +87,10 @@ parser.add_argument("--serial-log", type=pathlib.Path,
 parser.add_argument("--kd-port", type=int, default=51000,
                     help="the TCP port on 127.0.0.1 where the kernel debugger connects to "
                          "the secondary serial port (default 51000); 0: no relay")
+parser.add_argument("--wait-debugger", type=int, default=0, metavar="SECONDS",
+                    help="do not enter the firmware before the kernel debugger has connected; "
+                         "after this many seconds without one, stop, the guest not run "
+                         "(default 0: do not wait)")
 parser.add_argument("--disk", type=pathlib.Path,
                     help="the image of a disk with a GPT, put into guest memory after the boot "
                          "arguments for the firmware to register as a RAM disk")
@@ -104,6 +108,10 @@ if args.seconds < 0:
     parser.error("--seconds: not a time")
 if not 0 <= args.kd_port <= 65535:
     parser.error("--kd-port: not a port")
+if args.wait_debugger < 0:
+    parser.error("--wait-debugger: not a time")
+if args.wait_debugger and not args.kd_port:
+    parser.error("--wait-debugger: with --kd-port 0 there is no relay for a debugger to connect to")
 
 PAGE = 0x4000
 
@@ -324,6 +332,8 @@ class DebuggerRelay:
         self.client = None
         self.lock = threading.Lock()
         self.to_target = self.to_debugger = 0
+        # Set once the first debugger has connected (--wait-debugger)
+        self.connected = threading.Event()
         self.stopping = False
         self.thread = threading.Thread(target=self.run, daemon=True)
 
@@ -345,6 +355,7 @@ class DebuggerRelay:
                      "is connected")
         else:
             self.say(f"debugger connected from {addr[0]}:{addr[1]}")
+            self.connected.set()
 
     def drop(self, client, why):
         with self.lock:
@@ -668,6 +679,14 @@ p.hv_start = enter_guest_timed
 
 reader.start()
 try:
+    # The Windows kernel looks for the debugger once, early, and goes on without it: one that
+    # connects later sees nothing of a bug check (R17).
+    if args.wait_debugger:
+        print(f"Waiting for the kernel debugger on {reader.relay.where}, up to "
+              f"{args.wait_debugger} s", flush=True)
+        if not reader.relay.connected.wait(args.wait_debugger):
+            sys.exit(f"Not going on: no kernel debugger connected within {args.wait_debugger} s. "
+                     "The guest has not run.")
     hv.start()
 finally:
     # A run that has ended by itself is not to be interrupted afterwards

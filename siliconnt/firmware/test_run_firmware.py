@@ -788,5 +788,50 @@ check("with a disk, it is turned on after the whole disk is in guest memory",
       code == 0 and rec.xtrack_state is not None and rec.xtrack_state[1] == rec.writes_at_entry
       and rec.xtrack_state[1] > 0 and rec.xtrack_state[2], f"{rec.xtrack_state} {rec.writes_at_entry}")
 
+# 33. --wait-debugger: the guest is not entered before a debugger has connected
+def connect_now(rec):
+    rec.kd["early"] = debugger(rec)
+
+def connect_later(rec):
+    def late():
+        rec.kd["late"] = debugger(rec)
+    timer = threading.Timer(0.7, late)
+    timer.daemon = True
+    timer.start()
+
+def order(out):
+    """Where the three lines are in the output; -1 for one that is not there."""
+    return [out.find(text) for text in ("Waiting for the kernel debugger", "KD> debugger connected",
+                                        "Entering the firmware")]
+
+rec, out, code = run({"at_init": connect_now}, "--seconds", "1", "--wait-debugger", "5", *image_args)
+check("--wait-debugger: with a debugger that is there already, the guest is entered",
+      code == 0 and rec.hv_start is not None and -1 < order(out)[1] < order(out)[2],
+      f"{code!r} {order(out)}")
+
+rec, out, code = run({"at_init": connect_later}, "--seconds", "1", "--wait-debugger", "5", *image_args)
+check("--wait-debugger: the guest is entered only after a debugger that comes later has connected",
+      code == 0 and rec.hv_start is not None and -1 < order(out)[0] < order(out)[1] < order(out)[2],
+      f"{code!r} {order(out)}")
+
+started = time.monotonic()
+rec, out, code = run({}, "--seconds", "1", "--wait-debugger", "1", *image_args)
+check("--wait-debugger: with no debugger the run stops and the guest is not entered",
+      isinstance(code, str) and "debugger" in code and rec.hv_start is None and
+      "Entering the firmware" not in out and time.monotonic() - started < 10, f"{code!r}")
+try:
+    with socket.create_server(("127.0.0.1", rec.kd_port)):
+        port_free = True
+except OSError:
+    port_free = False
+check("and the relay is closed", port_free)
+
+rec, out, code = run({}, "--wait-debugger", "5", "--kd-port", "0", *image_args, kd_port="default")
+check("--wait-debugger without a relay is refused", code != 0 and untouched(rec), f"{code!r}")
+
+rec, out, code = run({}, "--seconds", "1", *image_args)
+check("without --wait-debugger the guest is entered with no debugger, as before",
+      code == 0 and rec.hv_start is not None and "Waiting for the kernel debugger" not in out)
+
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)
