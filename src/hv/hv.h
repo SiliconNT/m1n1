@@ -114,6 +114,31 @@ void hv_psci_init(void);
 bool hv_psci_hvc(struct exc_info *ctx, u16 imm);
 void hv_psci_report(void);
 
+/* The PMUv3 registers for the guest: accesses replaced by hvc with bit 15 of the immediate set */
+void hv_pmu_init(void);
+bool hv_pmu_is_access(u32 insn);
+u32 hv_pmu_patch_word(u32 insn);
+u32 hv_pmu_unpatch_word(u32 insn);
+u32 hv_pmu_patch_range(u32 *words, u32 count);
+bool hv_pmu_hvc(struct exc_info *ctx, u16 imm);
+void hv_pmu_report(void);
+
+/* Execution tracking: a page of the guest is scanned before it first executes */
+#define HV_XTRACK_EL1 1 // execution at EL1 is tracked, EL0 executes freely (needs FEAT_XNX)
+#define HV_XTRACK_ALL 2 // execution at EL1 and EL0 is tracked
+int hv_pt_xtrack(u64 mode);
+bool hv_pt_xtrack_on(void);
+int hv_pt_scanned(u64 ipa, u64 *pa);
+int hv_pt_set_scanned(u64 ipa, bool scanned);
+#define HV_XTRACK_NONE    0
+#define HV_XTRACK_RETRY   1
+#define HV_XTRACK_EMULATE 2
+void hv_xtrack_init(void);
+bool hv_xtrack_iabort(struct exc_info *ctx);
+int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write);
+void hv_xtrack_stored(u64 ipa);
+void hv_xtrack_report(void);
+
 /* AMCC interrupt filtering */
 bool hv_amcc_init(void);
 bool hv_amcc_handle_irq(u32 irq);

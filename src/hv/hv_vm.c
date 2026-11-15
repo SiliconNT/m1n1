@@ -32,6 +32,17 @@ extern uint64_t ram_base;
 
 #define PTE_LOWER_ATTRIBUTES GENMASK(13, 2)
 
+/*
+ * Stage 2 execute-never, XN[1:0] (Arm DDI 0487 M.d, D8.4.2.1.2, table D8-78; the second bit
+ * is there with FEAT_XNX, which ID_AA64MMFR1_EL1 of the M4 reports): 0b00 is executable,
+ * 0b01 is not executable at EL1 but is at EL0, 0b10 is not executable at all.
+ */
+#define PTE_XN     GENMASK(54, 53)
+#define PTE_XN_EL1 (0b01L << 53)
+#define PTE_XN_ALL (0b10L << 53)
+/* One of the bits a descriptor leaves to software: this page has been scanned, see hv_xtrack.c */
+#define PTE_SW_SCANNED BIT(56)
+
 #define PTE_VALID BIT(0)
 #define PTE_TYPE  BIT(1)
 #define PTE_BLOCK 0
@@ -117,8 +128,13 @@ uint64_t vaddr_bits;
 
 static u64 *hv_Ltop;
 
+/* What every hardware mapping that has not been scanned carries in XN; 0 while tracking is off */
+static u64 hv_pt_xn;
+
 void hv_pt_init(void)
 {
+    hv_pt_xn = 0;
+
     const uint64_t pa_bits[] = {32, 36, 40, 42, 44, 48, 52};
     uint64_t pa_range = FIELD_GET(ID_AA64MMFR0_PARange, mrs(ID_AA64MMFR0_EL1));
 
@@ -314,6 +330,10 @@ int hv_map(u64 from, u64 to, u64 size, u64 incr)
     if (from & MASK(VADDR_L4_OFFSET_BITS) || size & MASK(VADDR_L4_OFFSET_BITS))
         return -1;
 
+    /* While execution is tracked, memory is not executable until hv_xtrack.c has scanned it */
+    if (hw && hv_pt_xn && !(to & PTE_SW_SCANNED))
+        to = (to & ~PTE_XN) | hv_pt_xn;
+
     if (hw && (from & MASK(VADDR_L3_OFFSET_BITS) || size & MASK(VADDR_L3_OFFSET_BITS))) {
         printf("HV: cannot use L4 pages with HW mappings (0x%lx -> 0x%lx)\n", from, to);
         return -1;
@@ -420,6 +440,109 @@ int hv_pt_set_writable(u64 ipa, bool writable)
     sysop("tlbi vmalls12e1is");
     sysop("dsb ish");
     sysop("isb");
+    return 0;
+}
+
+static void hv_pt_flush_tlb(void)
+{
+    sysop("dsb ishst");
+    sysop("tlbi vmalls12e1is");
+    sysop("dsb ish");
+    sysop("isb");
+}
+
+static void hv_pt_xn_l2(u64 *l2, u64 base)
+{
+    for (u64 i = 0; i < ENTRIES_PER_L2_TABLE; i++) {
+        /*
+         * Every page gets an entry of its own now, before the guest runs: a 32 MB block is
+         * not taken apart later, under a guest that may be executing from it on another core.
+         */
+        if (L2_IS_HW_BLOCK(l2[i]))
+            hv_pt_get_l3(base + (i << VADDR_L2_OFFSET_BITS));
+
+        if (!L2_IS_TABLE(l2[i]))
+            continue;
+
+        u64 *l3 = (u64 *)(l2[i] & PTE_TARGET_MASK);
+        for (u64 j = 0; j < ENTRIES_PER_L3_TABLE; j++)
+            if (L3_IS_HW_BLOCK(l3[j]) && !(l3[j] & PTE_SW_SCANNED))
+                l3[j] = (l3[j] & ~PTE_XN) | hv_pt_xn;
+    }
+}
+
+/*
+ * Start tracking execution: from now on no hardware mapping is executable (at EL1 only, or at
+ * EL1 and EL0) until hv_pt_set_scanned() says so, and the mappings that exist already are
+ * changed to match. There is no way back short of hv_pt_init().
+ */
+int hv_pt_xtrack(u64 mode)
+{
+    switch (mode) {
+        case HV_XTRACK_EL1:
+            hv_pt_xn = PTE_XN_EL1;
+            break;
+        case HV_XTRACK_ALL:
+            hv_pt_xn = PTE_XN_ALL;
+            break;
+        default:
+            printf("HV: no execution tracking mode %ld\n", mode);
+            return -1;
+    }
+
+    if (vaddr_bits > 36) {
+        for (u64 i = 0; i < ENTRIES_PER_L1_TABLE; i++)
+            if (L1_IS_TABLE(hv_Ltop[i]))
+                hv_pt_xn_l2((u64 *)(hv_Ltop[i] & PTE_TARGET_MASK), i << VADDR_L1_OFFSET_BITS);
+    } else {
+        hv_pt_xn_l2(hv_Ltop, 0);
+    }
+
+    hv_pt_flush_tlb();
+    printf("HV: memory is not executable at %s until it has been scanned\n",
+           mode == HV_XTRACK_EL1 ? "EL1" : "EL1 and EL0");
+    return 0;
+}
+
+bool hv_pt_xtrack_on(void)
+{
+    return hv_pt_xn != 0;
+}
+
+/*
+ * The state of the page of memory at this IPA while execution is tracked: 1 if it has been
+ * scanned (executable, read-only), 0 if not (writable, not executable), -1 if there is no
+ * memory there. *pa is where the page is.
+ */
+int hv_pt_scanned(u64 ipa, u64 *pa)
+{
+    ipa &= ~MASK(VADDR_L3_OFFSET_BITS);
+
+    if (ipa >= BIT(vaddr_bits))
+        return -1;
+
+    u64 pte = hv_pt_walk(ipa);
+    if (!IS_HW(pte))
+        return -1;
+
+    *pa = pte & PTE_TARGET_MASK;
+    return pte & PTE_SW_SCANNED ? 1 : 0;
+}
+
+int hv_pt_set_scanned(u64 ipa, bool scanned)
+{
+    u64 pa;
+
+    ipa &= ~MASK(VADDR_L3_OFFSET_BITS);
+    if (hv_pt_scanned(ipa, &pa) < 0)
+        return -1;
+
+    /* hv_map() puts the XN bits on a mapping that does not say PTE_SW_SCANNED */
+    u64 attrs = scanned ? (PTE_ATTRIBUTES_RO | PTE_SW_SCANNED) : PTE_ATTRIBUTES;
+    if (hv_map(ipa, pa | attrs | PTE_VALID, PAGE_SIZE, 1) < 0)
+        return -1;
+
+    hv_pt_flush_tlb();
     return 0;
 }
 
@@ -1299,16 +1422,30 @@ bool hv_handle_dabort(struct exc_info *ctx)
         return false;
     }
 
+    /* A store into a page that was made read-only when it was scanned for execution */
+    bool xstore = false;
+
     if (IS_HW(pte)) {
-        printf("HV: Data abort on mapped page (0x%lx -> 0x%lx)\n", far, pte);
-        // Try again, this is usually a race
-        ctx->elr -= 4;
-        return true;
+        switch (hv_xtrack_dabort(ctx, ipa, is_write)) {
+            case HV_XTRACK_RETRY:
+                // The page is writable again: execute the store once more
+                ctx->elr -= 4;
+                return true;
+            case HV_XTRACK_EMULATE:
+                // The store is in the page it writes to: carry it out here, as for a SW mapping
+                xstore = true;
+                break;
+            default:
+                printf("HV: Data abort on mapped page (0x%lx -> 0x%lx)\n", far, pte);
+                // Try again, this is usually a race
+                ctx->elr -= 4;
+                return true;
+        }
     }
 
     hv_wdt_breadcrumb('1');
 
-    assert(IS_SW(pte));
+    assert(IS_SW(pte) || xstore);
 
     u64 elr = ctx->elr;
     u64 elr_pa = hv_translate(elr, false, false, NULL);
@@ -1424,7 +1561,13 @@ bool hv_handle_dabort(struct exc_info *ctx)
             printf("HV: WARNING: Failed to emulate upper half but lower half did commit!\n");
             return false;
         }
+
+        if (xstore)
+            hv_xtrack_stored(ipa2);
     }
+
+    if (xstore)
+        hv_xtrack_stored(ipa);
 
     if (vaddrp0 != vaddrp1) {
         printf("HV: Straddled r/w data:\n");

@@ -622,6 +622,11 @@ bool hv_exc_sync(struct exc_info *ctx)
             hv_wdt_breadcrumb('D');
             handled = hv_handle_dabort(ctx);
             break;
+        case ESR_EC_IABORT_LOWER:
+            hv_wdt_breadcrumb('X');
+            /* The guest fetches the same instruction again */
+            handled = protect_elr = hv_xtrack_iabort(ctx);
+            break;
         case ESR_EC_MSR:
             hv_wdt_breadcrumb('M');
             handled = hv_handle_msr(ctx, FIELD_GET(ESR_ISS, ctx->esr));
@@ -654,8 +659,15 @@ bool hv_exc_sync(struct exc_info *ctx)
             break;
         case ESR_EC_HVC:
             hv_wdt_breadcrumb('H');
-            /* A guest that is not macOS under the SPTM emulation gets PSCI and nothing else */
-            if (hv_sptm_mode == SPTM_NONE)
+            /*
+             * A guest that is not macOS under the SPTM emulation gets PSCI, and the PMUv3
+             * registers through the hvcs that hv_pmu.c puts into its code; nothing else
+             */
+            if (hv_sptm_mode == SPTM_NONE && (FIELD_GET(ESR_ISS, ctx->esr) & BIT(15)) &&
+                hv_pt_xtrack_on())
+                handled = hv_pmu_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr)) ||
+                          hv_psci_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr));
+            else if (hv_sptm_mode == SPTM_NONE)
                 handled = hv_psci_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr));
             else
                 handled = hv_hvc_dispatch(ctx, FIELD_GET(ESR_ISS, ctx->esr));
