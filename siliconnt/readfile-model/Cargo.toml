@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Host-side model test for rust/src/readfile.rs. See src/lib.rs.
+
+[package]
+name = "readfile-model"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+publish = false
+
+# The same fatfs, with the same features, as rust/Cargo.toml
+[dependencies]
+fatfs = { git = "https://github.com/rafalh/rust-fatfs", rev = "4eccb50d011146fbed20e133d33b22f3c27292e7", default-features = false, features = ["lfn", "alloc"] }
+uuid = { version = "1.23", default-features = false }
