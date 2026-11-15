@@ -183,6 +183,7 @@ OBJECTS := \
 	ringbuffer.o \
 	rtkit.o \
 	sart.o \
+	selfboot.o \
 	sep.o \
 	sio.o \
 	smc.o \
