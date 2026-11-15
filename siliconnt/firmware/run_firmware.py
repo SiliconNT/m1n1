@@ -603,8 +603,10 @@ def load_firmware(hv, image, disk, layout):
 
 load_firmware(hv, image, disk, layout)
 
-# After the memory of the guest has been mapped and filled: this changes the mappings that are
-# there. What the host writes from here on (the device tree, in HV.start()) is data.
+# After the memory of the guest has been filled, and before it is mapped: HV.start() makes the
+# mappings (HV.pt_update()), and the hypervisor makes them not executable as it goes. A 2 MB
+# block of memory is taken apart into pages when one of its pages is first scanned, not here.
+# What the host writes from here on (the device tree, in HV.start()) is data.
 if args.xtrack == "off":
     print("Execution tracking: off. A guest that reads the PMUv3 cycle counter takes an "
           "exception")

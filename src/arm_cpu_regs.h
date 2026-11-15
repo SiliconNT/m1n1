@@ -202,6 +202,11 @@
 
 #define HACR_TRAP_GENTER BIT(29)
 
+/* MDCR_EL2, Arm DDI 0487 M.d D24.3.17 */
+#define MDCR_TDRA  BIT(11)
+#define MDCR_TDOSA BIT(10)
+#define MDCR_TDA   BIT(9)
+
 /* GICv3 virtualization control registers, Arm IHI 0069H.b section 12.4 */
 #define SYS_ICC_SRE_EL2 sys_reg(3, 4, 12, 9, 5)
 #define ICC_SRE_ENABLE  BIT(3)

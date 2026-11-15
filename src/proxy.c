@@ -19,6 +19,7 @@
 #include "nvme.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "selfboot.h"
 #include "smp.h"
 #include "string.h"
 #include "tunables.h"
@@ -560,6 +561,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_HV_XTRACK:
             reply->retval = hv_pt_xtrack();
+            break;
+        case P_SELFBOOT_RUN:
+            reply->retval = selfboot_run_loaded(request->args[0], request->args[1],
+                                                request->args[2], uartproxy_iodev);
             break;
 
         case P_FB_INIT:

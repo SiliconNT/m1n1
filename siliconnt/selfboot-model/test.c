@@ -3,155 +3,17 @@
  * Host-side model test for src/selfboot.c.
  *
  * The real file is compiled for the build machine. What it gets from the rest of m1n1 is
- * stood in for here: the device tree functions of src/adt.h it calls, over a device tree
- * this file makes, in the format of Apple's (a node is two counts, its properties, its
- * children; a property is a name of 32 bytes, a length, the value padded to 4 bytes).
+ * stood in for: the device tree functions of src/adt.h it calls (model.c), over a device
+ * tree this file makes, in the format of Apple's.
  *
  * The numbers the layout is checked against are those of a run on the M4 (R21): what
  * run_firmware.py printed there, and what the firmware printed that it found.
  */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include "adt.h"
+#include "model.h"
 #include "selfboot.h"
 #include "types.h"
 #include "utils.h"
-
-static int checks, failed;
-
-#define CHECK(cond)                                                                                \
-    do {                                                                                           \
-        checks++;                                                                                  \
-        if (!(cond)) {                                                                             \
-            failed++;                                                                              \
-            printf("FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond);                               \
-        }                                                                                          \
-    } while (0)
-
-#define CHECK_EQ(a, b)                                                                             \
-    do {                                                                                           \
-        u64 _a = (a), _b = (b);                                                                    \
-        checks++;                                                                                  \
-        if (_a != _b) {                                                                            \
-            failed++;                                                                              \
-            printf("FAILED %s:%d: %s is 0x%lx, not 0x%lx\n", __FILE__, __LINE__, #a, _a, _b);      \
-        }                                                                                          \
-    } while (0)
-
-/* ---- the device tree functions of src/adt.h that selfboot.c calls ---------------------- */
-
-void *adt;
-
-#define PROP_SIZE(p) ((p)->size & 0x7fffffff)
-
-static const struct adt_node_hdr *node_at(int offset)
-{
-    return (const struct adt_node_hdr *)((u8 *)adt + offset);
-}
-
-int adt_get_property_count(const void *dt, int offset)
-{
-    return node_at(offset)->property_count;
-}
-
-int adt_first_property_offset(const void *dt, int offset)
-{
-    return offset + sizeof(struct adt_node_hdr);
-}
-
-int adt_next_property_offset(const void *dt, int offset)
-{
-    const struct adt_property *p = ADT_PROP(adt, offset);
-    return offset + sizeof(*p) + ((PROP_SIZE(p) + 3) & ~3);
-}
-
-const struct adt_property *adt_get_property(const void *dt, int nodeoffset, const char *name)
-{
-    int off = adt_first_property_offset(dt, nodeoffset);
-    for (int i = adt_get_property_count(dt, nodeoffset); i; i--) {
-        const struct adt_property *p = ADT_PROP(adt, off);
-        if (!strcmp(p->name, name))
-            return p;
-        off = adt_next_property_offset(dt, off);
-    }
-    return NULL;
-}
-
-/* The offset after the node at `offset` and everything below it */
-static int node_end(int offset)
-{
-    int off = adt_first_property_offset(adt, offset);
-    for (int i = node_at(offset)->property_count; i; i--)
-        off = adt_next_property_offset(adt, off);
-    for (int i = node_at(offset)->child_count; i; i--)
-        off = node_end(off);
-    return off;
-}
-
-int adt_path_offset(const void *dt, const char *path)
-{
-    int offset = 0;
-
-    while (*path == '/')
-        path++;
-    while (*path) {
-        size_t len = strcspn(path, "/");
-        int child = adt_first_property_offset(adt, offset);
-        int i;
-
-        for (i = node_at(offset)->property_count; i; i--)
-            child = adt_next_property_offset(adt, child);
-        for (i = node_at(offset)->child_count; i; i--) {
-            const struct adt_property *name = adt_get_property(adt, child, "name");
-            if (name && strlen((const char *)name->value) == len &&
-                !memcmp(name->value, path, len))
-                break;
-            child = node_end(child);
-        }
-        if (!i)
-            return -1;
-        offset = child;
-        path += len;
-        while (*path == '/')
-            path++;
-    }
-    return offset;
-}
-
-/* ---- making a device tree ---------------------------------------------------------------- */
-
-static u8 *put_node(u8 *p, u32 properties, u32 children)
-{
-    struct adt_node_hdr hdr = {properties, children};
-    memcpy(p, &hdr, sizeof(hdr));
-    return p + sizeof(hdr);
-}
-
-static u8 *put_prop(u8 *p, const char *name, const void *value, u32 len)
-{
-    struct adt_property *prop = (struct adt_property *)p;
-    memset(prop, 0, sizeof(*prop) + ((len + 3) & ~3));
-    strncpy(prop->name, name, sizeof(prop->name) - 1);
-    prop->size = len;
-    memcpy(prop->value, value, len);
-    return p + sizeof(*prop) + ((len + 3) & ~3);
-}
-
-static u8 *put_name(u8 *p, const char *name)
-{
-    return put_prop(p, "name", name, strlen(name) + 1);
-}
-
-static u8 *put_range(u8 *p, const char *name, u64 base, u64 size)
-{
-    u64 value[2] = {base, size};
-    return put_prop(p, name, value, sizeof(value));
-}
-
-/* What iBoot lists that says nothing: neither a base nor a size */
-#define NOTHING 0xffffffffffffffffUL
 
 /* One more entry of /chosen/memory-map, for the tests that need one in the way */
 static const char *extra_name;
@@ -215,40 +77,6 @@ static void default_tree(void)
     spare_entries = 3;
     with_device_tree_entry = true;
     make_tree();
-}
-
-/* ---- the M4 of R21 ----------------------------------------------------------------------- */
-
-#define R21_PHYS_BASE 0x100189a8000UL /* the top of the heap the host kept */
-#define R21_MEM_TOP   0x103db610000UL
-#define R21_IMAGE     0x1e00000UL
-#define R21_DISK      0x28200000UL
-
-/* Through a pointer, and compared with memcmp(): the padding of the structure is 0 too */
-static void r21_ba(struct boot_args *out)
-{
-    static struct boot_args ba;
-
-    memset(&ba, 0, sizeof(ba));
-    ba.revision = 3;
-    ba.version = 2;
-    ba.virt_base = 0xfffffe0007004000;
-    ba.phys_base = 0x10002e70000;
-    ba.mem_size = R21_MEM_TOP - 0x10002e70000;
-    ba.top_of_kernel_data = 0x10006ab0000;
-    ba.video.base = 0x103e004c000;
-    ba.video.display = 1;
-    ba.video.stride = 0x2f40;
-    ba.video.width = 0xbd0;
-    ba.video.height = 0x7ac;
-    ba.video.depth = 0x1001e;
-    ba.machine_type = 0;
-    ba.devtree = (void *)0xfffffe0009624000;
-    ba.devtree_size = 0x84000;
-    strcpy(ba.rv3.cmdline, "-v");
-    ba.rv3.boot_flags = 0x10;
-    ba.rv3.mem_size_actual = 0x400000000;
-    memcpy(out, &ba, sizeof(ba));
 }
 
 static void test_layout_of_r21(void)

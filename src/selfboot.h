@@ -81,4 +81,33 @@ void selfboot_boot_args(struct boot_args *out, const struct boot_args *cur,
  */
 int selfboot_adt(void *dest, u32 size, const struct selfboot_layout *l);
 
+/*
+ * The rest is selfboot_run.c: the part that touches the machine. It does what the host does
+ * between run_firmware.py and HV.start() of proxyclient/m1n1/hv/__init__.py.
+ */
+
+/* m1n1 keeps this much above where its heap ends now, for the stage 2 page tables above all */
+#define SELFBOOT_M1N1_HEAP (128UL << 20)
+
+/* The two files, on the FAT32 partition that the variable siliconnt=<its UUID> names */
+#define SELFBOOT_IMAGE_FILE "siliconnt/firmware.fd"
+#define SELFBOOT_DISK_FILE  "siliconnt/bootdisk.img"
+
+/*
+ * For payload.c, in a build with CHAINLOADING. Reads the two files from the partition into
+ * guest memory, which starts SELFBOOT_M1N1_HEAP above m1n1's heap, hands the firmware what it
+ * needs and enters it as the guest of the hypervisor, on the boot CPU.
+ *
+ * Returns -1 if the guest was not entered: m1n1 goes on to the proxy then. Returns 0 once the
+ * guest has been left, which takes a host.
+ */
+int selfboot_run(const char *part_uuid);
+
+/*
+ * The same, for the proxy, when a host has put the two files where the layout above
+ * phys_base has them: nothing is read. host_iodev is the port m1n1 talks to the host over;
+ * it stays a console, and what the guest writes to its UART goes there too.
+ */
+int selfboot_run_loaded(u64 phys_base, u64 image_size, u64 disk_size, int host_iodev);
+
 #endif

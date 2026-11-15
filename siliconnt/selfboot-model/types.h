@@ -12,4 +12,10 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int64_t s64;
 #define PACKED __attribute__((packed))
+/* As in src/types.h */
+#define BIT(x)            (1UL << (x))
+#define GENMASK(msb, lsb) ((BIT((msb + 1) - (lsb)) - 1) << (lsb))
+/* A system register is just a number here */
+#define sys_reg(op0, op1, CRn, CRm, op2)                                                           \
+    (((op0) << 14) | ((op1) << 11) | ((CRn) << 7) | ((CRm) << 3) | (op2))
 #endif

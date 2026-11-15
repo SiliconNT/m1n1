@@ -675,6 +675,7 @@ class M1N1Proxy(Reloadable):
     P_HV_SPRR_SET_POOL = 0xc12
     P_HV_SET_GENTER_TRAP = 0xc13
     P_HV_XTRACK = 0xc14
+    P_SELFBOOT_RUN = 0xc15
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1179,6 +1180,8 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_HV_SET_GENTER_TRAP, enabled)
     def hv_xtrack(self):
         return self.request(self.P_HV_XTRACK)
+    def selfboot_run(self, phys_base, image_size, disk_size):
+        return self.request(self.P_SELFBOOT_RUN, phys_base, image_size, disk_size, signed=True)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

@@ -12,6 +12,7 @@
 #include "heapblock.h"
 #include "kboot.h"
 #include "mitigations.h"
+#include "selfboot.h"
 #include "smp.h"
 #include "utils.h"
 
@@ -43,6 +44,7 @@ static char expect_compatible[256];
 static struct kernel_header *kernel = NULL;
 static void *fdt = NULL;
 static char *chainload_spec = NULL;
+static char *selfboot_spec = NULL;
 
 static void *load_one_payload(void *start, size_t size);
 
@@ -199,6 +201,8 @@ static bool check_var(u8 **p)
             chosen[chosen_cnt++] = (char *)*p;
     } else if (IS_VAR("chainload=")) {
         chainload_spec = val;
+    } else if (IS_VAR("siliconnt=")) {
+        selfboot_spec = val;
     } else if (IS_VAR("display=")) {
         display_configure(val);
     } else if (IS_VAR("mitigations=")) {
@@ -311,6 +315,21 @@ int payload_run(void)
 
     if (chainload_spec) {
         return chainload_load(chainload_spec, chosen, chosen_cnt);
+    }
+
+    /*
+     * siliconnt=<UUID of a FAT32 partition>: the SiliconNT firmware and its boot disk are
+     * files there, and the firmware runs as the guest of the hypervisor. There is no next
+     * stage: whether the guest never ran or has been left, m1n1 goes on to the proxy.
+     */
+    if (selfboot_spec) {
+#ifdef CHAINLOADING
+        selfboot_run(selfboot_spec);
+#else
+        printf("siliconnt=%s: this m1n1 was built without CHAINLOADING, it cannot read files\n",
+               selfboot_spec);
+#endif
+        return -1;
     }
 
     if (kernel && fdt) {
