@@ -4,9 +4,11 @@
  * pmutest: an EL1 guest that uses the PMUv3 cycle counter the way Windows does and that
  * brings code into being the ways an operating system does, for src/hv/hv_pmu.c and
  * src/hv/hv_xtrack.c. Under the hypervisor with execution tracking on, on a core without
- * PMUv3 registers, every one of its accesses has been replaced by an hvc before it runs; on
+ * PMUv3 registers, every one of its accesses has been replaced before it runs, at EL1 and at
+ * EL0: a read of the cycle counter by a read of CNTVCT_EL0, anything else by an hvc. On
  * QEMU's virt machine the registers are real and nothing is replaced. The guest passes on
- * both; with ARG_STRICT it also looks at its own code and insists that it was replaced.
+ * both; with ARG_STRICT it also looks at its own code and insists that it was replaced, and
+ * that the cycle counter is the count of the generic timer.
  *
  * The instructions under test must not sit in this image as they are: the image's own code
  * and constants share pages that execute, and those pages are scanned. So the test code is
@@ -23,7 +25,7 @@
 
 extern u64 hdr_arg;
 
-#define ARG_STRICT 0x100 /* the code must have been replaced by hvcs */
+#define ARG_STRICT 0x100 /* the code must have been replaced */
 
 void uart_putc(int c);
 u64 run_el0(u64 entry, u64 sp, u64 *esr);
@@ -51,7 +53,8 @@ enum {
     PG_STORE,    /* code that stores into its own page */
     PG_PATCH,    /* code that writes an instruction into its own page and runs it */
     PG_EL0,      /* code that runs at EL0 first and at EL1 afterwards */
-    PG_OPEN,     /* code that stores into its own page in a way EL2 does not carry out */
+    PG_EL0_READ, /* code that reads the cycle counter at EL0 */
+    PG_OPEN,    /* code that stores into its own page in a way EL2 does not carry out */
     PG_UNTOUCHED, /* looks like accesses all over and is never executed */
     PG_TIMING,   /* the first of NR_TIMING pages that are each run once */
 };
@@ -105,10 +108,16 @@ static const u32 tpl_open[] = {K(0x100000a9), K(0x28810520), K(I_RET), K(I_NOP),
 static const u32 tpl_el0[] = {K(0xd2898600), K(0xd4000001), K(0xd2803c20), K(I_RET)};
 #define EL0_MARK 0x4c30
 #define EL1_MARK 0x1e1
+/* For EL0: mrs x0, PMCCNTR_EL0; svc #0 */
+static const u32 tpl_el0_read[] = {K(I_MRS_X0_PMCCNTR), K(0xd4000001)};
 
 /* What hv_pmu.c makes of an access (the layout of the immediate is in its header comment) */
 static u32 replaced(u32 insn)
 {
+    /* mrs xN, PMCCNTR_EL0 becomes mrs xN, CNTVCT_EL0 */
+    if ((insn & ~31u) == U(K(I_MRS_X0_PMCCNTR)))
+        return 0xd53be040 | (insn & 31);
+
     u32 op1 = (insn >> 16) & 7, crn = (insn >> 12) & 15;
     u32 reg = (op1 == 3 ? 0x100 : 0) | (crn == 14 ? 0x80 : 0) | ((insn >> 5) & 0x7f);
     u32 imm = 0x8000 | (reg << 6) | ((insn >> 21) & 1) << 5 | (insn & 31);
@@ -320,8 +329,8 @@ static u64 call1(u32 *at, u64 arg)
 }
 
 /*
- * The instruction at this address is still the access, or, where it must be, the hvc for it.
- * masked is K(the access).
+ * The instruction at this address is still the access, or, where it must be, what the access
+ * is replaced by. masked is K(the access).
  */
 static int as_expected(const u32 *at, u32 masked)
 {
@@ -372,7 +381,18 @@ static void test_setup(void)
     asm volatile("isb");
     u64 c = read_sysreg(pmccntr_el0);
     value("after writing 0", c);
-    result("PMCCNTR_EL0 can be written", c < b);
+    if (strict) {
+        /* The count is the generic timer's: a write goes through and changes nothing */
+        result("PMCCNTR_EL0 can be written, and the count runs on", c >= b);
+
+        u64 t0 = read_sysreg(cntvct_el0);
+        u64 d = read_sysreg(pmccntr_el0);
+        u64 t1 = read_sysreg(cntvct_el0);
+        value("CNTVCT_EL0", t0);
+        result("PMCCNTR_EL0 is the count of the generic timer", t0 <= d && d <= t1);
+    } else {
+        result("PMCCNTR_EL0 can be written", c < b);
+    }
 }
 
 static void test_fresh_page(void)
@@ -487,6 +507,36 @@ static void test_el0(void)
     result("...and at EL1 afterwards", call0(pg + 2) == EL1_MARK);
 }
 
+/* What smss.exe does first: read the cycle counter at EL0 */
+static void test_el0_read(void)
+{
+    u32 *pg = page(PG_EL0_READ);
+    u64 vbar = read_sysreg(vbar_el1);
+
+    /* HalpGitInitialize: EL0 may read the counts of the generic timer (EL0PCTEN, EL0VCTEN) */
+    write_sysreg(cntkctl_el1, read_sysreg(cntkctl_el1) | 3);
+    /* HalpCycleCounterInitialize: EL0 may read the cycle counter (CR) */
+    write_sysreg(pmuserenr_el0, read_sysreg(pmuserenr_el0) | 4);
+    asm volatile("isb");
+
+    EMIT(pg, tpl_el0_read);
+    write_sysreg(vbar_el1, (u64)el0_vectors);
+    asm volatile("isb");
+    u64 el0_esr = 0;
+    u64 before = read_sysreg(pmccntr_el0);
+    u64 x0 = run_el0((u64)pg, (u64)el0_stack + sizeof(el0_stack), &el0_esr);
+    u64 after = read_sysreg(pmccntr_el0);
+    write_sysreg(vbar_el1, vbar);
+    asm volatile("isb");
+
+    value("ESR_EL1 of the way back from EL0", el0_esr);
+    value("PMCCNTR_EL0 read at EL0", x0);
+    /* EC 0x15 is the svc behind the read; 0x00 would be the read itself, undefined */
+    result("EL0 reads the cycle counter", (el0_esr >> 26) == 0x15);
+    result("...and gets the count that EL1 gets", before < x0 && x0 < after);
+    result("...and the read is as expected afterwards", as_expected(pg, K(I_MRS_X0_PMCCNTR)));
+}
+
 static void test_timing(void)
 {
     u64 freq = read_sysreg(cntfrq_el0);
@@ -546,6 +596,7 @@ void boot_main(void)
     test_patch_same_page();
     test_open_page();
     test_el0();
+    test_el0_read();
     test_timing();
     test_untouched();
 

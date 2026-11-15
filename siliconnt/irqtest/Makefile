@@ -135,7 +135,7 @@ qemu-psci-strict: build/pscitest-qemu-0x100.elf
 	-timeout 20 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
 # pmutest ends with SYSTEM_OFF. QEMU has real PMUv3 registers, so nothing is replaced there:
-# the strict run shows that the checks for replaced code can fail (5 of the 20)
+# the strict run shows that the checks for replaced code can fail (8 of the 24)
 qemu-pmu: build/pmutest-qemu-0x0.elf
 	-timeout 30 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
