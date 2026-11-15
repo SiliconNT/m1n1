@@ -34,10 +34,10 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp \n	qemu-psci qemu-psci-reset qemu-psci-strict clean
+.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp \n	qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict clean
 .SECONDARY:
 
-all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin
+all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin
 
 build/irqtest.o: irqtest.S
 	@mkdir -p build
@@ -59,14 +59,14 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o: build/%.o: %.c sgitest.h gic.h
+build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o: build/%.o: %.c sgitest.h gic.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
-build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
+build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
 	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/$*.o
 
-build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin: build/%.bin: build/%.elf
+build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin: build/%.bin: build/%.elf
 	$(OBJCOPY) -O binary $< $@
 
 # build/<image>-qemu-<cpus>.elf
@@ -82,6 +82,13 @@ build/wfitest-qemu-%.o: sgitest-qemu.S sgitest.h build/wfitest.bin
 # build/pscitest-qemu-<argument for the image header>.elf, on one CPU
 build/pscitest-qemu-%.o: sgitest-qemu.S sgitest.h build/pscitest.bin
 	$(CC) -c -Wall -Werror -DNR_CPUS=1 -DGUEST_ARG=$* -DIMAGE='"build/pscitest.bin"' -o $@ $<
+
+# build/pmutest-qemu-<argument for the image header>.elf, on one CPU
+build/pmutest-qemu-%.o: sgitest-qemu.S sgitest.h build/pmutest.bin
+	$(CC) -c -Wall -Werror -DNR_CPUS=1 -DGUEST_ARG=$* -DIMAGE='"build/pmutest.bin"' -o $@ $<
+
+build/pmutest-qemu-%.elf: build/pmutest-qemu-%.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
 
 build/pscitest-qemu-%.elf: build/pscitest-qemu-%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
@@ -126,6 +133,14 @@ qemu-psci-reset: build/pscitest-qemu-0x1.elf
 
 qemu-psci-strict: build/pscitest-qemu-0x100.elf
 	-timeout 20 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
+
+# pmutest ends with SYSTEM_OFF. QEMU has real PMUv3 registers, so nothing is replaced there:
+# the strict run shows that the checks for replaced code can fail
+qemu-pmu: build/pmutest-qemu-0x0.elf
+	-timeout 30 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-pmu-strict: build/pmutest-qemu-0x100.elf
+	-timeout 30 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
 clean:
 	rm -rf build

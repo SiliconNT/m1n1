@@ -1,0 +1,528 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+/*
+ * pmutest: an EL1 guest that uses the PMUv3 cycle counter the way Windows does and that
+ * brings code into being the ways an operating system does, for src/hv/hv_pmu.c and
+ * src/hv/hv_xtrack.c. Under the hypervisor with execution tracking on, on a core without
+ * PMUv3 registers, every one of its accesses has been replaced by an hvc before it runs; on
+ * QEMU's virt machine the registers are real and nothing is replaced. The guest passes on
+ * both; with ARG_STRICT it also looks at its own code and insists that it was replaced.
+ *
+ * The instructions under test must not sit in this image as they are: the image's own code
+ * and constants share pages that execute, and those pages are scanned. So the test code is
+ * kept as words XORed with a key that the compiler cannot see through, and written out at
+ * run time into pages of an arena that nothing has executed.
+ *
+ * Raw image, MMU off, EL1h, entry points and image header of sgitest (sgitest-head.S). It
+ * ends with PSCI SYSTEM_OFF, which does not return on QEMU and stops the guest under the
+ * hypervisor.
+ */
+
+#include "sgitest.h"
+#include "gic.h" /* for u64 and u32 */
+
+extern u64 hdr_arg;
+
+#define ARG_STRICT 0x100 /* the code must have been replaced by hvcs */
+
+void uart_putc(int c);
+u64 run_el0(u64 entry, u64 sp, u64 *esr);
+void psci_system_off(void);
+extern char el0_vectors[];
+
+#define read_sysreg(r)                                                                             \
+    ({                                                                                             \
+        u64 _v;                                                                                    \
+        asm volatile("mrs %0, " #r : "=r"(_v));                                                    \
+        _v;                                                                                        \
+    })
+#define write_sysreg(r, v)                                                                         \
+    do {                                                                                           \
+        u64 _v = (v);                                                                              \
+        asm volatile("msr " #r ", %0" : : "r"(_v));                                                \
+    } while (0)
+
+#define PAGE  0x4000UL /* a stage 2 page of the hypervisor */
+#define WORDS (PAGE / 4)
+
+/* Pages of the arena, each for one purpose */
+enum {
+    PG_FRESH,    /* code written into a page that never ran, then rewritten again and again */
+    PG_STORE,    /* code that stores into its own page */
+    PG_PATCH,    /* code that writes an instruction into its own page and runs it */
+    PG_EL0,      /* code that runs at EL0 first and at EL1 afterwards */
+    PG_UNTOUCHED, /* looks like accesses all over and is never executed */
+    PG_TIMING,   /* the first of NR_TIMING pages that are each run once */
+};
+/* The image is built for the tiny code model: all of it within 1 MB, the arena included */
+#define NR_TIMING 32
+#define NR_PAGES  (PG_TIMING + NR_TIMING)
+#define NR_REWRITES 16
+#define NR_STORES   1000
+
+/* One more page than is used, so that the pages can start on a boundary */
+static u8 arena[(NR_PAGES + 1) * PAGE];
+static u8 el0_stack[4096] __attribute__((aligned(16)));
+
+/* ---- instructions, kept so that no word of this image is one of them ---- */
+
+static volatile u32 key = 0xa5a5a5a5;
+#define K(x) ((x) ^ 0xa5a5a5a5u)
+/* U(K(x)) is x, and the compiler does not know */
+#define U(masked) ((masked) ^ key)
+
+#define I_MRS_X0_PMCCNTR 0xd53b9d00
+#define I_MRS_X0_PMCR    0xd53b9c00
+#define I_RET            0xd65f03c0
+#define I_NOP            0xd503201f
+
+/* mrs x0, PMCCNTR_EL0; ret; then a word of data that looks like the first instruction */
+static const u32 tpl_ccntr[] = {K(I_MRS_X0_PMCCNTR), K(I_RET), K(I_MRS_X0_PMCCNTR)};
+/* mrs x0, PMCR_EL0; ret; data */
+static const u32 tpl_pmcr[] = {K(I_MRS_X0_PMCR), K(I_RET), K(I_MRS_X0_PMCCNTR)};
+/* adr x9, data; str x0, [x9]; mrs x0, PMCCNTR_EL0; ret; data: .quad 0 */
+static const u32 tpl_store[] = {K(0x10000089), K(0xf9000120), K(I_MRS_X0_PMCCNTR), K(I_RET), K(0),
+                                K(0)};
+#define STORE_DATA 4
+/*
+ * adr x9, slot; str w0, [x9]; dc cvau, x9; dsb ish; ic ivau, x9; dsb ish; isb; slot: nop; ret
+ * Called with an instruction in w0, it writes it into the slot and runs it.
+ */
+static const u32 tpl_patch[] = {K(0x100000e9), K(0xb9000120), K(0xd50b7b29), K(0xd5033b9f),
+                                K(0xd50b7529), K(0xd5033b9f), K(0xd5033fdf), K(I_NOP),  K(I_RET)};
+#define PATCH_SLOT 7
+/* For EL0: mov x0, #0x4c30; svc #0. For EL1, four bytes further on: mov x0, #0x1e1; ret */
+static const u32 tpl_el0[] = {K(0xd2898600), K(0xd4000001), K(0xd2803c20), K(I_RET)};
+#define EL0_MARK 0x4c30
+#define EL1_MARK 0x1e1
+
+/* What hv_pmu.c makes of an access (the layout of the immediate is in its header comment) */
+static u32 replaced(u32 insn)
+{
+    u32 op1 = (insn >> 16) & 7, crn = (insn >> 12) & 15;
+    u32 reg = (op1 == 3 ? 0x100 : 0) | (crn == 14 ? 0x80 : 0) | ((insn >> 5) & 0x7f);
+    u32 imm = 0x8000 | (reg << 6) | ((insn >> 21) & 1) << 5 | (insn & 31);
+
+    return 0xd4000002 | (imm << 5);
+}
+
+/* ---- output ---- */
+
+static int strict;
+static u32 nr_pass, nr_fail;
+
+static void put(const char *s)
+{
+    while (*s)
+        uart_putc(*s++);
+}
+
+static void put_hex(u64 v, int digits)
+{
+    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
+        uart_putc("0123456789abcdef"[(v >> shift) & 0xf]);
+}
+
+static void put_dec(u64 v)
+{
+    char buf[20];
+    int n = 0;
+
+    do {
+        buf[n++] = '0' + v % 10;
+        v /= 10;
+    } while (v);
+    while (n)
+        uart_putc(buf[--n]);
+}
+
+static void line(const char *s)
+{
+    put("HVLOG: pmutest: ");
+    put(s);
+}
+
+static void result(const char *name, int ok)
+{
+    line(ok ? "PASS " : "FAIL ");
+    put(name);
+    put("\n");
+    if (ok)
+        nr_pass++;
+    else
+        nr_fail++;
+}
+
+static void value(const char *name, u64 v)
+{
+    line("     ");
+    put(name);
+    put(" = 0x");
+    put_hex(v, 16);
+    put("\n");
+}
+
+/* ---- exception handlers, called from sgitest-head.S and from the vectors below ---- */
+
+void irq_handler(void)
+{
+}
+
+u64 sync_handler(u64 esr, u64 elr)
+{
+    (void)esr;
+    (void)elr;
+    return 0;
+}
+
+void bad_exception(u64 vector)
+{
+    line("EXCEPTION cpu vector ESR ELR FAR SPSR = ");
+    put_hex(read_sysreg(tpidr_el1), 2);
+    put(" ");
+    put_hex(vector, 2);
+    put(" ");
+    put_hex(read_sysreg(esr_el1), 8);
+    put(" ");
+    put_hex(read_sysreg(elr_el1), 16);
+    put(" ");
+    put_hex(read_sysreg(far_el1), 16);
+    put(" ");
+    put_hex(read_sysreg(spsr_el1), 8);
+    put("\n");
+    for (;;)
+        ;
+}
+
+void secondary_main(int slot)
+{
+    (void)slot;
+    for (;;)
+        ;
+}
+
+/*
+ * A second vector table, in use only while a page runs at EL0: a synchronous exception from
+ * there ends run_el0(), which returns what EL0 left in x0 and stores ESR_EL1 through esr.
+ */
+asm("    .text\n"
+    "    .macro  el0_bad num\n"
+    "    .balign 0x80\n"
+    "    mov     x0, #\\num\n"
+    "    bl      bad_exception\n"
+    "    .endm\n"
+    "    .balign 0x800\n"
+    "    .globl  el0_vectors\n"
+    "el0_vectors:\n"
+    "    el0_bad 32\n"
+    "    el0_bad 33\n"
+    "    el0_bad 34\n"
+    "    el0_bad 35\n"
+    "    el0_bad 36\n"
+    "    el0_bad 37\n"
+    "    el0_bad 38\n"
+    "    el0_bad 39\n"
+    "    .balign 0x80\n"
+    "    b       el0_return\n" /* synchronous, from EL0 */
+    "    el0_bad 41\n"
+    "    el0_bad 42\n"
+    "    el0_bad 43\n"
+    "    el0_bad 44\n"
+    "    el0_bad 45\n"
+    "    el0_bad 46\n"
+    "    el0_bad 47\n"
+    "    .balign 0x80\n"
+    "    .globl  run_el0\n"
+    "run_el0:\n"
+    "    stp     x29, x30, [sp, #-112]!\n"
+    "    stp     x19, x20, [sp, #16]\n"
+    "    stp     x21, x22, [sp, #32]\n"
+    "    stp     x23, x24, [sp, #48]\n"
+    "    stp     x25, x26, [sp, #64]\n"
+    "    stp     x27, x28, [sp, #80]\n"
+    "    str     x2, [sp, #96]\n"
+    "    msr     sp_el0, x1\n"
+    "    msr     elr_el1, x0\n"
+    "    mov     x9, #0x3c0\n" /* EL0t, interrupts masked */
+    "    msr     spsr_el1, x9\n"
+    "    isb\n"
+    "    eret\n"
+    "el0_return:\n"
+    "    mrs     x1, esr_el1\n"
+    "    ldr     x9, [sp, #96]\n"
+    "    str     x1, [x9]\n"
+    "    ldp     x19, x20, [sp, #16]\n"
+    "    ldp     x21, x22, [sp, #32]\n"
+    "    ldp     x23, x24, [sp, #48]\n"
+    "    ldp     x25, x26, [sp, #64]\n"
+    "    ldp     x27, x28, [sp, #80]\n"
+    "    ldp     x29, x30, [sp], #112\n"
+    "    ret\n"
+    "    .globl  psci_system_off\n"
+    "psci_system_off:\n"
+    "    mov     x0, #0x84000000\n"
+    "    orr     x0, x0, #8\n"
+    "    hvc     #0\n"
+    "    ret\n");
+
+/* ---- helpers ---- */
+
+static u32 *page(int n)
+{
+    u64 base = ((u64)arena + PAGE - 1) & ~(PAGE - 1);
+
+    return (u32 *)(base + n * PAGE);
+}
+
+/* After writing code: what real hardware needs before the code may run */
+static void sync_code(u32 *at, int words)
+{
+    for (int i = 0; i < words; i++) {
+        asm volatile("dc cvau, %0" : : "r"(at + i));
+        asm volatile("ic ivau, %0" : : "r"(at + i));
+    }
+    asm volatile("dsb ish\nisb");
+}
+
+static void emit(u32 *at, const u32 *tpl, int words)
+{
+    u32 k = key;
+
+    for (int i = 0; i < words; i++)
+        at[i] = tpl[i] ^ k;
+    sync_code(at, words);
+}
+
+#define EMIT(at, tpl) emit(at, tpl, sizeof(tpl) / sizeof((tpl)[0]))
+
+typedef u64 (*fn0)(void);
+typedef u64 (*fn1)(u64);
+
+static u64 call0(u32 *at)
+{
+    return ((fn0)at)();
+}
+
+static u64 call1(u32 *at, u64 arg)
+{
+    return ((fn1)at)(arg);
+}
+
+/*
+ * The instruction at this address is still the access, or, where it must be, the hvc for it.
+ * masked is K(the access).
+ */
+static int as_expected(const u32 *at, u32 masked)
+{
+    u32 insn = U(masked);
+
+    return *at == (strict ? replaced(insn) : insn);
+}
+
+static void spin(u64 ticks)
+{
+    u64 t0 = read_sysreg(cntvct_el0);
+
+    while (read_sysreg(cntvct_el0) - t0 < ticks)
+        ;
+}
+
+/* ---- the tests ---- */
+
+/* What winload.efi and bootmgfw.efi do before they use the counter (BlpArchInitialize) */
+static void test_setup(void)
+{
+    u64 pmcr = read_sysreg(pmcr_el0);
+
+    value("PMCR_EL0 at the start", pmcr);
+    if (!(pmcr & 1)) {
+        write_sysreg(pmcntenclr_el0, 0xffffffff);
+        write_sysreg(pmovsclr_el0, 0xffffffff);
+        write_sysreg(pmintenclr_el1, 0xffffffff);
+    }
+    write_sysreg(pmcr_el0, (pmcr & ~0x28UL) | 0x51);
+    write_sysreg(pmccfiltr_el0, 0x8000000);
+    write_sysreg(pmcntenset_el0, 0x80000000);
+    write_sysreg(pmuserenr_el0, 0);
+    asm volatile("isb");
+
+    result("PMCR_EL0 keeps E and LC", (read_sysreg(pmcr_el0) & 0x41) == 0x41);
+    result("the cycle counter is enabled", (read_sysreg(pmcntenset_el0) >> 31) & 1);
+
+    u64 a = read_sysreg(pmccntr_el0);
+    spin(read_sysreg(cntfrq_el0) / 100);
+    u64 b = read_sysreg(pmccntr_el0);
+    value("PMCCNTR_EL0", a);
+    value("10 ms later", b);
+    result("PMCCNTR_EL0 goes up", b > a);
+
+    /* HalpTimerInitSystem */
+    write_sysreg(pmccntr_el0, 0);
+    asm volatile("isb");
+    u64 c = read_sysreg(pmccntr_el0);
+    value("after writing 0", c);
+    result("PMCCNTR_EL0 can be written", c < b);
+}
+
+static void test_fresh_page(void)
+{
+    u32 *pg = page(PG_FRESH);
+
+    EMIT(pg, tpl_ccntr);
+    u64 a = call0(pg);
+    spin(1000);
+    u64 b = call0(pg);
+    result("code written into a page that never ran: reads the counter", b > a);
+    result("...and is as expected afterwards", as_expected(pg, K(I_MRS_X0_PMCCNTR)));
+
+    line("     data behind it that looks like the instruction is now 0x");
+    put_hex(pg[2], 8);
+    put(pg[2] == U(K(I_MRS_X0_PMCCNTR)) ? " (as written)\n" : " (replaced)\n");
+
+    /* The page is executable now. Write other code into it and run that, over and over */
+    int ok = 1, seen = 1;
+    for (int i = 0; i < NR_REWRITES; i++) {
+        if (i & 1) {
+            EMIT(pg, tpl_ccntr);
+            u64 c = call0(pg);
+            ok &= c > b;
+            b = c;
+            seen &= as_expected(pg, K(I_MRS_X0_PMCCNTR));
+        } else {
+            EMIT(pg, tpl_pmcr);
+            ok &= (call0(pg) & 0x41) == 0x41;
+            seen &= as_expected(pg, K(I_MRS_X0_PMCR));
+        }
+    }
+    result("the page rewritten 16 times: each version does what it says", ok);
+    result("...and is as expected afterwards", seen);
+}
+
+static void test_store_same_page(void)
+{
+    u32 *pg = page(PG_STORE);
+    u64 *data = (u64 *)(pg + STORE_DATA);
+    int ok = 1;
+    u64 last = 0;
+
+    EMIT(pg, tpl_store);
+    for (u64 i = 1; i <= NR_STORES; i++) {
+        u64 c = call1(pg, 0x5700000000000000UL + i);
+        ok &= *data == 0x5700000000000000UL + i && c > last;
+        last = c;
+    }
+    result("code that stores into its own page, 1000 times: the stores arrive", ok);
+    result("...and the code is as expected afterwards", as_expected(pg + 2, K(I_MRS_X0_PMCCNTR)));
+
+    /* A store from elsewhere into that page, and the code again */
+    *data = 1;
+    u64 c = call1(pg, 2);
+    result("after a store from another page: the code still works", *data == 2 && c > last);
+}
+
+static void test_patch_same_page(void)
+{
+    u32 *pg = page(PG_PATCH);
+    u32 insn = U(K(I_MRS_X0_PMCCNTR));
+
+    EMIT(pg, tpl_patch);
+    u64 a = call1(pg, insn);
+    spin(1000);
+    u64 b = call1(pg, insn);
+    value("first", a);
+    value("second", b);
+    result("code that writes an access into its own page and runs it", a != insn && b > a);
+    result("...and the access is as expected afterwards",
+           as_expected(pg + PATCH_SLOT, K(I_MRS_X0_PMCCNTR)));
+}
+
+static void test_el0(void)
+{
+    u32 *pg = page(PG_EL0);
+    u64 vbar = read_sysreg(vbar_el1);
+
+    EMIT(pg, tpl_el0);
+    write_sysreg(vbar_el1, (u64)el0_vectors);
+    asm volatile("isb");
+    u64 el0_esr = 0;
+    u64 x0 = run_el0((u64)pg, (u64)el0_stack + sizeof(el0_stack), &el0_esr);
+    write_sysreg(vbar_el1, vbar);
+    asm volatile("isb");
+
+    value("ESR_EL1 of the way back from EL0", el0_esr);
+    result("a page that EL1 never ran executes at EL0", x0 == EL0_MARK && (el0_esr >> 26) == 0x15);
+    result("...and at EL1 afterwards", call0(pg + 2) == EL1_MARK);
+}
+
+static void test_timing(void)
+{
+    u64 freq = read_sysreg(cntfrq_el0);
+    for (int i = 0; i < NR_TIMING; i++) {
+        page(PG_TIMING + i)[0] = U(K(I_RET));
+        sync_code(page(PG_TIMING + i), 1);
+    }
+
+    u64 t0 = read_sysreg(cntvct_el0);
+    for (int i = 0; i < NR_TIMING; i++)
+        call0(page(PG_TIMING + i));
+    u64 t1 = read_sysreg(cntvct_el0);
+    for (int i = 0; i < NR_TIMING; i++)
+        call0(page(PG_TIMING + i));
+    u64 t2 = read_sysreg(cntvct_el0);
+
+    line("     32 pages, each run for the first time: ");
+    put_dec((t1 - t0) * 1000000000 / freq / NR_TIMING);
+    put(" ns a page; run again: ");
+    put_dec((t2 - t1) * 1000000000 / freq / NR_TIMING);
+    put(" ns a page\n");
+    result("32 pages run for the first time", 1);
+}
+
+static void test_untouched(void)
+{
+    u32 *pg = page(PG_UNTOUCHED);
+    u32 insn = U(K(I_MRS_X0_PMCCNTR));
+    int ok = 1;
+
+    for (u64 i = 0; i < WORDS; i++)
+        ok &= pg[i] == insn + (i & 31);
+    result("a page full of accesses that never ran is as it was written", ok);
+}
+
+void boot_main(void)
+{
+    u32 insn = U(K(I_MRS_X0_PMCCNTR));
+
+    strict = !!(hdr_arg & ARG_STRICT);
+
+    line("start, arg=");
+    put_hex(hdr_arg, 4);
+    put(strict ? ", expecting replaced code\n" : ", expecting real PMUv3 registers\n");
+    line("CurrentEL = ");
+    put_dec((read_sysreg(CurrentEL) >> 2) & 3);
+    put("\n");
+    value("arena", (u64)page(0));
+
+    /* Before anything else: fill the page that is never to run, every Rt there is */
+    for (u64 i = 0; i < WORDS; i++)
+        page(PG_UNTOUCHED)[i] = insn + (i & 31);
+
+    test_setup();
+    test_fresh_page();
+    test_store_same_page();
+    test_patch_same_page();
+    test_el0();
+    test_timing();
+    test_untouched();
+
+    line("DONE pass fail = ");
+    put_dec(nr_pass);
+    put(" ");
+    put_dec(nr_fail);
+    put("\n");
+
+    psci_system_off();
+    line("FAIL SYSTEM_OFF returned\n");
+    for (;;)
+        ;
+}
