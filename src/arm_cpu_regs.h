@@ -499,6 +499,7 @@
 
 #define SYS_MDSCR_EL1 sys_reg(2, 0, 0, 2, 2)
 #define SYS_OSLAR_EL1 sys_reg(2, 0, 1, 0, 4)
+#define SYS_OSLSR_EL1 sys_reg(2, 0, 1, 1, 4)
 
 #define SYS_TPIDR2_EL0 sys_reg(3, 3, 13, 0, 5)
 

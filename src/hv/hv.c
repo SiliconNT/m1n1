@@ -214,6 +214,7 @@ void hv_init(void)
     hv_wfi_init();
     hv_psci_init();
     hv_pmu_init();
+    hv_dbg_init();
     hv_xtrack_init();
 
     // Set deep WFI back to defaults
@@ -329,6 +330,7 @@ void hv_start(void *entry, u64 regs[4])
     hv_wfi_report();
     hv_psci_report();
     hv_pmu_report();
+    hv_dbg_report();
     hv_xtrack_report();
     spin_unlock(&bhl);
 }

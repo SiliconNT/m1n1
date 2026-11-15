@@ -74,5 +74,8 @@ u32 hv_pmu_unpatch_word(u32 insn);
 u32 hv_pmu_patch_range(u32 *words, u32 count);
 bool hv_pmu_hvc(struct exc_info *ctx, u16 imm);
 void hv_pmu_report(void);
+void hv_dbg_init(void);
+bool hv_dbg_handle_msr(struct exc_info *ctx, u64 iss);
+void hv_dbg_report(void);
 
 #endif

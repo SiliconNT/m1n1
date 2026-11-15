@@ -237,6 +237,10 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         hv_sprr_traps_tlbi())
         return false;
 
+    /* The breakpoint and watchpoint registers and OSLSR_EL1, which MDCR_EL2 traps */
+    if (hv_dbg_handle_msr(ctx, iss))
+        return true;
+
     switch (reg) {
         SYSREG_PASS(SYS_TPIDR2_EL0);
         SYSREG_PASS(SYS_IMP_APL_TPIDR_GL2);

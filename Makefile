@@ -130,6 +130,7 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 	hv_amcc.o \
 	hv_cpu_power.o \
 	hv_asm.o \
+	hv_dbg.o \
 	hv_exc.o \
 	hv_pmu.o \
 	hv_psci.o \

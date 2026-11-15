@@ -8,6 +8,7 @@
 #   make        build them and run them
 #   make pt     only the page table one
 #   make xtrack only the execution tracking one
+#   make dbg    only the one for the debug registers, src/hv/hv_dbg.c (dbg_test.c)
 #   make psci   only the PSCI one, and test_hv_events.py: that the host has a handler for
 #               every event the hypervisor sends (needs the Python of the proxy client)
 #   make tsan   test.c under ThreadSanitizer, with fewer rounds
@@ -18,10 +19,21 @@ SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -pthread -I. -Ibuild
 ROUNDS ?= 200000
 
-.PHONY: all psci pmu pt xtrack tsan clean
+.PHONY: all psci pmu pt xtrack dbg tsan clean
 
-all: build/model psci pmu pt xtrack
+all: build/model psci pmu pt xtrack dbg
 	build/model $(ROUNDS)
+
+# The breakpoint and watchpoint registers of the guest, src/hv/hv_dbg.c
+dbg: build/dbg-model
+	build/dbg-model
+
+build/hv_dbg.c: $(SRC)/hv/hv_dbg.c
+	@mkdir -p build
+	cp $< $@
+
+build/dbg-model: dbg_test.c $(wildcard *.h) build/hv_dbg.c build/arm_cpu_regs.h
+	$(CC) $(CFLAGS) -o $@ dbg_test.c build/hv_dbg.c
 
 # The stage 2 page tables of src/hv/hv_vm.c
 pt: build/pt-model

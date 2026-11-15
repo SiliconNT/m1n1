@@ -123,6 +123,11 @@ u32 hv_pmu_patch_range(u32 *words, u32 count);
 bool hv_pmu_hvc(struct exc_info *ctx, u16 imm);
 void hv_pmu_report(void);
 
+/* The breakpoint and watchpoint registers for the guest: kept per core, never armed */
+void hv_dbg_init(void);
+bool hv_dbg_handle_msr(struct exc_info *ctx, u64 iss);
+void hv_dbg_report(void);
+
 /* Execution tracking: a page of the guest is scanned before it first executes */
 int hv_pt_xtrack(void);
 bool hv_pt_xtrack_on(void);
