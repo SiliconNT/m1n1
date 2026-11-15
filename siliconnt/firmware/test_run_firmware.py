@@ -89,8 +89,8 @@ def make_fakes(case):
     class M1N1Proxy:
         def __init__(self, iface, debug=False):
             pass
-        def hv_xtrack(self, mode):
-            rec.xtrack = mode
+        def hv_xtrack(self):
+            rec.xtrack = True
             # what was done already, and what was not, when tracking was turned on
             rec.xtrack_state = (rec.loaded is not None, len(rec.writes), rec.hv_start is None)
             return case.get("xtrack_ret", 0)
@@ -762,14 +762,14 @@ check("the default port is 51000",
 
 # 32. execution tracking
 rec, out, code = run({}, "--seconds", "1", *image_args)
-check("execution tracking is on by default, at EL1 only",
-      code == 0 and rec.xtrack == 1 and "Execution tracking: el1" in out, f"{rec.xtrack} {out[-300:]}")
+check("execution tracking is on by default",
+      code == 0 and rec.xtrack is True and "Execution tracking: on" in out, f"{rec.xtrack} {out[-300:]}")
 check("it is turned on after the image is loaded and before the guest is entered",
       rec.xtrack_state == (True, 0, True) and rec.hv_start is not None, f"{rec.xtrack_state}")
 
-rec, out, code = run({}, "--seconds", "1", "--xtrack", "all", *image_args)
-check("--xtrack all tracks EL1 and EL0", code == 0 and rec.xtrack == 2 and
-      "Execution tracking: all" in out, f"{rec.xtrack}")
+rec, out, code = run({}, "--seconds", "1", "--xtrack", "el1", *image_args)
+check("there is no tracking of EL1 alone to ask for", code != 0 and rec.hv_start is None,
+      f"{code!r}")
 
 rec, out, code = run({}, "--seconds", "1", "--xtrack", "off", *image_args)
 check("--xtrack off leaves it off and says what that means",
@@ -778,7 +778,7 @@ check("--xtrack off leaves it off and says what that means",
 
 rec, out, code = run({"xtrack_ret": 0xffffffffffffffff}, "--seconds", "1", *image_args)
 check("a hypervisor that refuses stops the run before the guest is entered",
-      code != 0 and rec.xtrack == 1 and rec.hv_start is None, f"{code!r}")
+      code != 0 and rec.xtrack is True and rec.hv_start is None, f"{code!r}")
 
 rec, out, code = run({}, "--check-only", *image_args)
 check("check-only does not turn it on", code == 0 and rec.xtrack is None)

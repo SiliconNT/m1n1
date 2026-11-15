@@ -9,9 +9,8 @@ The m1n1 on the target has to be built from this tree: the tests are about src/h
 src/hv/hv_wfi.c, src/hv/hv_psci.c, src/hv/hv_pmu.c and src/hv/hv_xtrack.c.
 
 pmutest needs --xtrack: no memory of the guest is executable then until the hypervisor has
-scanned it and replaced the accesses to PMUv3 registers, which the M4 does not have. "all"
-tracks execution at EL1 and EL0, "el1" tracks EL1 only and needs the hardware to tell the two
-apart in stage 2 (FEAT_XNX). With --guest-arg 0x100 pmutest also insists that its code was
+scanned it and replaced the accesses to PMUv3 registers, which the M4 does not have, whether
+the code runs at EL1 or at EL0. With --guest-arg 0x100 pmutest also insists that its code was
 replaced. It ends with SYSTEM_OFF, as pscitest does.
 
 pscitest takes an argument, --guest-arg: 0x100 makes it expect exactly the answers of the
@@ -52,7 +51,7 @@ parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "buil
                     help="the raw m1n1.bin that is supposed to be running on the target")
 parser.add_argument("--guest-arg", type=lambda s: int(s, 0), default=0, metavar="N",
                     help="what goes into the argument field of the image header (default 0)")
-parser.add_argument("--xtrack", choices=("el1", "all"),
+parser.add_argument("--xtrack", action="store_true",
                     help="track execution: scan the memory of the guest before it runs "
                          "(for pmutest)")
 parser.add_argument("--check-only", action="store_true",
@@ -237,9 +236,9 @@ hv.load_raw(bytes(image), entryoffset=0)
 if args.xtrack:
     # After the memory of the guest has been mapped and filled: this changes the mappings
     # that are there
-    if p.hv_xtrack({"el1": 1, "all": 2}[args.xtrack]) != 0:
+    if p.hv_xtrack() != 0:
         sys.exit("The hypervisor refused to track execution")
-    print(f"Execution tracking: {args.xtrack}")
+    print("Execution tracking: on")
 
 def start_secondary(die, cluster, core):
     """The guest wrote the CPU start register. Stands in for HV.start_secondary(), which

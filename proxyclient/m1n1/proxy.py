@@ -1177,8 +1177,8 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_HV_SPRR_SET_POOL, base, size)
     def hv_set_genter_trap(self, enabled):
         return self.request(self.P_HV_SET_GENTER_TRAP, enabled)
-    def hv_xtrack(self, mode):
-        return self.request(self.P_HV_XTRACK, mode)
+    def hv_xtrack(self):
+        return self.request(self.P_HV_XTRACK)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

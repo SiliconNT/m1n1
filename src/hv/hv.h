@@ -124,9 +124,7 @@ bool hv_pmu_hvc(struct exc_info *ctx, u16 imm);
 void hv_pmu_report(void);
 
 /* Execution tracking: a page of the guest is scanned before it first executes */
-#define HV_XTRACK_EL1 1 // execution at EL1 is tracked, EL0 executes freely (needs FEAT_XNX)
-#define HV_XTRACK_ALL 2 // execution at EL1 and EL0 is tracked
-int hv_pt_xtrack(u64 mode);
+int hv_pt_xtrack(void);
 bool hv_pt_xtrack_on(void);
 #define HV_XPAGE_UNSCANNED 0
 #define HV_XPAGE_SCANNED   1

@@ -9,8 +9,8 @@ from the boot disk, the PMUv3 registers (src/hv/hv_pmu.c), which the M4 does not
 
 Execution tracking (--xtrack, src/hv/hv_xtrack.c) is how Windows gets them: no memory of the
 guest is executable until the hypervisor has scanned it and replaced the accesses to those
-registers. It is turned on after everything has been put into guest memory and before the
-guest is entered. "el1", the default, leaves code that runs at EL0 alone.
+registers, whether the code runs at EL1 or at EL0. It is turned on after everything has been
+put into guest memory and before the guest is entered.
 
 What the firmware is handed, and where things go. Guest RAM starts at the top of the heap
 this script keeps for itself, above m1n1 and m1n1's own heap (HV._prepare_load()), so what
@@ -94,9 +94,9 @@ parser.add_argument("--wait-debugger", type=int, default=0, metavar="SECONDS",
 parser.add_argument("--disk", type=pathlib.Path,
                     help="the image of a disk with a GPT, put into guest memory after the boot "
                          "arguments for the firmware to register as a RAM disk")
-parser.add_argument("--xtrack", choices=("el1", "all", "off"), default="el1",
-                    help="execution tracking: scan the memory of the guest before it runs, "
-                         "at EL1 only (default), at EL1 and EL0, or not at all")
+parser.add_argument("--xtrack", choices=("on", "off"), default="on",
+                    help="execution tracking: scan the memory of the guest before it runs "
+                         "(default), or do not")
 parser.add_argument("--image-only", action="store_true",
                     help="only check the firmware image and the disk image; do not open any port")
 parser.add_argument("--check-only", action="store_true",
@@ -609,9 +609,9 @@ if args.xtrack == "off":
     print("Execution tracking: off. A guest that reads the PMUv3 cycle counter takes an "
           "exception")
 else:
-    if p.hv_xtrack({"el1": 1, "all": 2}[args.xtrack]) != 0:
+    if p.hv_xtrack() != 0:
         sys.exit("The hypervisor refused to track execution. The guest has not run.")
-    print(f"Execution tracking: {args.xtrack}")
+    print("Execution tracking: on")
 
 # Does nothing unless M1N1_PMU_RESET=1 (proxyclient/m1n1/hw/pmu.py)
 PMU(u).reset_panic_counter()

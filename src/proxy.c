@@ -559,7 +559,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             hv_set_genter_trap(request->args[0]);
             break;
         case P_HV_XTRACK:
-            reply->retval = hv_pt_xtrack(request->args[0]);
+            reply->retval = hv_pt_xtrack();
             break;
 
         case P_FB_INIT:

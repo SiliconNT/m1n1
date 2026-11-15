@@ -35,10 +35,9 @@ extern uint64_t ram_base;
 /*
  * Stage 2 execute-never, XN[1:0] (Arm DDI 0487 M.d, D8.4.2.1.2, table D8-78; the second bit
  * is there with FEAT_XNX, which ID_AA64MMFR1_EL1 of the M4 reports): 0b00 is executable,
- * 0b01 is not executable at EL1 but is at EL0, 0b10 is not executable at all.
+ * 0b10 is not executable at all, at EL1 or at EL0.
  */
 #define PTE_XN     GENMASK(54, 53)
-#define PTE_XN_EL1 (0b01L << 53)
 #define PTE_XN_ALL (0b10L << 53)
 /* One of the bits a descriptor leaves to software: this page has been scanned, see hv_xtrack.c */
 #define PTE_SW_SCANNED BIT(56)
@@ -474,23 +473,13 @@ static void hv_pt_xn_l2(u64 *l2, u64 base)
 }
 
 /*
- * Start tracking execution: from now on no hardware mapping is executable (at EL1 only, or at
- * EL1 and EL0) until hv_pt_set_scanned() says so, and the mappings that exist already are
- * changed to match. There is no way back short of hv_pt_init().
+ * Start tracking execution: from now on no hardware mapping is executable, at EL1 or at EL0,
+ * until hv_pt_set_scanned() says so, and the mappings that exist already are changed to match.
+ * There is no way back short of hv_pt_init().
  */
-int hv_pt_xtrack(u64 mode)
+int hv_pt_xtrack(void)
 {
-    switch (mode) {
-        case HV_XTRACK_EL1:
-            hv_pt_xn = PTE_XN_EL1;
-            break;
-        case HV_XTRACK_ALL:
-            hv_pt_xn = PTE_XN_ALL;
-            break;
-        default:
-            printf("HV: no execution tracking mode %ld\n", mode);
-            return -1;
-    }
+    hv_pt_xn = PTE_XN_ALL;
 
     if (vaddr_bits > 36) {
         for (u64 i = 0; i < ENTRIES_PER_L1_TABLE; i++)
@@ -501,8 +490,7 @@ int hv_pt_xtrack(u64 mode)
     }
 
     hv_pt_flush_tlb();
-    printf("HV: memory is not executable at %s until it has been scanned\n",
-           mode == HV_XTRACK_EL1 ? "EL1" : "EL1 and EL0");
+    printf("HV: memory is not executable at EL1 and EL0 until it has been scanned\n");
     return 0;
 }
 
