@@ -17,7 +17,7 @@
 
 extern uint64_t ram_base;
 
-#define PAGE_SIZE       0x4000
+#define PAGE_SIZE       0x1000
 #define CACHE_LINE_SIZE 64
 #define CACHE_LINE_LOG2 6
 
@@ -30,7 +30,7 @@ extern uint64_t ram_base;
 #define PTE_ATTRIBUTES    (PTE_ACCESS | PTE_SH_NS | PTE_S2AP_RW | PTE_MEMATTR_UNCHANGED)
 #define PTE_ATTRIBUTES_RO (PTE_ACCESS | PTE_SH_NS | PTE_S2AP_RO | PTE_MEMATTR_UNCHANGED)
 
-#define PTE_LOWER_ATTRIBUTES GENMASK(13, 2)
+#define PTE_LOWER_ATTRIBUTES GENMASK(11, 2)
 
 /*
  * Stage 2 execute-never, XN[1:0] (Arm DDI 0487 M.d, D8.4.2.1.2, table D8-78; the second bit
@@ -50,22 +50,24 @@ extern uint64_t ram_base;
 #define PTE_TABLE 1
 #define PTE_PAGE  1
 
-#define VADDR_L4_INDEX_BITS 12
-#define VADDR_L3_INDEX_BITS 11
-#define VADDR_L2_INDEX_BITS 11
-#define VADDR_L1_INDEX_BITS 8
+#define VADDR_L4_INDEX_BITS 10
+#define VADDR_L3_INDEX_BITS 9
+#define VADDR_L2_INDEX_BITS 9
+#define VADDR_L1_INDEX_BITS 13 // at most: 16 tables side by side
 
 #define VADDR_L4_OFFSET_BITS 2
-#define VADDR_L3_OFFSET_BITS 14
-#define VADDR_L2_OFFSET_BITS 25
-#define VADDR_L1_OFFSET_BITS 36
+#define VADDR_L3_OFFSET_BITS 12
+#define VADDR_L2_OFFSET_BITS 21
+#define VADDR_L1_OFFSET_BITS 30
+
+#define VADDR_MAX_BITS (VADDR_L1_OFFSET_BITS + VADDR_L1_INDEX_BITS)
 
 #define VADDR_L2_ALIGN_MASK GENMASK(VADDR_L2_OFFSET_BITS - 1, VADDR_L3_OFFSET_BITS)
 #define VADDR_L3_ALIGN_MASK GENMASK(VADDR_L3_OFFSET_BITS - 1, VADDR_L4_OFFSET_BITS)
 #define PTE_TARGET_MASK     GENMASK(49, VADDR_L3_OFFSET_BITS)
 #define PTE_TARGET_MASK_L4  GENMASK(49, VADDR_L4_OFFSET_BITS)
 
-#define ENTRIES_PER_L1_TABLE BIT(VADDR_L1_INDEX_BITS)
+#define ENTRIES_PER_L1_TABLE BIT(vaddr_bits - VADDR_L1_OFFSET_BITS)
 #define ENTRIES_PER_L2_TABLE BIT(VADDR_L2_INDEX_BITS)
 #define ENTRIES_PER_L3_TABLE BIT(VADDR_L3_INDEX_BITS)
 #define ENTRIES_PER_L4_TABLE BIT(VADDR_L4_INDEX_BITS)
@@ -99,21 +101,23 @@ extern uint64_t ram_base;
 uint64_t vaddr_bits;
 
 /*
- * We use 16KB page tables for stage 2 translation, and a 64GB (36-bit) guest
- * PA size, which results in the following virtual address space:
+ * We use 4KB page tables for stage 2 translation, the page size of the guest (Windows): a
+ * page of the guest is a page here, which hv_xtrack.c relies on. The walk starts at level 1.
+ * With up to 16 tables side by side there, it resolves up to 43 bits of guest PA (Arm DDI
+ * 0487 M.d, D8.2.2 and table D8-22), which results in the following virtual address space:
  *
- * [L2 index]  [L3 index] [page offset]
- *  11 bits     11 bits    14 bits
+ * [L1 index]  [L2 index]  [L3 index] [page offset]
+ *  2..13 bits  9 bits      9 bits     12 bits
  *
- * 32MB L2 mappings look like this:
- * [L2 index]  [page offset]
- *  11 bits     25 bits
+ * 2MB L2 mappings look like this:
+ * [L1 index]  [L2 index]  [page offset]
+ *  2..13 bits  9 bits      21 bits
  *
  * We implement sub-page granularity mappings for software MMIO hooks, which behave
  * as an additional page table level used only by software. This works like this:
  *
- * [L2 index]  [L3 index] [L4 index]  [Word offset]
- *  11 bits     11 bits    12 bits     2 bits
+ * [L1 index]  [L2 index]  [L3 index] [L4 index]  [Word offset]
+ *  2..13 bits  9 bits      9 bits     10 bits     2 bits
  *
  * Thus, L4 sub-page tables are twice the size.
  *
@@ -122,9 +126,7 @@ uint64_t vaddr_bits;
  * block but 1 means both table (at L<3) and page (at L3). For mmiotrace, this is
  * pushed to L4.
  *
- * On SoCs with more than 36-bit PA sizes there is an additional L1 translation level,
- * but no blocks or software mappings are allowed there. This level can have up to 8 bits
- * at this time.
+ * No blocks or software mappings are allowed at L1.
  */
 
 static u64 *hv_Ltop;
@@ -139,21 +141,21 @@ void hv_pt_init(void)
     const uint64_t pa_bits[] = {32, 36, 40, 42, 44, 48, 52};
     uint64_t pa_range = FIELD_GET(ID_AA64MMFR0_PARange, mrs(ID_AA64MMFR0_EL1));
 
-    vaddr_bits = min(44, pa_bits[pa_range]);
+    vaddr_bits = min(VADDR_MAX_BITS, pa_bits[pa_range]);
 
     printf("HV: Initializing for %ld-bit PA range\n", vaddr_bits);
 
-    hv_Ltop = memalign(PAGE_SIZE, sizeof(u64) * ENTRIES_PER_L2_TABLE);
-    memset(hv_Ltop, 0, sizeof(u64) * ENTRIES_PER_L2_TABLE);
-
-    u64 sl0 = vaddr_bits > 36 ? 2 : 1;
+    // The tables of the first level lie side by side, aligned to the size of them all
+    u64 size = max(sizeof(u64) * ENTRIES_PER_L1_TABLE, PAGE_SIZE);
+    hv_Ltop = memalign(size, size);
+    memset(hv_Ltop, 0, size);
 
     msr(VTCR_EL2, FIELD_PREP(VTCR_PS, pa_range) |              // Full PA size
-                      FIELD_PREP(VTCR_TG0, 2) |                // 16KB page size
+                      FIELD_PREP(VTCR_TG0, 0) |                // 4KB page size
                       FIELD_PREP(VTCR_SH0, 3) |                // PTWs Inner Sharable
                       FIELD_PREP(VTCR_ORGN0, 1) |              // PTWs Cacheable
                       FIELD_PREP(VTCR_IRGN0, 1) |              // PTWs Cacheable
-                      FIELD_PREP(VTCR_SL0, sl0) |              // Start level
+                      FIELD_PREP(VTCR_SL0, 1) |                // Start at level 1
                       FIELD_PREP(VTCR_T0SZ, 64 - vaddr_bits)); // Translation region == PA
 
     msr(VTTBR_EL2, hv_Ltop);
@@ -163,10 +165,7 @@ static u64 *hv_pt_get_l2(u64 from)
 {
     u64 l1idx = from >> VADDR_L1_OFFSET_BITS;
 
-    if (vaddr_bits <= 36) {
-        assert(l1idx == 0);
-        return hv_Ltop;
-    }
+    assert(l1idx < ENTRIES_PER_L1_TABLE);
 
     u64 l1d = hv_Ltop[l1idx];
 
@@ -455,12 +454,22 @@ static void hv_pt_flush_tlb(void)
 static void hv_pt_xn_l2(u64 *l2, u64 base)
 {
     for (u64 i = 0; i < ENTRIES_PER_L2_TABLE; i++) {
+        u64 ipa = base + (i << VADDR_L2_OFFSET_BITS);
+
         /*
-         * Every page gets an entry of its own now, before the guest runs: a 32 MB block is
-         * not taken apart later, under a guest that may be executing from it on another core.
+         * Every page of memory gets an entry of its own now, before the guest runs: a 2 MB
+         * block is not taken apart later, under a guest that may be executing from it on
+         * another core. Device registers, which are everything below the memory and several
+         * times its size, stay blocks, or the tables would not fit the heap: nothing is ever
+         * executed there, and hv_pt_scanned() does not take them for memory.
          */
-        if (L2_IS_HW_BLOCK(l2[i]))
-            hv_pt_get_l3(base + (i << VADDR_L2_OFFSET_BITS));
+        if (L2_IS_HW_BLOCK(l2[i])) {
+            if (ipa < ram_base) {
+                l2[i] = (l2[i] & ~PTE_XN) | hv_pt_xn;
+                continue;
+            }
+            hv_pt_get_l3(ipa);
+        }
 
         if (!L2_IS_TABLE(l2[i]))
             continue;
@@ -481,13 +490,9 @@ int hv_pt_xtrack(void)
 {
     hv_pt_xn = PTE_XN_ALL;
 
-    if (vaddr_bits > 36) {
-        for (u64 i = 0; i < ENTRIES_PER_L1_TABLE; i++)
-            if (L1_IS_TABLE(hv_Ltop[i]))
-                hv_pt_xn_l2((u64 *)(hv_Ltop[i] & PTE_TARGET_MASK), i << VADDR_L1_OFFSET_BITS);
-    } else {
-        hv_pt_xn_l2(hv_Ltop, 0);
-    }
+    for (u64 i = 0; i < ENTRIES_PER_L1_TABLE; i++)
+        if (L1_IS_TABLE(hv_Ltop[i]))
+            hv_pt_xn_l2((u64 *)(hv_Ltop[i] & PTE_TARGET_MASK), i << VADDR_L1_OFFSET_BITS);
 
     hv_pt_flush_tlb();
     printf("HV: memory is not executable at EL1 and EL0 until it has been scanned\n");
@@ -502,14 +507,14 @@ bool hv_pt_xtrack_on(void)
 /*
  * The state of the page of memory at this IPA while execution is tracked: HV_XPAGE_SCANNED
  * (executable, read-only), HV_XPAGE_UNSCANNED (writable, not executable), HV_XPAGE_OPEN
- * (executable and writable, for a short while), or -1 if there is no memory there. *pa is
- * where the page is.
+ * (executable and writable, for a short while), or -1 if there is no memory there: device
+ * registers are not memory. *pa is where the page is.
  */
 int hv_pt_scanned(u64 ipa, u64 *pa)
 {
     ipa &= ~MASK(VADDR_L3_OFFSET_BITS);
 
-    if (ipa >= BIT(vaddr_bits))
+    if (ipa < ram_base || ipa >= BIT(vaddr_bits))
         return -1;
 
     u64 pte = hv_pt_walk(ipa);
@@ -595,23 +600,17 @@ u64 hv_pt_walk(u64 addr)
     dprintf("hv_pt_walk(0x%lx)\n", addr);
 
     u64 idx = addr >> VADDR_L1_OFFSET_BITS;
-    u64 *l2;
-    if (vaddr_bits > 36) {
-        assert(idx < ENTRIES_PER_L1_TABLE);
+    assert(idx < ENTRIES_PER_L1_TABLE);
 
-        u64 l1d = hv_Ltop[idx];
+    u64 l1d = hv_Ltop[idx];
 
-        dprintf("  l1d = 0x%lx\n", l1d);
+    dprintf("  l1d = 0x%lx\n", l1d);
 
-        if (!L1_IS_TABLE(l1d)) {
-            dprintf("  result: 0x%lx\n", l1d);
-            return l1d;
-        }
-        l2 = (u64 *)(l1d & PTE_TARGET_MASK);
-    } else {
-        assert(idx == 0);
-        l2 = hv_Ltop;
+    if (!L1_IS_TABLE(l1d)) {
+        dprintf("  result: 0x%lx\n", l1d);
+        return l1d;
     }
+    u64 *l2 = (u64 *)(l1d & PTE_TARGET_MASK);
 
     idx = (addr >> VADDR_L2_OFFSET_BITS) & MASK(VADDR_L2_INDEX_BITS);
     u64 l2d = l2[idx];
@@ -1102,7 +1101,7 @@ static bool hv_emulate_rw_aligned(struct exc_info *ctx, u64 pte, u64 vaddr, u64 
                                   bool is_write, u64 width, u64 elr, u64 par)
 {
     assert(pte);
-    assert(((ipa & 0x3fff) + (1 << width)) <= 0x4000);
+    assert(((ipa & (PAGE_SIZE - 1)) + (1 << width)) <= PAGE_SIZE);
 
     u64 target = pte & PTE_TARGET_MASK_L4;
     u64 paddr = target | (vaddr & MASK(VADDR_L4_OFFSET_BITS));

@@ -133,6 +133,13 @@ static void hv_enable_sme_zt0(void)
 /* must be called before hv_init */
 void hv_sptm_set_mode(enum hv_sptm_mode mode)
 {
+    /*
+     * hv_sprr.c write-protects the 16 KB pages of its guest one stage 2 page at a time, and
+     * stage 2 has 4 KB pages in this tree (hv_vm.c): three quarters would stay writable.
+     */
+    if (mode == SPTM_EMULATION)
+        panic("HV: SPTM emulation needs 16 KB pages in stage 2, this tree has 4 KB\n");
+
     printf("HV: SPTM mode %d\n", mode);
     hv_sptm_mode = mode;
 }

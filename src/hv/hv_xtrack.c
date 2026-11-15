@@ -16,8 +16,8 @@
  *    back to writable and not executable and the guest stores again; when code in it next
  *    runs, it is scanned again. So a page is never executable while something that has not
  *    been scanned can be in it.
- *  - If the store comes from the very page it writes to (code and writable data share a 16 KB
- *    stage 2 page while the guest thinks in 4 KB pages), flipping would never end: the store
+ *  - If the store comes from the very page it writes to (code and writable data that share a
+ *    page; stage 2 has the 4 KB pages of the guest), flipping would never end: the store
  *    needs the page writable and the instruction that stores needs it executable. Then the
  *    store is carried out here, with the page left as it is, and the page is scanned again.
  *  - If that store is an instruction the MMIO emulation does not know (pair stores with
@@ -29,7 +29,10 @@
  * What gets past this: memory written from outside the guest's stage 2 mappings while it is
  * executable. That is the host of the hypervisor writing to guest memory, and devices doing
  * DMA. And an access that is written into an open page and executed before the page is
- * closed again: within a millisecond, by code that shares its 16 KB page.
+ * closed again: within a millisecond, by code that shares its page.
+ *
+ * Device registers are not memory here: a guest that executes from them is stopped
+ * (hv_pt_scanned() knows nothing below the start of RAM).
  *
  * Everything here runs with the hypervisor lock held. The stage 2 tables are shared by all
  * cores, and a change of permissions is followed by a TLB invalidation on all of them
@@ -43,7 +46,8 @@
 #include "smp.h"
 #include "utils.h"
 
-#define XTRACK_PAGE 0x4000UL
+/* A page of stage 2, which is a page of the guest: see hv_vm.c */
+#define XTRACK_PAGE 0x1000UL
 
 /* ESR_ELx.ISS of an abort: the fault status code is in bits 5:0, 0b0011xx is a permission fault */
 #define ISS_FSC      GENMASK(5, 0)
