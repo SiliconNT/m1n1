@@ -4,14 +4,24 @@
  * The Arm PMUv3 registers for a guest on a core that does not have them.
  *
  * Windows reads the PMUv3 cycle counter PMCCNTR_EL0 as a time stamp, in its boot manager, its
- * loader, its kernel and its serial debugger module, and sets the counter up through PMCR_EL0
- * and a handful of other registers. On the M4 (ID_AA64DFR0_EL1.PMUVer = 0xF) these registers
- * do not exist: an access is an Undefined Instruction exception that the guest takes itself, at
- * EL1, and none of the controls that hand such an access to EL2 take effect under m1n1.
+ * loader, its kernel, its serial debugger module and its user-mode programs and libraries, and
+ * sets the counter up through PMCR_EL0 and a handful of other registers. On the M4
+ * (ID_AA64DFR0_EL1.PMUVer = 0xF) these registers do not exist: an access is an Undefined
+ * Instruction exception that the guest takes itself, at EL1, and none of the controls that
+ * hand such an access to EL2 take effect under m1n1.
  *
  * So the accesses are taken out of the guest's code. The words of a page that are an MRS or an
- * MSR of one of these registers are each replaced by an HVC whose immediate says which
- * register, which direction and which general-purpose register:
+ * MSR of one of these registers are each replaced by another instruction of the same length
+ * that uses the same general-purpose register.
+ *
+ * A read of PMCCNTR_EL0 becomes a read of CNTVCT_EL0, the count of the generic timer as the
+ * guest sees it. The guest executes that itself, at EL1 and, as Windows lets it
+ * (CNTKCTL_EL1.EL0VCTEN), at EL0, and EL2 has no part in it. The count always runs, whether or
+ * not the guest has enabled the cycle counter, and writing to the cycle counter does not
+ * change it.
+ *
+ * Every other access becomes an HVC whose immediate says which register, which direction and
+ * which general-purpose register:
  *
  *   bit 15       1, which no PSCI call has (those are hvc #0)
  *   bits 14:6    the register: op1 == 3, CRn == 14, CRm, op2
@@ -21,15 +31,15 @@
  * The original instruction can be had back from the immediate. The guest executes the HVC, EL2
  * answers here, and the guest goes on behind it with its own ELR_EL1, SPSR_EL1 and ESR_EL1
  * untouched, as after a trapped access. HVC is undefined at EL0 (Arm DDI 0487 M.d, rule
- * RZVTPR), so this serves code that runs at EL1 only.
+ * RZVTPR), so these stay what they are on this core when code at EL0 executes them: undefined.
  *
  * When a page is scanned is decided in hv_xtrack.c. This file is the part that does not depend
  * on page tables: which words, what they become and what the answers are.
  *
- * The answers: PMCCNTR_EL0 is the guest's view of the generic timer count and always runs,
- * whether or not the guest has enabled it. The control registers keep what is written to them,
- * as far as a PMU with a cycle counter and no event counters (PMCR_EL0.N = 0) has the bits.
- * Event counters read as zero and ignore writes. Nothing overflows, nothing interrupts.
+ * The answers: the control registers keep what is written to them, as far as a PMU with a
+ * cycle counter and no event counters (PMCR_EL0.N = 0) has the bits. Writes of PMCCNTR_EL0
+ * are taken and dropped. Event counters read as zero and ignore writes. Nothing overflows,
+ * nothing interrupts.
  *
  * Everything here runs with the hypervisor lock held.
  */
@@ -45,6 +55,10 @@
 
 #define HVC_OPCODE 0xd4000002 // hvc #0
 #define HVC_MASK   0xffe0001f
+
+#define MRS_RT_MASK  0xffffffe0
+#define MRS_PMCCNTR  0xd53b9d00 // mrs x0, PMCCNTR_EL0
+#define MRS_CNTVCT   0xd53be040 // mrs x0, CNTVCT_EL0
 
 #define REG_OP1_3  BIT(8)
 #define REG_CRN_14 BIT(7)
@@ -69,10 +83,7 @@
 /* The cycle counter is counter 31 in every per-counter register; there are no others */
 #define PMU_C BIT(31)
 
-#define PMCR_E   BIT(0)
-#define PMCR_C   BIT(2) // write-only: reset the cycle counter
-#define PMCR_LC  BIT(6)
-/* E, D, X, DP, LC, LP. P and C read as zero; N, IDCODE and IMP are zero */
+/* E, D, X, DP, LC, LP. P and C, the resets, read as zero; N, IDCODE and IMP are zero */
 #define PMCR_KEPT (BIT(0) | BIT(3) | BIT(4) | BIT(5) | BIT(6) | BIT(7))
 
 #define PMUSERENR_KEPT  GENMASK(3, 0)
@@ -80,7 +91,6 @@
 #define PMCCFILTR_KEPT  GENMASK(31, 24)
 
 static struct pmu_cpu {
-    u64 base; // PMCCNTR_EL0 = guest count - base
     u64 pmcr;
     u64 cnten;
     u64 inten;
@@ -93,8 +103,8 @@ static struct pmu_cpu {
 static struct {
     u64 pages;        // pages scanned
     u64 patched;      // words replaced
-    u64 ccntr_reads;  // answers given, by kind
-    u64 other_reads;
+    u64 ccntr;        // ...of which were reads of the cycle counter
+    u64 reads;        // answers given, by kind
     u64 writes;
     u64 unknown;      // accesses to registers of the group that have no case below
     u16 last_unknown;
@@ -103,7 +113,6 @@ static struct {
 void hv_pmu_init(void)
 {
     for (int i = 0; i < MAX_CPUS; i++) {
-        pmu_cpu[i].base = 0;
         pmu_cpu[i].pmcr = 0;
         pmu_cpu[i].cnten = 0;
         pmu_cpu[i].inten = 0;
@@ -114,8 +123,8 @@ void hv_pmu_init(void)
     }
     pmu_stats.pages = 0;
     pmu_stats.patched = 0;
-    pmu_stats.ccntr_reads = 0;
-    pmu_stats.other_reads = 0;
+    pmu_stats.ccntr = 0;
+    pmu_stats.reads = 0;
     pmu_stats.writes = 0;
     pmu_stats.unknown = 0;
     pmu_stats.last_unknown = 0;
@@ -148,9 +157,17 @@ bool hv_pmu_is_access(u32 insn)
     return false;
 }
 
-/* The HVC that stands for an access; insn must be one */
+static bool hv_pmu_is_ccntr_read(u32 insn)
+{
+    return (insn & MRS_RT_MASK) == MRS_PMCCNTR;
+}
+
+/* What an access is replaced by; insn must be one */
 u32 hv_pmu_patch_word(u32 insn)
 {
+    if (hv_pmu_is_ccntr_read(insn))
+        return MRS_CNTVCT | (insn & 31);
+
     u32 op1 = (insn >> 16) & 7;
     u32 crn = (insn >> 12) & 15;
     u32 crm = (insn >> 8) & 15;
@@ -178,14 +195,15 @@ u32 hv_pmu_unpatch_word(u32 insn)
                ((reg & 0x7f) << 5) | (imm & 31);
 
     /* An immediate that no access produces: bit 15 set by something else */
-    if (!hv_pmu_is_access(orig))
+    if (!hv_pmu_is_access(orig) || hv_pmu_is_ccntr_read(orig))
         return 0;
     return orig;
 }
 
 /*
  * Replace the accesses in count words. Returns how many there were. Words that are already
- * HVCs, ours or the guest's own, are left alone, so scanning twice does no harm.
+ * what an access becomes, put there by an earlier scan or the guest's own, are left alone, so
+ * scanning twice does no harm.
  */
 u32 hv_pmu_patch_range(u32 *words, u32 count)
 {
@@ -197,6 +215,8 @@ u32 hv_pmu_patch_range(u32 *words, u32 count)
             continue;
         if (!hv_pmu_is_access(words[i]))
             continue;
+        if (hv_pmu_is_ccntr_read(words[i]))
+            pmu_stats.ccntr++;
         words[i] = hv_pmu_patch_word(words[i]);
         n++;
     }
@@ -206,22 +226,9 @@ u32 hv_pmu_patch_range(u32 *words, u32 count)
     return n;
 }
 
-/*
- * What the guest sees as the count of the generic timer: the physical count less the offset
- * the hypervisor keeps in CNTVOFF_EL2, which is where it takes out the time the guest was
- * stopped for the host (hv_exc.c).
- */
-static u64 hv_pmu_now(void)
-{
-    return mrs(CNTPCT_EL0) - mrs(CNTVOFF_EL2);
-}
-
 static u64 hv_pmu_read(struct pmu_cpu *p, u32 reg)
 {
     switch (reg) {
-        case R_PMCCNTR:
-            pmu_stats.ccntr_reads++;
-            return hv_pmu_now() - p->base;
         case R_PMCR:
             return p->pmcr;
         case R_PMCNTENSET:
@@ -254,12 +261,10 @@ static void hv_pmu_write(struct pmu_cpu *p, u32 reg, u64 val)
 {
     switch (reg) {
         case R_PMCCNTR:
-            p->base = hv_pmu_now() - val;
+            /* The guest reads CNTVCT_EL0 in its place, which nothing sets */
             return;
         case R_PMCR:
             p->pmcr = val & PMCR_KEPT;
-            if (val & PMCR_C)
-                p->base = hv_pmu_now();
             return;
         case R_PMCNTENSET:
             p->cnten |= val & PMU_C;
@@ -313,8 +318,7 @@ bool hv_pmu_hvc(struct exc_info *ctx, u16 imm)
 
     if (imm & BIT(5)) {
         u64 val = hv_pmu_read(p, reg);
-        if (reg != R_PMCCNTR)
-            pmu_stats.other_reads++;
+        pmu_stats.reads++;
         /* Rt == 31 is the zero register */
         if (rt != 31)
             ctx->regs[rt] = val;
@@ -328,9 +332,9 @@ bool hv_pmu_hvc(struct exc_info *ctx, u16 imm)
 
 void hv_pmu_report(void)
 {
-    printf("HV: PMU: %ld pages scanned, %ld instructions replaced; %ld reads of PMCCNTR_EL0, "
-           "%ld other reads, %ld writes",
-           pmu_stats.pages, pmu_stats.patched, pmu_stats.ccntr_reads, pmu_stats.other_reads,
+    printf("HV: PMU: %ld pages scanned, %ld instructions replaced (%ld of them reads of "
+           "PMCCNTR_EL0, now reads of CNTVCT_EL0); %ld reads and %ld writes answered",
+           pmu_stats.pages, pmu_stats.patched, pmu_stats.ccntr, pmu_stats.reads,
            pmu_stats.writes);
     if (pmu_stats.unknown)
         printf(", %ld of them to registers that are not there (the last one 0x%x)",

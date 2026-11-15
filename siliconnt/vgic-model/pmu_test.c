@@ -3,7 +3,8 @@
 /*
  * Host-side model test for src/hv/hv_pmu.c. The file under test is the real one, compiled
  * against the stand-in headers of this directory; this file plays the guest (the registers of
- * an hvc) and the two counters the answers are made from.
+ * an hvc). hv_pmu.c has no business with any register of the hardware: the stand-ins for mrs
+ * and msr fail the test.
  *
  *   build/pmu-model                 the checks
  *   build/pmu-model <file> ...      also scan each file as it lies on disk, word by word, and
@@ -37,15 +38,8 @@ static int checks, failures;
 
 /* ---- the hardware ---- */
 
-static u64 now;  /* CNTPCT_EL0 */
-static u64 voff; /* CNTVOFF_EL2 */
-
 u64 mock_mrs(int reg)
 {
-    if (reg == CNTPCT_EL0)
-        return now;
-    if (reg == CNTVOFF_EL2)
-        return voff;
     printf("FAIL: hv_pmu.c read register 0x%x\n", reg);
     failures++;
     return 0;
@@ -139,6 +133,15 @@ static const u32 others[] = {
     0xffffffff,
 };
 
+/* A read of the cycle counter, into any register */
+static bool is_ccntr_read(u32 w)
+{
+    return (w & ~31u) == MRS(PMCCNTR_EL0, 0);
+}
+
+/* The hvc that would stand for a read of the cycle counter, if reads of it became hvcs */
+#define HVC_IMM_CCNTR_READ(rt) (0x8000 | (0x168 << 6) | 0x20 | (rt))
+
 static bool in_named_group(u32 w)
 {
     for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); i++)
@@ -189,17 +192,31 @@ static void test_which_words(void)
             continue;
 
         u32 h = hv_pmu_patch_word(w);
+        CHECK(!hv_pmu_is_access(h), "0x%08x", h);
+
+        /* A read of the cycle counter becomes a read of the virtual count, same register */
+        if (is_ccntr_read(w)) {
+            CHECK(h == MRS(CNTVCT_EL0, w & 31), "0x%08x -> 0x%08x is not mrs CNTVCT_EL0", w, h);
+            CHECK(hv_pmu_unpatch_word(h) == 0, "0x%08x -> 0x%08x has a way back", w, h);
+            continue;
+        }
+
         CHECK((h & 0xffe0001f) == 0xd4000002, "0x%08x -> 0x%08x is not an hvc", w, h);
         CHECK(h & (0x8000u << 5), "0x%08x -> 0x%08x: bit 15 of the immediate", w, h);
         CHECK(hv_pmu_unpatch_word(h) == w, "0x%08x -> 0x%08x -> 0x%08x", w, h,
               hv_pmu_unpatch_word(h));
-        CHECK(!hv_pmu_is_access(h), "0x%08x", h);
     }
 
     /* 24 + 8 + 64 register encodings, read and write, 32 general-purpose registers */
     CHECK(accepted == (24 + 8 + 64) * 2 * 32, "%u words taken", accepted);
 
-    /* Every hvc there is: the ones that stand for an access are exactly as many */
+    /* A write of the cycle counter is an hvc like the rest */
+    CHECK((hv_pmu_patch_word(MSR(PMCCNTR_EL0, 5)) & 0xffe0001f) == 0xd4000002, "msr PMCCNTR_EL0");
+
+    /*
+     * Every hvc there is: the ones that stand for an access are as many as the accesses that
+     * become hvcs, which is all but the 32 reads of the cycle counter
+     */
     u32 back = 0;
     for (u32 imm = 0; imm < 0x10000; imm++) {
         u32 h = 0xd4000002 | (imm << 5);
@@ -211,7 +228,10 @@ static void test_which_words(void)
         CHECK(imm & 0x8000, "hvc #0x%x", imm);
         CHECK(hv_pmu_is_access(w) && hv_pmu_patch_word(w) == h, "hvc #0x%x -> 0x%08x", imm, w);
     }
-    CHECK(back == accepted, "%u hvcs stand for an access, %u accesses", back, accepted);
+    CHECK(back == accepted - 32, "%u hvcs stand for an access, %u accesses", back, accepted);
+    for (u32 rt = 0; rt < 32; rt++)
+        CHECK(hv_pmu_unpatch_word(0xd4000002 | (HVC_IMM_CCNTR_READ(rt) << 5)) == 0,
+              "hvc #0x%x stands for a read of the cycle counter", HVC_IMM_CCNTR_READ(rt));
 
     for (unsigned i = 0; i < sizeof(others) / sizeof(others[0]); i++)
         CHECK(hv_pmu_unpatch_word(others[i]) == 0, "0x%08x", others[i]);
@@ -256,7 +276,9 @@ static void test_patch_range(void)
     CHECK(hv_pmu_patch_range(page, PAGE_WORDS) == 5, "first scan");
     for (int i = 0; i < PAGE_WORDS; i++) {
         bool was = i == 0 || i == 100 || i == 101 || i == 2000 || i == PAGE_WORDS - 1;
-        if (was)
+        if (i == 0)
+            CHECK(page[i] == MRS(CNTVCT_EL0, 9), "word 0 is 0x%08x", page[i]);
+        else if (was)
             CHECK(page[i] != orig[i] && hv_pmu_unpatch_word(page[i]) == orig[i], "word %d", i);
         else
             CHECK(page[i] == orig[i], "word %d changed", i);
@@ -308,53 +330,32 @@ static bool exec(int cpu, u32 insn, u64 *x)
 #define RD(cpu, reg) ({ u64 _v = 0; CHECK(exec(cpu, MRS(reg, 11), &_v), "read"); _v; })
 #define WR(cpu, reg, val) ({ u64 _v = (val); CHECK(exec(cpu, MSR(reg, 12), &_v), "write"); })
 
+/*
+ * The cycle counter is not answered here: a read of it is the guest reading CNTVCT_EL0 itself.
+ * What is left for EL2 is that writing it, and resetting it, go through and change nothing.
+ */
 static void test_counter(void)
 {
     hv_pmu_init();
-    now = 1000000;
-    voff = 0;
-
-    u64 a = RD(0, PMCCNTR_EL0);
-    now += 1;
-    u64 b = RD(0, PMCCNTR_EL0);
-    now += 999;
-    u64 c = RD(0, PMCCNTR_EL0);
-    CHECK(b == a + 1 && c == a + 1000, "0x%lx 0x%lx 0x%lx", a, b, c);
-    CHECK(a == 1000000, "runs before anything enabled it, from the timer: 0x%lx", a);
-
-    /* Time the guest was stopped for is taken out of both counters alike */
-    now += 5000;
-    voff += 5000;
-    CHECK(RD(0, PMCCNTR_EL0) == c, "stopped time counted");
 
     /* HalpTimerInitSystem writes 0 */
     WR(0, PMCCNTR_EL0, 0);
-    CHECK(RD(0, PMCCNTR_EL0) == 0, "after writing 0");
-    now += 77;
-    CHECK(RD(0, PMCCNTR_EL0) == 77, "after writing 0, later");
     WR(0, PMCCNTR_EL0, 0xfffffffffffffff0UL);
-    now += 0x20;
-    CHECK(RD(0, PMCCNTR_EL0) == 0x10, "wraps");
-
-    /* Another core has its own */
-    CHECK(RD(6, PMCCNTR_EL0) == now - voff, "core 6 follows core 0");
-
-    /* msr PMCCNTR_EL0, xzr and mrs xzr, PMCCNTR_EL0 */
     u64 v = 0x1234;
-    now += 500;
     CHECK(exec(0, MSR(PMCCNTR_EL0, 31), &v), "write from xzr");
-    CHECK(RD(0, PMCCNTR_EL0) == 0, "xzr is zero");
-    v = 0;
-    CHECK(exec(0, MRS(PMCCNTR_EL0, 31), &v), "read to xzr");
 
-    /* PMCR_EL0.C resets the counter and does not stay set */
-    now += 4242;
+    /* PMCR_EL0.C does not stay set */
     WR(0, PMCR_EL0, 0x45);
-    CHECK(RD(0, PMCCNTR_EL0) == 0, "PMCR_EL0.C");
     CHECK(RD(0, PMCR_EL0) == 0x41, "PMCR_EL0 = 0x%lx", RD(0, PMCR_EL0));
-    now += 3;
-    WR(0, PMCR_EL0, 0x41);
-    CHECK(RD(0, PMCCNTR_EL0) == 3, "PMCR_EL0 without C");
+
+    /* Nothing replaces a read by an hvc, so the hvc that would stand for one is not ours */
+    for (u32 rt = 0; rt < 32; rt++) {
+        fill(0);
+        CHECK(!hv_pmu_hvc(&ctx, HVC_IMM_CCNTR_READ(rt)), "hvc #0x%x answered",
+              HVC_IMM_CCNTR_READ(rt));
+        CHECK(!memcmp(&ctx, &before, sizeof(ctx)), "hvc #0x%x changed the context",
+              HVC_IMM_CCNTR_READ(rt));
+    }
 }
 
 static void test_windows(void)
@@ -363,8 +364,6 @@ static void test_windows(void)
 
     /* winload.efi BlpArchInitialize+0x150 and the same code in bootmgfw.efi, counter off */
     hv_pmu_init();
-    now = 5000;
-    voff = 0;
     v = RD(0, PMCR_EL0);
     CHECK(v == 0, "PMCR_EL0 = 0x%lx at the start", v);
     WR(0, PMCNTENCLR_EL0, 0xffffffff);
@@ -390,10 +389,6 @@ static void test_windows(void)
     CHECK(RD(0, PMCCFILTR_EL0) == 0x8000000, "PMCCFILTR_EL0");
     CHECK(RD(0, PMUSERENR_EL0) == 0, "PMUSERENR_EL0");
     CHECK(RD(0, PMOVSCLR_EL0) == 0 && RD(0, PMINTENSET_EL1) == 0, "overflow, interrupt");
-    /* BlArchGetPerformanceCounter, twice */
-    u64 t0 = RD(0, PMCCNTR_EL0);
-    now += 123456;
-    CHECK(RD(0, PMCCNTR_EL0) - t0 == 123456, "time stamps");
 
     /* ntoskrnl.exe HalpCycleCounterInitialize, on a core where the loader did not run */
     v = RD(3, PMCR_EL0);
