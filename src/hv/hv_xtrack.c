@@ -20,10 +20,16 @@
  *    stage 2 page while the guest thinks in 4 KB pages), flipping would never end: the store
  *    needs the page writable and the instruction that stores needs it executable. Then the
  *    store is carried out here, with the page left as it is, and the page is scanned again.
+ *  - If that store is an instruction the MMIO emulation does not know (pair stores with
+ *    writeback of vector or 32-bit registers, exclusive stores, atomics), the page is opened:
+ *    executable and writable, so that the guest carries the store out itself. The next time
+ *    any core comes to EL2 with the lock, which the 1 kHz tick of the hypervisor sees to,
+ *    open pages are scanned and made read-only again.
  *
  * What gets past this: memory written from outside the guest's stage 2 mappings while it is
  * executable. That is the host of the hypervisor writing to guest memory, and devices doing
- * DMA.
+ * DMA. And an access that is written into an open page and executed before the page is
+ * closed again: within a millisecond, by code that shares its 16 KB page.
  *
  * Everything here runs with the hypervisor lock held. The stage 2 tables are shared by all
  * cores, and a change of permissions is followed by a TLB invalidation on all of them
@@ -55,6 +61,9 @@ static struct {
     u64 writes;      // stores that made a page writable again
     u64 stores;      // stores carried out here
     u64 restores;    // ...after which the page had to be patched again
+    u64 opens;       // pages opened for a store that could not be carried out here
+    u64 open_hits;   // ...in which there was something to replace when they were closed
+    u32 open_insn;   // the last instruction a page was opened for
     u64 ticks;       // time spent scanning, in timer ticks
     u64 longest;
 } xtrack_stats;
@@ -63,6 +72,14 @@ static struct {
     u64 page;
     u32 repeats;
 } xtrack_last[MAX_CPUS];
+
+/* Pages that are open, by IPA */
+#define XTRACK_MAX_OPEN 16
+static u64 xtrack_open[XTRACK_MAX_OPEN];
+static u32 xtrack_nr_open;
+
+/* How many of the instructions that pages are opened for get a line of their own */
+#define XTRACK_LOG_OPEN 16
 
 void hv_xtrack_init(void)
 {
@@ -73,6 +90,10 @@ void hv_xtrack_init(void)
     xtrack_stats.writes = 0;
     xtrack_stats.stores = 0;
     xtrack_stats.restores = 0;
+    xtrack_stats.opens = 0;
+    xtrack_stats.open_hits = 0;
+    xtrack_stats.open_insn = 0;
+    xtrack_nr_open = 0;
     xtrack_stats.ticks = 0;
     xtrack_stats.longest = 0;
     for (int i = 0; i < MAX_CPUS; i++) {
@@ -137,7 +158,7 @@ bool hv_xtrack_iabort(struct exc_info *ctx)
         return false;
     }
 
-    if (state == 1) {
+    if (state != HV_XPAGE_UNSCANNED) {
         /* Another core got there first, or this one faulted on what was left in its TLB */
         if (xtrack_last[ctx->cpu_id].page == page) {
             if (++xtrack_last[ctx->cpu_id].repeats > XTRACK_MAX_REPEATS) {
@@ -188,7 +209,11 @@ int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write)
         return HV_XTRACK_NONE;
 
     u64 page = ipa & ~(XTRACK_PAGE - 1);
-    if (hv_pt_scanned(page, &pa) != 1)
+    int state = hv_pt_scanned(page, &pa);
+    /* An open page takes stores: this one faulted on what was left in the TLB */
+    if (state == HV_XPAGE_OPEN)
+        return HV_XTRACK_RETRY;
+    if (state != HV_XPAGE_SCANNED)
         return HV_XTRACK_NONE;
 
     /* ctx->elr is where the store is: the caller has not moved it yet */
@@ -209,10 +234,49 @@ void hv_xtrack_stored(u64 ipa)
 {
     u64 pa;
 
-    if (!hv_pt_xtrack_on() || hv_pt_scanned(ipa, &pa) != 1)
+    /* An open page is scanned when it is closed */
+    if (!hv_pt_xtrack_on() || hv_pt_scanned(ipa, &pa) != HV_XPAGE_SCANNED)
         return;
     if (hv_xtrack_scan(pa))
         xtrack_stats.restores++;
+}
+
+/*
+ * A store from the page it writes to that EL2 cannot carry out. Open the page: the guest
+ * executes the store again and this time it goes through. Returns false if that cannot be.
+ */
+bool hv_xtrack_open(u64 ipa, u32 insn)
+{
+    u64 page = ipa & ~(XTRACK_PAGE - 1);
+
+    if (xtrack_nr_open == XTRACK_MAX_OPEN)
+        hv_xtrack_close();
+    if (hv_pt_set_scanned(page, HV_XPAGE_OPEN) < 0)
+        return false;
+
+    xtrack_open[xtrack_nr_open++] = page;
+    /* hv_xtrack_dabort() has counted it as a store carried out here */
+    xtrack_stats.stores--;
+    if (xtrack_stats.opens++ < XTRACK_LOG_OPEN)
+        printf("HV: page 0x%lx opened for the store 0x%08x from within it\n", page, insn);
+    xtrack_stats.open_insn = insn;
+    return true;
+}
+
+/* Scan the open pages and make them read-only again. Called on every entry to EL2 that locks */
+void hv_xtrack_close(void)
+{
+    u64 pa;
+
+    while (xtrack_nr_open) {
+        u64 page = xtrack_open[--xtrack_nr_open];
+
+        if (hv_pt_scanned(page, &pa) != HV_XPAGE_OPEN)
+            continue;
+        if (hv_xtrack_scan(pa))
+            xtrack_stats.open_hits++;
+        hv_pt_set_scanned(page, HV_XPAGE_SCANNED);
+    }
 }
 
 void hv_xtrack_report(void)
@@ -230,4 +294,10 @@ void hv_xtrack_report(void)
            "put an instruction back)\n",
            xtrack_stats.scans, xtrack_stats.scans_el0, xtrack_stats.hits, us, longest,
            xtrack_stats.done, xtrack_stats.writes, xtrack_stats.stores, xtrack_stats.restores);
+    printf("HV: execution tracking: %ld times a page was opened for a store EL2 could not "
+           "carry out (%ld had instructions to replace when closed)",
+           xtrack_stats.opens, xtrack_stats.open_hits);
+    if (xtrack_stats.opens)
+        printf(", the last such store 0x%08x", xtrack_stats.open_insn);
+    printf("\n");
 }

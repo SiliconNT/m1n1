@@ -505,6 +505,8 @@ static void hv_exc_entry(void)
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
     spin_lock(&bhl);
     hv_wdt_breadcrumb('X');
+    /* Pages that were left open for the guest are scanned again whenever EL2 is back */
+    hv_xtrack_close();
     exc_entry_time = mrs(CNTPCT_EL0);
     /* disable PMU counters in the hypervisor */
     u64 pmcr0 = mrs(SYS_IMP_APL_PMCR0);

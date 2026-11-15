@@ -128,8 +128,11 @@ void hv_pmu_report(void);
 #define HV_XTRACK_ALL 2 // execution at EL1 and EL0 is tracked
 int hv_pt_xtrack(u64 mode);
 bool hv_pt_xtrack_on(void);
+#define HV_XPAGE_UNSCANNED 0
+#define HV_XPAGE_SCANNED   1
+#define HV_XPAGE_OPEN      2
 int hv_pt_scanned(u64 ipa, u64 *pa);
-int hv_pt_set_scanned(u64 ipa, bool scanned);
+int hv_pt_set_scanned(u64 ipa, int state);
 #define HV_XTRACK_NONE    0
 #define HV_XTRACK_RETRY   1
 #define HV_XTRACK_EMULATE 2
@@ -137,6 +140,8 @@ void hv_xtrack_init(void);
 bool hv_xtrack_iabort(struct exc_info *ctx);
 int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write);
 void hv_xtrack_stored(u64 ipa);
+bool hv_xtrack_open(u64 ipa, u32 insn);
+void hv_xtrack_close(void);
 void hv_xtrack_report(void);
 
 /* AMCC interrupt filtering */

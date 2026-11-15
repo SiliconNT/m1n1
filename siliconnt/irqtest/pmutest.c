@@ -51,6 +51,7 @@ enum {
     PG_STORE,    /* code that stores into its own page */
     PG_PATCH,    /* code that writes an instruction into its own page and runs it */
     PG_EL0,      /* code that runs at EL0 first and at EL1 afterwards */
+    PG_OPEN,     /* code that stores into its own page in a way EL2 does not carry out */
     PG_UNTOUCHED, /* looks like accesses all over and is never executed */
     PG_TIMING,   /* the first of NR_TIMING pages that are each run once */
 };
@@ -91,6 +92,15 @@ static const u32 tpl_store[] = {K(0x10000089), K(0xf9000120), K(I_MRS_X0_PMCCNTR
 static const u32 tpl_patch[] = {K(0x100000e9), K(0xb9000120), K(0xd50b7b29), K(0xd5033b9f),
                                 K(0xd50b7529), K(0xd5033b9f), K(0xd5033fdf), K(I_NOP),  K(I_RET)};
 #define PATCH_SLOT 7
+/*
+ * adr x9, slot; stp w0, w1, [x9], #8; ret; nop; nop; slot: nop; ret
+ * Called with two instructions in w0 and w1, it writes them into the slot and behind it. The
+ * pair store with writeback of 32-bit registers is one that the hypervisor's emulation of
+ * stores does not know.
+ */
+static const u32 tpl_open[] = {K(0x100000a9), K(0x28810520), K(I_RET), K(I_NOP),
+                               K(I_NOP),      K(I_NOP),      K(I_RET)};
+#define OPEN_SLOT 5
 /* For EL0: mov x0, #0x4c30; svc #0. For EL1, four bytes further on: mov x0, #0x1e1; ret */
 static const u32 tpl_el0[] = {K(0xd2898600), K(0xd4000001), K(0xd2803c20), K(I_RET)};
 #define EL0_MARK 0x4c30
@@ -297,6 +307,7 @@ static void emit(u32 *at, const u32 *tpl, int words)
 
 typedef u64 (*fn0)(void);
 typedef u64 (*fn1)(u64);
+typedef u64 (*fn2)(u64, u64);
 
 static u64 call0(u32 *at)
 {
@@ -436,6 +447,28 @@ static void test_patch_same_page(void)
            as_expected(pg + PATCH_SLOT, K(I_MRS_X0_PMCCNTR)));
 }
 
+static void test_open_page(void)
+{
+    u32 *pg = page(PG_OPEN);
+    u32 insn = U(K(I_MRS_X0_PMCCNTR));
+    u64 freq = read_sysreg(cntfrq_el0);
+
+    EMIT(pg, tpl_open);
+    ((fn2)pg)(insn, U(K(I_RET)));
+    sync_code(pg + OPEN_SLOT, 2);
+    result("a pair store with writeback into its own page arrives",
+           pg[OPEN_SLOT + 1] == U(K(I_RET)) &&
+               (pg[OPEN_SLOT] == insn || pg[OPEN_SLOT] == replaced(insn)));
+
+    /* Longer than the hypervisor leaves a page open: 1 ms at most */
+    spin(freq / 200);
+    u64 a = call0(pg + OPEN_SLOT);
+    spin(1000);
+    u64 b = call0(pg + OPEN_SLOT);
+    result("...and the access it wrote works 5 ms later", b > a);
+    result("...and is as expected afterwards", as_expected(pg + OPEN_SLOT, K(I_MRS_X0_PMCCNTR)));
+}
+
 static void test_el0(void)
 {
     u32 *pg = page(PG_EL0);
@@ -511,6 +544,7 @@ void boot_main(void)
     test_fresh_page();
     test_store_same_page();
     test_patch_same_page();
+    test_open_page();
     test_el0();
     test_timing();
     test_untouched();

@@ -42,6 +42,8 @@ extern uint64_t ram_base;
 #define PTE_XN_ALL (0b10L << 53)
 /* One of the bits a descriptor leaves to software: this page has been scanned, see hv_xtrack.c */
 #define PTE_SW_SCANNED BIT(56)
+/* ...and it is open for the moment: scanned, executable and writable all the same */
+#define PTE_SW_OPEN BIT(57)
 
 #define PTE_VALID BIT(0)
 #define PTE_TYPE  BIT(1)
@@ -510,9 +512,10 @@ bool hv_pt_xtrack_on(void)
 }
 
 /*
- * The state of the page of memory at this IPA while execution is tracked: 1 if it has been
- * scanned (executable, read-only), 0 if not (writable, not executable), -1 if there is no
- * memory there. *pa is where the page is.
+ * The state of the page of memory at this IPA while execution is tracked: HV_XPAGE_SCANNED
+ * (executable, read-only), HV_XPAGE_UNSCANNED (writable, not executable), HV_XPAGE_OPEN
+ * (executable and writable, for a short while), or -1 if there is no memory there. *pa is
+ * where the page is.
  */
 int hv_pt_scanned(u64 ipa, u64 *pa)
 {
@@ -526,10 +529,12 @@ int hv_pt_scanned(u64 ipa, u64 *pa)
         return -1;
 
     *pa = pte & PTE_TARGET_MASK;
-    return pte & PTE_SW_SCANNED ? 1 : 0;
+    if (pte & PTE_SW_OPEN)
+        return HV_XPAGE_OPEN;
+    return pte & PTE_SW_SCANNED ? HV_XPAGE_SCANNED : HV_XPAGE_UNSCANNED;
 }
 
-int hv_pt_set_scanned(u64 ipa, bool scanned)
+int hv_pt_set_scanned(u64 ipa, int state)
 {
     u64 pa;
 
@@ -538,7 +543,11 @@ int hv_pt_set_scanned(u64 ipa, bool scanned)
         return -1;
 
     /* hv_map() puts the XN bits on a mapping that does not say PTE_SW_SCANNED */
-    u64 attrs = scanned ? (PTE_ATTRIBUTES_RO | PTE_SW_SCANNED) : PTE_ATTRIBUTES;
+    u64 attrs = PTE_ATTRIBUTES;
+    if (state == HV_XPAGE_SCANNED)
+        attrs = PTE_ATTRIBUTES_RO | PTE_SW_SCANNED;
+    else if (state == HV_XPAGE_OPEN)
+        attrs = PTE_ATTRIBUTES | PTE_SW_SCANNED | PTE_SW_OPEN;
     if (hv_map(ipa, pa | attrs | PTE_VALID, PAGE_SIZE, 1) < 0)
         return -1;
 
@@ -1468,6 +1477,11 @@ bool hv_handle_dabort(struct exc_info *ctx)
         hv_wdt_breadcrumb('W');
 
         if (!emulate_store(ctx, insn, (u64 *)val, &width, &vaddr)) {
+            /* Not one EL2 can carry out: let the guest do it, with its page open for a while */
+            if (xstore && hv_xtrack_open(ipa, insn)) {
+                ctx->elr -= 4;
+                return true;
+            }
             printf("HV: store not emulated: 0x%08x at 0x%lx\n", insn, ipa);
             return false;
         }
