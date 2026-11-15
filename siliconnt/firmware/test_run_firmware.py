@@ -55,7 +55,8 @@ def make_fakes(case):
     rec = types.SimpleNamespace(loaded=None, bootargs_top=None, hv_start=None, stopped=None,
                                 hv_inited=False, memory_map=None, context_printed=False,
                                 entered=None, sigints=[], writes=[], writes_at_entry=None,
-                                readbacks=[], printed=b"", kd={})
+                                readbacks=[], printed=b"", kd={}, xtrack=None,
+                                xtrack_state=None)
     heap_top = case.get("heap_top", M4["heap_top"])
 
     memory_map = FakeNode(**{
@@ -88,6 +89,11 @@ def make_fakes(case):
     class M1N1Proxy:
         def __init__(self, iface, debug=False):
             pass
+        def hv_xtrack(self, mode):
+            rec.xtrack = mode
+            # what was done already, and what was not, when tracking was turned on
+            rec.xtrack_state = (rec.loaded is not None, len(rec.writes), rec.hv_start is None)
+            return case.get("xtrack_ret", 0)
         def hv_start(self, entry, *regs):
             rec.hv_start = (entry, *regs)
             rec.entered = time.monotonic()
@@ -753,6 +759,34 @@ rec, out, code = run({}, "--check-only", *image_args, kd_port="default")
 check("the default port is 51000",
       (code == 0 and "Kernel debugger: 127.0.0.1:51000" in out) or
       (isinstance(code, str) and "127.0.0.1:51000" in code), f"{code!r}")
+
+# 32. execution tracking
+rec, out, code = run({}, "--seconds", "1", *image_args)
+check("execution tracking is on by default, at EL1 only",
+      code == 0 and rec.xtrack == 1 and "Execution tracking: el1" in out, f"{rec.xtrack} {out[-300:]}")
+check("it is turned on after the image is loaded and before the guest is entered",
+      rec.xtrack_state == (True, 0, True) and rec.hv_start is not None, f"{rec.xtrack_state}")
+
+rec, out, code = run({}, "--seconds", "1", "--xtrack", "all", *image_args)
+check("--xtrack all tracks EL1 and EL0", code == 0 and rec.xtrack == 2 and
+      "Execution tracking: all" in out, f"{rec.xtrack}")
+
+rec, out, code = run({}, "--seconds", "1", "--xtrack", "off", *image_args)
+check("--xtrack off leaves it off and says what that means",
+      code == 0 and rec.xtrack is None and rec.hv_start is not None and
+      "Execution tracking: off" in out, f"{rec.xtrack}")
+
+rec, out, code = run({"xtrack_ret": 0xffffffffffffffff}, "--seconds", "1", *image_args)
+check("a hypervisor that refuses stops the run before the guest is entered",
+      code != 0 and rec.xtrack == 1 and rec.hv_start is None, f"{code!r}")
+
+rec, out, code = run({}, "--check-only", *image_args)
+check("check-only does not turn it on", code == 0 and rec.xtrack is None)
+
+rec, out, code = run({}, "--seconds", "1", "--disk", str(disk_path), *image_args)
+check("with a disk, it is turned on after the whole disk is in guest memory",
+      code == 0 and rec.xtrack_state is not None and rec.xtrack_state[1] == rec.writes_at_entry
+      and rec.xtrack_state[1] > 0 and rec.xtrack_state[2], f"{rec.xtrack_state} {rec.writes_at_entry}")
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)
