@@ -35,6 +35,33 @@ M4 = dict(
 MEM_TOP = M4["ba_phys_base"] + M4["ba_mem_size"]
 assert MEM_TOP == 0x103db610000
 
+# For --loader m1n1. Three of the ranges of /arm-io that R21 mapped (SiliconNT
+# docs/lab/2026-11-15-boot-disk-4k-plan/run.txt); the UART lies in the first.
+ARM_IO = [(0x200000000, 0x3a0000000), (0x800000000, 0x2e0000000), (0x1cb0000000, 0x10000000)]
+# ProxyUtils keeps 128 MB for m1n1's heap and 128 MB for its own below the start of guest RAM
+HOST_HEAP_BASE = M4["heap_top"] - (128 << 20)
+M1N1_HEAP_TOP = HOST_HEAP_BASE - (128 << 20)
+RAM_BASE = M4["heap_top"] & ~0xffffffff
+
+class EXC(enum.IntEnum):
+    SYNC = 0
+    IRQ = 1
+    FIQ = 2
+    SERROR = 3
+
+# proxyclient/m1n1/hv/types.py
+class HV_EVENT(enum.IntEnum):
+    HOOK_VM = 1
+    VTIMER = 2
+    USER_INTERRUPT = 3
+    WDT_BARK = 4
+    CPU_SWITCH = 5
+    VIRTIO = 6
+    PANIC = 7
+    GUEST_RESET = 8
+    GUEST_OFF = 9
+    GUEST_HVC = 10
+
 class FakeNode:
     def __init__(self, **props):
         self.__dict__["_properties"] = dict(props)
@@ -56,8 +83,30 @@ def make_fakes(case):
                                 hv_inited=False, memory_map=None, context_printed=False,
                                 entered=None, sigints=[], writes=[], writes_at_entry=None,
                                 readbacks=[], printed=b"", kd={}, xtrack=None,
-                                xtrack_state=None)
+                                xtrack_state=None,
+                                # --loader m1n1
+                                selfboot=None, selfboot_sent=0.0, selfboot_done=False, interrupts=[],
+                                timeout_at_entry="not entered", debugger_at_entry=None,
+                                pt_walks=[], heap_reads=[], context_fault=None, image_base=None)
     heap_top = case.get("heap_top", M4["heap_top"])
+
+    def stage2(addr):
+        """What hv_pt_walk() of src/hv/hv_vm.c returns for the tables selfboot_map() of
+        src/selfboot_run.c builds: the page itself with the valid bit for memory and device
+        registers, a software entry without it for the UART, 0 for what is not mapped."""
+        if addr == case.get("bad_pt"):
+            return 0
+        if addr == case.get("extra_pt"):
+            return addr | 3
+        if addr == case.get("wrong_pt"):
+            return addr + 0x1000 | 1
+        if M4["uart"] <= addr < M4["uart"] + 0x4000:
+            return 1 << 50 | addr & 0xfff
+        if any(base <= addr < base + size for base, size in ARM_IO):
+            return addr | 1
+        if RAM_BASE <= addr < M4["ba_phys_base"] or heap_top <= addr < MEM_TOP:
+            return addr | 3 | 2 << 53
+        return 0
 
     memory_map = FakeNode(**{
         # below guest RAM, as iBoot left them under m1n1 (addresses made up, the names are
@@ -73,6 +122,23 @@ def make_fakes(case):
         setattr(memory_map, name, value)
 
     class UartInterface:
+        def __init__(self):
+            self.handlers = {}
+            # The port to m1n1. While the guest runs, a byte written to it brings the
+            # hypervisor back with HV/USER_INTERRUPT (hv_tick(), src/hv/hv.c).
+            def write(data):
+                rec.interrupts.append((time.monotonic(), bytes(data)))
+                rec.sigints.append(time.monotonic())
+            self.dev = types.SimpleNamespace(timeout=3, write=write)
+        def set_handler(self, reason, code, handler):
+            self.handlers[(reason, code)] = handler
+        def unkhandler(self, data):
+            # what m1n1 prints on its console arrives between the replies
+            sys.stdout.write("".join("TTY> " + line for line in
+                                     bytes(data).decode().splitlines(keepends=True)))
+        def readstruct(self, addr, stype):
+            assert stype == "ExcInfo"
+            return types.SimpleNamespace(elr=rec.image_base + 0x8600)
         def readmem(self, addr, size):
             # what ProxyUtils.compressed_writemem() below has put into guest memory
             for base, written in rec.writes:
@@ -88,7 +154,58 @@ def make_fakes(case):
 
     class M1N1Proxy:
         def __init__(self, iface, debug=False):
-            pass
+            self.iface = iface
+        def heapblock_alloc(self, size):
+            assert size == 0
+            rec.heap_reads.append(rec.selfboot_done)
+            return M1N1_HEAP_TOP + (case.get("heap_growth", 31 << 20) if rec.selfboot_done else 0)
+        def hv_pt_walk(self, addr):
+            rec.pt_walks.append((addr, rec.selfboot_done))
+            return stage2(addr)
+        def exit(self, value):
+            rec.stopped = value
+        def selfboot_run(self, phys_base, image_size, disk_size):
+            """selfboot_run_loaded() of src/selfboot_run.c, as the host sees it: lines on
+            m1n1's console, then nothing until the hypervisor has an event for the host, and
+            the reply once the guest has been left."""
+            rec.selfboot = (phys_base, image_size, disk_size)
+            rec.selfboot_sent = time.monotonic()
+            rec.writes_at_entry = len(rec.writes)
+            rec.timeout_at_entry = self.iface.dev.timeout
+            rec.debugger_at_entry = bool(rec.kd)
+            rec.image_base = align_up(phys_base + (32 << 20) + align(M4["devtree_size"]), 0x200000)
+            if case.get("selfboot_ret"):
+                self.iface.unkhandler(b"selfboot: the firmware image has no arm64 magic\n")
+                return case["selfboot_ret"]
+            self.iface.unkhandler(f"selfboot: guest RAM 0x{phys_base:x} .. 0x{MEM_TOP:x}\n".encode())
+            time.sleep(case.get("setup_time", 0))
+            self.iface.unkhandler(f"selfboot: entering the firmware at 0x{rec.image_base:x}, "
+                                  f"x0 = 0x{rec.image_base + align(image_size):x}\n".encode())
+            rec.entered = time.monotonic()
+            guest_prints(rec, b"Apple Silicon Project Mu Firmware (arm64/arm64e)\r\n"
+                              b"If you can see this")
+            time.sleep(0.5)  # let the serial reader see it
+            case.get("guest", lambda rec: None)(rec)
+            reason = START[case.get("stop_reason", "HV")]
+            if reason == START.HV:
+                code = HV_EVENT[case.get("stop_code", "USER_INTERRUPT")]
+                if code == HV_EVENT.USER_INTERRUPT:
+                    deadline = time.monotonic() + 10
+                    while not rec.interrupts and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    if not rec.interrupts:
+                        raise RuntimeError("nobody stops the guest: the real call would not return")
+                code = int(code)  # UartInterface.handle_boot() passes these as they come
+            else:
+                code = EXC[case.get("stop_code", "SYNC")]
+            self.iface.handlers[(reason, code)](reason, code, 0x10007ff0000)
+            if rec.stopped != "EXIT_GUEST":
+                raise RuntimeError("the event was not answered: the real call would not return")
+            self.iface.unkhandler(b"HV: Exiting hypervisor (main CPU)\n"
+                                  b"HV: debug registers: 3650 reads and 3650 writes of the guest "
+                                  b"answered\n")
+            rec.selfboot_done = True
+            return 0
         def hv_xtrack(self):
             rec.xtrack = True
             # what was done already, and what was not, when tracking was turned on
@@ -103,6 +220,7 @@ def make_fakes(case):
         EXIT_GUEST = "EXIT_GUEST"
 
     class START(enum.IntEnum):
+        EXCEPTION = 1
         EXCEPTION_LOWER = 2
         HV = 3
 
@@ -115,8 +233,13 @@ def make_fakes(case):
         def __init__(self, p, heap_size, m1n1_heap):
             self.base = M4["m1n1_base"]
             self.heap_top = heap_top
+            self.heap_base = heap_top - heap_size
             self.ba = ba
-            self.adt = FakeADT(chosen={"memory-map": memory_map})
+            uart = types.SimpleNamespace(get_reg=lambda i: (M4["uart"], 0x4000))
+            arm_io = types.SimpleNamespace(ranges=[
+                types.SimpleNamespace(parent_addr=base, size=size) for base, size in ARM_IO])
+            self.adt = FakeADT({"chosen": {"memory-map": memory_map}, "/arm-io": arm_io,
+                                "/arm-io/uart0": uart})
             self.regs = {
                 sysreg.HCR_EL2: sysreg.HCR(IMO=1, FMO=1, VM=1, TWI=1).value,
                 sysreg.CNTHCTL_EL2: 4,
@@ -133,11 +256,16 @@ def make_fakes(case):
             # the CRC-32 of what it unpacked with the one in the stream (src/tinf/tinfgzip.c)
             # and returns an error instead of the size if they differ, which trips
             # "assert decompressed_size == len(data)" in proxyclient/m1n1/proxyutils.py.
+            if not rec.writes:
+                case.get("at_upload", lambda rec: None)(rec)
             if len(rec.writes) + 1 == case.get("bad_write"):
                 raise AssertionError
             rec.writes.append((dest, bytes(data)))
         def print_context(self, ctx, is_fault=True):
             rec.context_printed = True
+            rec.context_fault = is_fault
+            # in the middle of what the script does about an event
+            case.get("at_context", lambda rec: None)(rec)
             print(f"  ELR    = 0x{ctx.elr:x}")
 
     class HV:
@@ -191,16 +319,19 @@ def make_fakes(case):
 
     mods = {
         "m1n1.proxy": dict(UartInterface=UartInterface, M1N1Proxy=M1N1Proxy, EXC_RET=EXC_RET,
-                           START=START),
+                           START=START, EXC=EXC, ExcInfo="ExcInfo"),
         "m1n1.proxyutils": dict(ProxyUtils=ProxyUtils, bootstrap_port=lambda iface, p: None),
-        "m1n1.hv": dict(HV=HV),
+        "m1n1.hv": dict(HV=HV, HV_EVENT=HV_EVENT),
         "m1n1.hw": dict(),
         "m1n1.hw.pmu": dict(PMU=PMU),
     }
     for name, contents in mods.items():
         mod = types.ModuleType(name)
         mod.__dict__.update(contents)
-        mod.__all__ = list(contents)
+        # As in proxyclient/m1n1/proxy.py: "from ... import *" brings the functions and the
+        # classes and nothing else. ExcInfo is neither (R23: the script died on that name).
+        mod.__all__ = [name for name, value in contents.items()
+                       if callable(value) or isinstance(value, type)]
         sys.modules[name] = mod
     return rec
 
@@ -832,6 +963,213 @@ check("--wait-debugger without a relay is refused", code != 0 and untouched(rec)
 rec, out, code = run({}, "--seconds", "1", *image_args)
 check("without --wait-debugger the guest is entered with no debugger, as before",
       code == 0 and rec.hv_start is not None and "Waiting for the kernel debugger" not in out)
+
+# ---- --loader m1n1: m1n1 lays out guest memory and enters the firmware itself ----------
+
+image_data = (pathlib.Path(image_args[0]) if image_args else pathlib.Path.home() /
+              "src/siliconnt-firmware/Build/MacBookProM4-AARCH64/DEBUG_CLANGPDB/FV/"
+              "MACBOOKPROM4_EFI.fd").read_bytes()
+M1N1 = ("--loader", "m1n1", "--disk", disk_path)
+# Nothing of the host's own loader: no HV object, no boot arguments or device tree written,
+# no command to turn execution tracking on
+no_hv = lambda rec: (not rec.hv_inited and rec.loaded is None and rec.hv_start is None and
+                     rec.xtrack is None and rec.memory_map is None and rec.bootargs_top is None)
+tty = lambda out: "\n".join(line for line in out.splitlines() if not line.startswith("FW>"))
+
+# 34. the whole run, ended by the timer
+rec, out, code = run({"guest": wait_for_sigint}, *M1N1, "--seconds", "1", *image_args)
+check("m1n1 loader: a full run exits 0", code == 0, f"{code!r} {out[-900:]}")
+check("m1n1 loader: the image goes up whole, to where the layout has it",
+      rec.writes[:1] == [(IMAGE_BASE, image_data)], f"{[(hex(b), len(d)) for b, d in rec.writes[:1]]}")
+check("m1n1 loader: both ends of the image are read back, one 16 KB page each",
+      rec.readbacks[:2] == [(IMAGE_BASE, 0x4000), (IMAGE_BASE + image_len - 0x4000, 0x4000)],
+      f"{rec.readbacks}")
+check("m1n1 loader: the disk goes up whole after it, and both of its ends are read back",
+      len(rec.writes) > 2 and rec.writes[1][0] == DISK_BASE and
+      b"".join(data for base, data in rec.writes[1:]) == disk_data and
+      rec.readbacks[2:] == [(DISK_BASE, 0x1000), (DISK_BASE + DISK_LEN - 0x1000, 0x1000)],
+      f"{rec.readbacks}")
+check("m1n1 loader: m1n1 is told where guest RAM starts and how long the two files are",
+      rec.selfboot == (M4["heap_top"], image_len, DISK_LEN), f"{rec.selfboot}")
+check("m1n1 loader: both files are in place before the command",
+      rec.writes_at_entry == len(rec.writes) and rec.writes_at_entry > 2)
+check("m1n1 loader: nothing of the host's own loader is used", no_hv(rec))
+check("m1n1 loader: the reply is waited for without a timeout", rec.timeout_at_entry is None,
+      f"{rec.timeout_at_entry}")
+check("m1n1 loader: the timer sends the one byte that brings the hypervisor back, about a "
+      "second after the command",
+      len(rec.interrupts) == 1 and rec.interrupts[0][1] == b"!" and
+      0.9 < rec.interrupts[0][0] - rec.selfboot_sent < 2.5, f"{rec.interrupts} {rec.selfboot_sent}")
+check("m1n1 loader: the event is answered with 'leave the guest'", rec.stopped == "EXIT_GUEST")
+check("m1n1 loader: a stop by the timer says so, says where the firmware was and prints the "
+      "context, not as a fault",
+      "Run ended: --seconds 1 ran out (HV/USER_INTERRUPT)" in out and
+      f"Firmware stopped at PC 0x{IMAGE_BASE + 0x8600:x} (firmware image + 0x8600)" in out and
+      rec.context_printed and rec.context_fault is False, out[-1500:])
+check("m1n1 loader: the final dump has the firmware's own exception registers",
+      all(f"{name:18s} = 0x" in out.split("==== firmware stopped ====")[-1]
+          for name in ("ELR_EL12", "ESR_EL12", "FAR_EL12", "SPSR_EL12", "SP_EL1")), out[-1500:])
+check("m1n1 loader: what m1n1 prints is shown, before and after the guest",
+      "TTY> selfboot: entering the firmware at" in out and
+      "TTY> HV: debug registers: 3650 reads and 3650 writes of the guest answered" in out,
+      tty(out)[-1500:])
+check("m1n1 loader: the firmware's output is shown",
+      "FW> Apple Silicon Project Mu Firmware (arm64/arm64e)\n" in out and
+      "FW> If you can see this\n" in out)
+check("m1n1 loader: the ranges of /arm-io are listed before anything is written",
+      "/arm-io: 3 ranges" in out and "  0x1cb0000000 .. 0x1cc0000000" in out and
+      out.find("/arm-io: 3 ranges") < out.find("Loading the firmware image"), tty(out)[:3000])
+check("m1n1 loader: how long m1n1 took to get to the guest is reported",
+      re.search(r"m1n1 said it was entering the firmware \d+\.\d s after the command", out) and
+      re.search(r"the firmware's first output came \d+\.\d s after the command", out),
+      tty(out)[-1500:])
+check("m1n1 loader: m1n1's heap is read right before the command and after the guest was left",
+      rec.heap_reads == [False, True] and
+      f"m1n1's heap: its top went from 0x{M1N1_HEAP_TOP:x} to 0x{M1N1_HEAP_TOP + (31 << 20):x}, "
+      "31.0 MiB; 97.0 MiB are left below its limit" in out, f"{rec.heap_reads} {tty(out)[-1500:]}")
+looked_up = {addr for addr, after in rec.pt_walks}
+check("m1n1 loader: stage 2 is looked up after the guest has been left: both ends of every "
+      "range of /arm-io, the UART, m1n1, the host's heap and both ends of guest RAM",
+      rec.pt_walks and all(after for addr, after in rec.pt_walks) and
+      {a for base, size in ARM_IO for a in (base, base + size - 0x1000)} <= looked_up and
+      {M4["uart"], M4["m1n1_base"], M4["heap_top"] - 0x1000, M4["heap_top"], MEM_TOP - 0x1000,
+       RAM_BASE} <= looked_up and "Stage 2: as expected" in out and "PROBLEM" not in out,
+      f"{sorted(hex(a) for a in looked_up)} {tty(out)[-1500:]}")
+check("m1n1 loader: no address beyond 42 bits is looked up (hv_pt_walk() asserts)",
+      all(addr < 1 << 42 for addr in looked_up))
+check("m1n1 loader: the run ends like one of the host's loader",
+      out.endswith("Hypervisor exited.\n"), out[-300:])
+
+# 35. m1n1 refuses: the guest is not entered
+rec, out, code = run({"selfboot_ret": -1}, *M1N1, "--seconds", "1", *image_args)
+check("m1n1 loader: a refusal by m1n1 is reported and the run fails",
+      code == 1 and "m1n1 did not enter the guest (P_SELFBOOT_RUN returned -1)" in out and
+      "TTY> selfboot: the firmware image has no arm64 magic" in out and
+      "Hypervisor exited." not in out, f"{code!r} {tty(out)[-900:]}")
+check("m1n1 loader: after a refusal nothing is sent, looked up or reported as a run",
+      rec.interrupts == [] and rec.pt_walks == [] and rec.stopped is None and
+      "Run ended" not in out and "Stage 2" not in out)
+try:
+    time.sleep(1.5)
+    stray = False
+except KeyboardInterrupt:
+    stray = True
+check("m1n1 loader: the timer does not go off after a refusal", not stray and rec.interrupts == [])
+
+# 36. something the hypervisor could not deal with by itself: no host would be there
+rec, out, code = run({"stop_reason": "EXCEPTION_LOWER"}, *M1N1, "--seconds", "30", *image_args)
+check("m1n1 loader: a guest exception that reaches the host ends the run and is named for "
+      "what it means without a host",
+      code == 0 and rec.stopped == "EXIT_GUEST" and rec.interrupts == [] and
+      "Run ended: the hypervisor could not deal with this by itself; without a host the guest "
+      "would hang here (EXCEPTION_LOWER/SYNC)" in out, f"{code!r} {tty(out)[-900:]}")
+check("m1n1 loader: its context is printed as a fault",
+      rec.context_printed and rec.context_fault is True)
+
+rec, out, code = run({"stop_code": "HOOK_VM"}, *M1N1, "--seconds", "30", *image_args)
+check("m1n1 loader: so does any other event of the hypervisor that nobody asked for",
+      code == 0 and rec.stopped == "EXIT_GUEST" and
+      "without a host the guest would hang here (HV/HOOK_VM)" in out, tty(out)[-900:])
+
+# 37. the guest stopped for good
+rec, out, code = run({"stop_code": "GUEST_RESET"}, *M1N1, "--seconds", "30", *image_args)
+check("m1n1 loader: a guest that resets itself ends the run, with the reason",
+      code == 0 and rec.stopped == "EXIT_GUEST" and rec.interrupts == [] and
+      "Run ended: the guest called PSCI SYSTEM_RESET (HV/GUEST_RESET)" in out, tty(out)[-900:])
+
+def ctrl_c_late(rec):
+    os.kill(os.getpid(), signal.SIGINT)
+    time.sleep(0.2)
+rec, out, code = run({"stop_code": "GUEST_RESET", "at_context": ctrl_c_late}, *M1N1,
+                     "--seconds", "30", *image_args)
+check("m1n1 loader: Ctrl-C while an event is being dealt with sends nothing: m1n1 is in the "
+      "middle of talking to the script",
+      code == 0 and rec.stopped == "EXIT_GUEST" and rec.interrupts == [] and
+      "(HV/GUEST_RESET)" in out, f"{code!r} {rec.interrupts} {tty(out)[-600:]}")
+
+# 38. m1n1 itself in trouble: nothing more is sent to it
+for reason, stop_code in (("EXCEPTION", "SYNC"), ("HV", "PANIC"), ("HV", "WDT_BARK")):
+    rec, out, code = run({"stop_reason": reason, "stop_code": stop_code}, *M1N1,
+                         "--seconds", "30", *image_args)
+    check(f"m1n1 loader: {reason}/{stop_code} is m1n1's own trouble: reported, not answered, "
+          "the run fails",
+          isinstance(code, str) and "Power the M4 off" in code and rec.stopped is None and
+          rec.pt_walks == [] and rec.interrupts == [] and
+          f"m1n1 itself is in trouble ({reason}/{stop_code})" in out,
+          f"{code!r} {rec.stopped} {rec.pt_walks} {rec.interrupts} {tty(out)[-600:]}")
+
+# 39. Ctrl-C, without a limit
+rec, out, code = run({"guest": ctrl_c}, *M1N1, "--seconds", "0", *image_args)
+check("m1n1 loader: Ctrl-C ends a run without a limit, and is not taken for the timer",
+      code == 0 and rec.stopped == "EXIT_GUEST" and len(rec.interrupts) == 1 and
+      "Run ended: interrupted (Ctrl-C) (HV/USER_INTERRUPT)" in out and
+      "No time limit: Ctrl-C ends the run" in out, tty(out)[-900:])
+
+# 40. what m1n1 cannot be asked for
+rec, out, code = run({}, "--loader", "m1n1", *image_args)
+check("m1n1 loader: without a boot disk it is refused, nothing touched",
+      code != 0 and untouched(rec) and rec.selfboot is None, f"{code!r}")
+rec, out, code = run({}, *M1N1, "--xtrack", "off", *image_args)
+check("m1n1 loader: without execution tracking it is refused, nothing touched",
+      code != 0 and untouched(rec) and rec.selfboot is None, f"{code!r}")
+
+# 41. --check-only writes nothing
+rec, out, code = run({}, *M1N1, "--check-only", *image_args)
+check("m1n1 loader: check-only decides and touches nothing",
+      code == 0 and untouched(rec) and rec.selfboot is None and
+      f"boot disk            0x{DISK_BASE:x}" in out, f"{code!r}")
+
+# 42. an upload that did not arrive
+rec, out, code = run({"bad_write": 1}, *M1N1, *image_args)
+check("m1n1 loader: an image that arrives damaged stops the run before the command",
+      isinstance(code, str) and "did not arrive intact" in code and rec.selfboot is None,
+      f"{code!r}")
+rec, out, code = run({"bad_readback": 2}, *M1N1, *image_args)
+check("m1n1 loader: an image that reads back differently stops the run before the command",
+      isinstance(code, str) and "reads back" in code and rec.selfboot is None and
+      len(rec.writes) == 1, f"{code!r}")
+rec, out, code = run({"bad_write": 3}, *M1N1, *image_args)
+check("m1n1 loader: a piece of the disk that arrives damaged stops the run before the command",
+      isinstance(code, str) and "did not arrive intact" in code and rec.selfboot is None,
+      f"{code!r}")
+
+# 43. stage 2 is not what it should be
+last_io = ARM_IO[1][0] + ARM_IO[1][1] - 0x1000
+rec, out, code = run({"guest": wait_for_sigint, "bad_pt": last_io}, *M1N1, "--seconds", "1",
+                     *image_args)
+check("m1n1 loader: a range of /arm-io that is not mapped to the end is a problem",
+      code == 2 and f"PROBLEM: 0x{last_io:x}" in out and "Stage 2: as expected" not in out,
+      f"{code!r} {tty(out)[-900:]}")
+rec, out, code = run({"guest": wait_for_sigint, "extra_pt": M4["m1n1_base"]}, *M1N1,
+                     "--seconds", "1", *image_args)
+check("m1n1 loader: m1n1 mapped for the guest is a problem",
+      code == 2 and f"PROBLEM: 0x{M4['m1n1_base']:x}" in out, f"{code!r} {tty(out)[-900:]}")
+rec, out, code = run({"guest": wait_for_sigint, "wrong_pt": ARM_IO[2][0]}, *M1N1,
+                     "--seconds", "1", *image_args)
+check("m1n1 loader: a page of /arm-io mapped to another page is a problem",
+      code == 2 and f"PROBLEM: 0x{ARM_IO[2][0]:x} should be mapped and is mapped to another page"
+      in out, f"{code!r} {tty(out)[-900:]}")
+check("m1n1 loader: a run with a stage 2 problem still says that the hypervisor was left",
+      out.endswith("Hypervisor exited.\n"), out[-300:])
+
+# 44. --wait-debugger: the command is not sent before a debugger has connected
+rec, out, code = run({"at_upload": connect_later, "guest": wait_for_sigint}, *M1N1,
+                     "--seconds", "1", "--wait-debugger", "5", *image_args)
+handed = out.find("Handing over to m1n1")
+check("m1n1 loader: --wait-debugger: the command goes out only after a debugger has connected",
+      code == 0 and rec.debugger_at_entry and
+      -1 < out.find("Waiting for the kernel debugger") < out.find("KD> debugger connected") < handed,
+      f"{code!r} {rec.debugger_at_entry} {tty(out)[-900:]}")
+rec, out, code = run({}, *M1N1, "--seconds", "1", "--wait-debugger", "1", *image_args)
+check("m1n1 loader: --wait-debugger: with no debugger the command is not sent",
+      isinstance(code, str) and "debugger" in code and rec.selfboot is None and
+      "Handing over to m1n1" not in out, f"{code!r}")
+
+# 45. the default is the host's loader, as before
+rec, out, code = run({}, "--seconds", "1", "--disk", disk_path, *image_args)
+check("without --loader the host loads, and m1n1 is not asked to",
+      code == 0 and rec.hv_inited and rec.hv_start == (IMAGE_BASE, BOOTARGS) and
+      rec.selfboot is None and rec.pt_walks == [] and rec.heap_reads == [])
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)

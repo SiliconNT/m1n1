@@ -65,6 +65,25 @@ Until the firmware's CpuDxe driver installs exception vectors, VBAR_EL1 is 0 (hv
 An exception the firmware takes itself before that shows up as an instruction abort at
 0x200 that the hypervisor cannot handle; ELR_EL12, ESR_EL12 and FAR_EL12 in the final
 dump then describe the original exception.
+
+--loader says who does all of this. The default, host, is this script with the HV class of
+proxyclient, as described above. With --loader m1n1 the script only uploads the firmware
+image and the boot disk to where the layout above has them and sends one command,
+P_SELFBOOT_RUN. m1n1 then does the rest with the code it runs when it starts without a
+host (selfboot_run_loaded(), src/selfboot_run.c): it works out the same layout from the
+start of guest RAM and the two sizes, checks both files where they lie, writes the boot
+arguments and the device tree, sets up the hypervisor, maps the memory, turns execution
+tracking on and enters the firmware. Three things are not as with the host's loader
+(SiliconNT docs/findings/0044): the guest's debug exceptions go to the guest and not to
+EL2, the few registers the host answers for itself are the devices, and memory is taken
+apart into 4 KB pages before the guest runs.
+
+Without a host nobody answers what the hypervisor cannot deal with by itself, so with
+--loader m1n1 this script does not answer either: the first event that reaches it ends the
+run, and the "Run ended:" line says that the guest would have hung there. The one event
+that is expected is the one the script asks for, by the timer or Ctrl-C. After the guest
+has been left the script reports how far the top of m1n1's heap has moved, and looks up in
+the stage 2 tables whether what m1n1 mapped is what it was to map.
 """
 import sys, os, pathlib, argparse, signal, struct, threading, hashlib, time, socket, select
 
@@ -77,7 +96,13 @@ DEFAULT_IMAGE = (pathlib.Path.home() / "src" / "siliconnt-firmware" / "Build" /
 parser = argparse.ArgumentParser(description="Run the SiliconNT UEFI firmware under the hypervisor")
 parser.add_argument("--seconds", type=int, default=120,
                     help="how long the firmware may run before it is stopped (default 120); "
-                         "0: until Ctrl-C or until the guest stops by itself")
+                         "0: until Ctrl-C or until the guest stops by itself. With --loader "
+                         "m1n1 the time counts from the command to m1n1, which includes what "
+                         "m1n1 does before it enters the guest")
+parser.add_argument("--loader", choices=("host", "m1n1"), default="host",
+                    help="who lays out guest memory, sets up the hypervisor and enters the "
+                         "firmware: this script (default), or m1n1 with the code it runs when "
+                         "it starts without a host; the script then only uploads the two files")
 parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "build" / "m1n1.bin",
                     help="the raw m1n1.bin that is supposed to be running on the target")
 parser.add_argument("--serial", default=os.environ.get("M1N1SECDEVICE", "/dev/m1n1-sec"),
@@ -112,6 +137,10 @@ if args.wait_debugger < 0:
     parser.error("--wait-debugger: not a time")
 if args.wait_debugger and not args.kd_port:
     parser.error("--wait-debugger: with --kd-port 0 there is no relay for a debugger to connect to")
+if args.loader == "m1n1" and not args.disk:
+    parser.error("--loader m1n1: m1n1 does not start the firmware without a boot disk (--disk)")
+if args.loader == "m1n1" and args.xtrack == "off":
+    parser.error("--loader m1n1: m1n1 always turns execution tracking on")
 
 PAGE = 0x4000
 
@@ -191,10 +220,12 @@ if args.image_only:
 # ---- the target ----------------------------------------------------------------------
 
 from m1n1.proxy import *
+# Not a function or a class, so not among what the line above brings
+from m1n1.proxy import ExcInfo
 from m1n1.proxyutils import *
 from m1n1.utils import *
 from m1n1.sysreg import *
-from m1n1.hv import HV
+from m1n1.hv import HV, HV_EVENT
 from m1n1.hw.pmu import PMU
 
 # Where the version string sits in the image, and what it says in this build. The raw image
@@ -442,6 +473,8 @@ class SerialReader:
         self.log = open(log_path, "wb") if log_path else None
         self.pending = b""
         self.stopping = False
+        # When the first byte arrived, by time.monotonic()
+        self.first_byte = None
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def emit(self, line):
@@ -462,6 +495,8 @@ class SerialReader:
             data = self.dev.read(self.dev.in_waiting or 1)
             if not data:
                 continue
+            if self.first_byte is None:
+                self.first_byte = time.monotonic()
             if self.log:
                 self.log.write(data)
                 self.log.flush()
@@ -503,12 +538,7 @@ if args.check_only:
     reader.stop()
     sys.exit(0)
 
-# ---- the hypervisor ------------------------------------------------------------------
-
-hv = HV(iface, p, u)
-# Boot CPU only: the secondary CPUs are neither started nor shown to the guest
-hv.smp = False
-hv.init()
+# ---- what both loaders use -----------------------------------------------------------
 
 def dump_state(title):
     print(f"==== {title} ====")
@@ -523,23 +553,6 @@ def dump_state(title):
     for i in range((u.mrs(ICH_VTR_EL2) & 0x1f) + 1):
         print(f"{f'ICH_LR{i}_EL2':18s} = 0x{u.mrs(globals()[f'ICH_LR{i}_EL2']):x}")
     sys.stdout.flush()
-
-dump_state("after hypervisor init, before the firmware")
-
-hcr = HCR(u.mrs(HCR_EL2))
-print(f"HCR_EL2: {hcr!s}")
-if not (hcr.IMO and hcr.FMO and hcr.VM and hcr.TWI):
-    sys.exit("HCR_EL2 is not IMO=1 FMO=1 VM=1 TWI=1: this m1n1 was not built from this tree")
-# The core waits out a WFI of the guest in WFE; the event stream is what ends a WFE for sure
-if not u.mrs(CNTHCTL_EL2) & 4:
-    sys.exit("CNTHCTL_EL2.EVNTEN is 0: this m1n1 was not built from this tree")
-if not u.mrs(ICH_HCR_EL2) & 1:
-    sys.exit("ICH_HCR_EL2.En is 0: this m1n1 was not built from this tree")
-if u.mrs(ICH_MISR_EL2):
-    sys.exit("ICH_MISR_EL2 is not 0 before the guest has run")
-
-uart_base = hv.adt["/arm-io/uart0"].get_reg(0)[0]
-print(f"Virtual UART at 0x{uart_base:x}")
 
 def load_disk(disk, base):
     """The boot disk goes up the way the image does, compressed, but in pieces. Each piece
@@ -571,6 +584,255 @@ def load_disk(disk, base):
     print(f"Boot disk: 0x{len(disk):x} bytes in {elapsed:.1f} s, "
           f"{len(disk) / (1 << 20) / elapsed:.1f} MB/s; every piece passed m1n1's CRC-32 "
           "check, the first and the last page read back the same")
+
+# The events with which the hypervisor says that it has stopped the guest for good
+# (src/hv/hv_psci.c), by their names in HV_EVENT (proxyclient/m1n1/hv/types.py)
+GUEST_STOPS = {
+    "GUEST_OFF": "the guest called PSCI SYSTEM_OFF",
+    "GUEST_RESET": "the guest called PSCI SYSTEM_RESET",
+    "GUEST_HVC": "the guest made a call that the hypervisor cannot carry out and that must "
+                 "not return: PSCI CPU_ON or CPU_OFF, or an hvc other than #0 (m1n1 has "
+                 "printed which)",
+}
+timed_out = threading.Event()
+
+# --seconds has run out. What SIGINT does is the loader's business.
+def time_out():
+    timed_out.set()
+    os.kill(os.getpid(), signal.SIGINT)
+
+def wait_for_debugger():
+    # The Windows kernel looks for the debugger once, early, and goes on without it: one that
+    # connects later sees nothing of a bug check (R17).
+    if not args.wait_debugger:
+        return
+    print(f"Waiting for the kernel debugger on {reader.relay.where}, up to "
+          f"{args.wait_debugger} s", flush=True)
+    if not reader.relay.connected.wait(args.wait_debugger):
+        sys.exit(f"Not going on: no kernel debugger connected within {args.wait_debugger} s. "
+                 "The guest has not run.")
+
+# ---- --loader m1n1 -------------------------------------------------------------------
+
+# A stage 2 entry as hv_pt_walk() returns it (src/hv/hv_vm.c): PTE_VALID, and
+# PTE_TARGET_MASK, the page of the machine it maps
+PTE_VALID = 1
+PTE_TARGET = (1 << 50) - (1 << 12)
+STAGE2_PAGE = 0x1000
+# hv_pt_walk() asserts that the address is one the tables cover; the M4's cover 42 bits
+# ("HV: Initializing for 42-bit PA range")
+STAGE2_BITS = 42
+# The last line of selfboot_enter() before the guest runs
+ENTERING = b"selfboot: entering the firmware"
+
+def load_image(image, base):
+    """The firmware image, as it is. m1n1 flushes the caches for it (selfboot_enter())."""
+    print(f"Loading the firmware image (0x{len(image):x} bytes) at 0x{base:x}...", flush=True)
+    try:
+        u.compressed_writemem(base, image, True)
+    except AssertionError:
+        sys.exit("Firmware image: it did not arrive intact. The guest was not entered.")
+    for off in sorted({0, len(image) - PAGE}):
+        if iface.readmem(base + off, PAGE) != image[off:off + PAGE]:
+            sys.exit(f"Firmware image: the page at offset 0x{off:x} reads back as something "
+                     "else. The guest was not entered.")
+    print("Firmware image: it passed m1n1's CRC-32 check, the first and the last page read "
+          "back the same")
+
+def check_stage2(io_ranges):
+    """What m1n1 mapped for the guest (selfboot_map(), src/selfboot_run.c), looked up in the
+    stage 2 tables, which are still there once the guest has been left. Each page has to be
+    mapped to itself or not at all: both ends of every range of /arm-io, of guest RAM and
+    of the memory below iBoot's are; m1n1 and the heap of this script are not; the UART is
+    a hook of the hypervisor. Returns how many are not as they should be."""
+    uart = u.adt["/arm-io/uart0"].get_reg(0)[0] & ~(STAGE2_PAGE - 1)
+    ram_base = layout.phys_base & ~0xffffffff
+    pages = {}
+    for base, size in io_ranges:
+        for addr in (base, base + size - STAGE2_PAGE):
+            pages[addr] = "mapped"
+    pages[layout.phys_base] = pages[layout.mem_top - STAGE2_PAGE] = "mapped"
+    if ram_base < u.ba.phys_base:
+        pages[ram_base] = pages[u.ba.phys_base - STAGE2_PAGE] = "mapped"
+    pages[u.base] = pages[layout.phys_base - STAGE2_PAGE] = "not mapped"
+    pages[uart] = "hook"
+
+    problems = 0
+    for addr, want in sorted(pages.items()):
+        if addr >> STAGE2_BITS:
+            print(f"PROBLEM: 0x{addr:x} is beyond {STAGE2_BITS} bits, not looked up")
+            problems += 1
+            continue
+        pte = p.hv_pt_walk(addr)
+        if pte == 0:
+            got = "not mapped"
+        elif not pte & PTE_VALID:
+            got = "hook"
+        elif (pte & PTE_TARGET) == addr:
+            got = "mapped"
+        else:
+            got = "mapped to another page"
+        if got != want:
+            print(f"PROBLEM: 0x{addr:x} should be {want} and is {got} (entry 0x{pte:x})")
+            problems += 1
+    if problems:
+        print(f"Stage 2: {problems} of {len(pages)} pages are not as they should be")
+    else:
+        print(f"Stage 2: as expected, {len(pages)} pages looked up: both ends of the "
+              f"{len(io_ranges)} ranges of /arm-io and of the memory mapped, m1n1 and this "
+              "script's heap not mapped, the UART a hook")
+    return problems
+
+def m1n1_loads():
+    """Uploads the two files, hands over to m1n1 and waits until the guest has been left.
+    Returns the exit code of the script: 1 if m1n1 did not enter the guest, 2 if stage 2 is
+    not what it should be."""
+    class run:
+        stopping = False   # an event has arrived: the run is ending
+        over = False       # the command has returned
+        entering = None    # when m1n1 said that it enters the guest
+        console = b""
+
+    io_ranges = [(r.parent_addr, r.size) for r in u.adt["/arm-io"].ranges]
+    print(f"/arm-io: {len(io_ranges)} ranges for m1n1 to map")
+    for base, size in io_ranges:
+        print(f"  0x{base:x} .. 0x{base + size:x}")
+
+    load_image(image, layout.image_base)
+    load_disk(disk, layout.disk_base)
+
+    def guest_event(reason, code, info):
+        run.stopping = True
+        name = HV_EVENT(code).name if reason == START.HV else code.name
+        event = f"{reason.name}/{name}"
+        # An exception of m1n1 itself, or the hypervisor giving up. What they expect for an
+        # answer is not "leave the guest", and nothing more is sent.
+        if reason == START.EXCEPTION or (reason == START.HV and name in ("PANIC", "WDT_BARK")):
+            print(f"Run ended: m1n1 itself is in trouble ({event}); it has printed what it "
+                  "knows above")
+            sys.exit("m1n1 was not answered and waits. Power the M4 off.")
+        ctx = iface.readstruct(info, ExcInfo)
+        interrupted = reason == START.HV and name == "USER_INTERRUPT"
+        if interrupted:
+            why = f"--seconds {args.seconds} ran out" if timed_out.is_set() else "interrupted (Ctrl-C)"
+        elif reason == START.HV and name in GUEST_STOPS:
+            why = GUEST_STOPS[name]
+        else:
+            why = ("the hypervisor could not deal with this by itself; without a host the "
+                   "guest would hang here")
+        print(f"Run ended: {why} ({event})")
+        where = ""
+        if layout.image_base <= ctx.elr < layout.image_base + layout.image_size:
+            where = f" (firmware image + 0x{ctx.elr - layout.image_base:x})"
+        print(f"Firmware stopped at PC 0x{ctx.elr:x}{where}")
+        try:
+            u.print_context(ctx, reason == START.EXCEPTION_LOWER and name in ("SYNC", "SERROR"))
+        except Exception as e:
+            print(f"(context not printed: {e})")
+        dump_state("firmware stopped")
+        p.exit(EXC_RET.EXIT_GUEST)
+
+    for code in EXC:
+        iface.set_handler(START.EXCEPTION_LOWER, code, guest_event)
+        iface.set_handler(START.EXCEPTION, code, guest_event)
+    for code in HV_EVENT:
+        iface.set_handler(START.HV, code, guest_event)
+
+    # What m1n1 prints arrives between the replies and is shown as "TTY> ..."
+    show_console = iface.unkhandler
+    def console(data):
+        seen = run.console + bytes(data)
+        if run.entering is None and ENTERING in seen:
+            run.entering = time.monotonic()
+        # Enough to find the line when it comes in pieces
+        run.console = seen[-len(ENTERING):]
+        show_console(data)
+    iface.unkhandler = console
+
+    # HV.interrupt(): a byte on the port the proxy listens on brings the hypervisor back
+    # with HV/USER_INTERRUPT (hv_tick(), src/hv/hv.c)
+    def interrupt(signum=None, frame=None):
+        if not run.stopping and not run.over:
+            iface.dev.write(b"!")
+
+    wait_for_debugger()
+
+    heap_before = p.heapblock_alloc(0)
+    print(f"Handing over to m1n1 (P_SELFBOOT_RUN): guest RAM from 0x{layout.phys_base:x}, "
+          f"image 0x{len(image):x} bytes, disk 0x{len(disk):x} bytes")
+    if not args.seconds:
+        print("No time limit: Ctrl-C ends the run")
+    sys.stdout.flush()
+    timer = threading.Timer(args.seconds, time_out)
+    timer.daemon = True
+    reply_timeout = iface.dev.timeout
+    iface.dev.timeout = None
+    old_sigint = signal.signal(signal.SIGINT, interrupt)
+    reader.first_byte = None
+    sent = time.monotonic()
+    if args.seconds:
+        timer.start()
+    try:
+        # Returns once the guest has been left, or at once if m1n1 does not enter it
+        ret = p.selfboot_run(layout.phys_base, len(image), len(disk))
+    finally:
+        run.over = True
+        timer.cancel()
+        signal.signal(signal.SIGINT, old_sigint)
+        iface.dev.timeout = reply_timeout
+
+    if ret:
+        print(f"m1n1 did not enter the guest (P_SELFBOOT_RUN returned {ret}): it has said why "
+              "above, in a line that starts with 'TTY> selfboot:'. Nothing has run.")
+        return 1
+
+    # m1n1's console and the firmware's output come over USB when they come: both times
+    # are upper bounds for what m1n1 does before the guest runs.
+    if run.entering is not None:
+        print(f"m1n1 said it was entering the firmware {run.entering - sent:.1f} s after the "
+              "command")
+    if reader.first_byte is not None:
+        print(f"the firmware's first output came {reader.first_byte - sent:.1f} s after the "
+              "command")
+    heap_after = p.heapblock_alloc(0)
+    print(f"m1n1's heap: its top went from 0x{heap_before:x} to 0x{heap_after:x}, "
+          f"{(heap_after - heap_before) / (1 << 20):.1f} MiB; "
+          f"{(u.heap_base - heap_after) / (1 << 20):.1f} MiB are left below its limit")
+    return 2 if check_stage2(io_ranges) else 0
+
+if args.loader == "m1n1":
+    reader.start()
+    try:
+        code = m1n1_loads()
+    finally:
+        reader.stop()
+    if code != 1:
+        print("Hypervisor exited.")
+    sys.exit(code)
+
+# ---- --loader host: the hypervisor ---------------------------------------------------
+
+hv = HV(iface, p, u)
+# Boot CPU only: the secondary CPUs are neither started nor shown to the guest
+hv.smp = False
+hv.init()
+
+dump_state("after hypervisor init, before the firmware")
+
+hcr = HCR(u.mrs(HCR_EL2))
+print(f"HCR_EL2: {hcr!s}")
+if not (hcr.IMO and hcr.FMO and hcr.VM and hcr.TWI):
+    sys.exit("HCR_EL2 is not IMO=1 FMO=1 VM=1 TWI=1: this m1n1 was not built from this tree")
+# The core waits out a WFI of the guest in WFE; the event stream is what ends a WFE for sure
+if not u.mrs(CNTHCTL_EL2) & 4:
+    sys.exit("CNTHCTL_EL2.EVNTEN is 0: this m1n1 was not built from this tree")
+if not u.mrs(ICH_HCR_EL2) & 1:
+    sys.exit("ICH_HCR_EL2.En is 0: this m1n1 was not built from this tree")
+if u.mrs(ICH_MISR_EL2):
+    sys.exit("ICH_MISR_EL2 is not 0 before the guest has run")
+
+uart_base = hv.adt["/arm-io/uart0"].get_reg(0)[0]
+print(f"Virtual UART at 0x{uart_base:x}")
 
 def load_firmware(hv, image, disk, layout):
     """What HV.load_raw() does, without the parts only macOS needs, entering the image at
@@ -618,17 +880,6 @@ else:
 # Does nothing unless M1N1_PMU_RESET=1 (proxyclient/m1n1/hw/pmu.py)
 PMU(u).reset_panic_counter()
 
-# The events with which the hypervisor says that it has stopped the guest for good
-# (src/hv/hv_psci.c), by their names in HV_EVENT (proxyclient/m1n1/hv/types.py)
-GUEST_STOPS = {
-    "GUEST_OFF": "the guest called PSCI SYSTEM_OFF",
-    "GUEST_RESET": "the guest called PSCI SYSTEM_RESET",
-    "GUEST_HVC": "the guest made a call that the hypervisor cannot carry out and that must "
-                 "not return: PSCI CPU_ON or CPU_OFF, or an hvc other than #0 (m1n1 has "
-                 "printed which)",
-}
-timed_out = threading.Event()
-
 # HV.handle_exception() calls run_shell() on a user interrupt and on anything it could not
 # handle, which includes the three events above. Report and leave the guest instead of
 # waiting for input.
@@ -661,10 +912,6 @@ hv.run_shell = stop_guest
 
 # Count from the moment the guest is entered: HV.start() has installed its SIGINT handler by
 # then, and the setup before that takes a while.
-def time_out():
-    timed_out.set()
-    os.kill(os.getpid(), signal.SIGINT)
-
 timer = threading.Timer(args.seconds, time_out)
 timer.daemon = True
 enter_guest = p.hv_start
@@ -681,14 +928,7 @@ p.hv_start = enter_guest_timed
 
 reader.start()
 try:
-    # The Windows kernel looks for the debugger once, early, and goes on without it: one that
-    # connects later sees nothing of a bug check (R17).
-    if args.wait_debugger:
-        print(f"Waiting for the kernel debugger on {reader.relay.where}, up to "
-              f"{args.wait_debugger} s", flush=True)
-        if not reader.relay.connected.wait(args.wait_debugger):
-            sys.exit(f"Not going on: no kernel debugger connected within {args.wait_debugger} s. "
-                     "The guest has not run.")
+    wait_for_debugger()
     hv.start()
 finally:
     # A run that has ended by itself is not to be interrupted afterwards
