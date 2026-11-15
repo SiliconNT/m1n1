@@ -44,7 +44,7 @@ extern char el0_vectors[];
         asm volatile("msr " #r ", %0" : : "r"(_v));                                                \
     } while (0)
 
-#define PAGE  0x4000UL /* a stage 2 page of the hypervisor */
+#define PAGE  0x1000UL /* a stage 2 page of the hypervisor, the size of a page of Windows */
 #define WORDS (PAGE / 4)
 
 /* Pages of the arena, each for one purpose */
@@ -55,7 +55,11 @@ enum {
     PG_EL0,      /* code that runs at EL0 first and at EL1 afterwards */
     PG_EL0_READ, /* code that reads the cycle counter at EL0 */
     PG_OPEN,    /* code that stores into its own page in a way EL2 does not carry out */
-    PG_UNTOUCHED, /* looks like accesses all over and is never executed */
+    /*
+     * Looks like accesses all over and is never executed. It has to stay between two pages
+     * that are: a hypervisor that scans more than the 4 KB that run replaces what is in here.
+     */
+    PG_UNTOUCHED,
     PG_TIMING,   /* the first of NR_TIMING pages that are each run once */
 };
 /* The image is built for the tiny code model: all of it within 1 MB, the arena included */
@@ -569,7 +573,8 @@ static void test_untouched(void)
 
     for (u64 i = 0; i < WORDS; i++)
         ok &= pg[i] == insn + (i & 31);
-    result("a page full of accesses that never ran is as it was written", ok);
+    result("a page full of accesses that never ran, between two that did, is as it was written",
+           ok);
 }
 
 void boot_main(void)
