@@ -7,8 +7,10 @@
  * PMUv3 registers, every one of its accesses has been replaced before it runs, at EL1 and at
  * EL0: a read of the cycle counter by a read of CNTVCT_EL0, anything else by an hvc. On
  * QEMU's virt machine the registers are real and nothing is replaced. The guest passes on
- * both; with ARG_STRICT it also looks at its own code and insists that it was replaced, and
- * that the cycle counter is the count of the generic timer.
+ * both; with ARG_STRICT it insists that the cycle counter is the count of the generic timer,
+ * which it is only if the read of it was replaced. Either way it reads its own code back as
+ * data, from the page the code is in and from others, and insists that it is what it wrote:
+ * what was replaced is the hypervisor's to keep out of sight.
  *
  * The instructions under test must not sit in this image as they are: the image's own code
  * and constants share pages that execute, and those pages are scanned. So the test code is
@@ -55,7 +57,7 @@ enum {
     PG_EL0,      /* code that runs at EL0 first and at EL1 afterwards */
     PG_EL0_READ, /* code that reads the cycle counter at EL0 */
     PG_READ,     /* code with an access, and constants that it and code elsewhere read */
-    PG_OPEN,    /* code that stores into its own page in a way EL2 does not carry out */
+    PG_OPEN,    /* code that stores into its own page with a pair store that has writeback */
     /*
      * Looks like accesses all over and is never executed. It has to stay between two pages
      * that are: a hypervisor that scans more than the 4 KB that run replaces what is in here.
@@ -103,8 +105,8 @@ static const u32 tpl_patch[] = {K(0x100000e9), K(0xb9000120), K(0xd50b7b29), K(0
 /*
  * adr x9, slot; stp w0, w1, [x9], #8; ret; nop; nop; slot: nop; ret
  * Called with two instructions in w0 and w1, it writes them into the slot and behind it. The
- * pair store with writeback of 32-bit registers is one that the hypervisor's emulation of
- * stores does not know.
+ * core says nothing of a pair store with writeback in ESR_EL2: the hypervisor has to take
+ * the instruction apart to carry it out.
  */
 static const u32 tpl_open[] = {K(0x100000a9), K(0x28810520), K(I_RET), K(I_NOP),
                                K(I_NOP),      K(I_NOP),      K(I_RET)};
@@ -142,20 +144,6 @@ static const u32 tpl_read[] = {K(0x58000100), K(I_RET),     K(0x98000100),      
 /* The transmit register of the UART, from its base in the image header (sgitest-head.S) */
 #define UTXH 0x20
 extern u64 hdr_uart_base;
-
-/* What hv_pmu.c makes of an access (the layout of the immediate is in its header comment) */
-static u32 replaced(u32 insn)
-{
-    /* mrs xN, PMCCNTR_EL0 becomes mrs xN, CNTVCT_EL0 */
-    if ((insn & ~31u) == U(K(I_MRS_X0_PMCCNTR)))
-        return 0xd53be040 | (insn & 31);
-
-    u32 op1 = (insn >> 16) & 7, crn = (insn >> 12) & 15;
-    u32 reg = (op1 == 3 ? 0x100 : 0) | (crn == 14 ? 0x80 : 0) | ((insn >> 5) & 0x7f);
-    u32 imm = 0x8000 | (reg << 6) | ((insn >> 21) & 1) << 5 | (insn & 31);
-
-    return 0xd4000002 | (imm << 5);
-}
 
 /* ---- output ---- */
 
@@ -361,14 +349,12 @@ static u64 call1(u32 *at, u64 arg)
 }
 
 /*
- * The instruction at this address is still the access, or, where it must be, what the access
- * is replaced by. masked is K(the access).
+ * The instruction at this address, read as data, is the access that was written there,
+ * whatever the core executes in its place. masked is K(the access).
  */
 static int as_expected(const u32 *at, u32 masked)
 {
-    u32 insn = U(masked);
-
-    return *at == (strict ? replaced(insn) : insn);
+    return *(volatile const u32 *)at == U(masked);
 }
 
 static void spin(u64 ticks)
@@ -436,11 +422,9 @@ static void test_fresh_page(void)
     spin(1000);
     u64 b = call0(pg);
     result("code written into a page that never ran: reads the counter", b > a);
-    result("...and is as expected afterwards", as_expected(pg, K(I_MRS_X0_PMCCNTR)));
-
-    line("     data behind it that looks like the instruction is now 0x");
-    put_hex(pg[2], 8);
-    put(pg[2] == U(K(I_MRS_X0_PMCCNTR)) ? " (as written)\n" : " (replaced)\n");
+    result("...and reads as it was written afterwards", as_expected(pg, K(I_MRS_X0_PMCCNTR)));
+    result("...and so does data behind it that looks like the instruction",
+           as_expected(pg + 2, K(I_MRS_X0_PMCCNTR)));
 
     /* The page is executable now. Write other code into it and run that, over and over */
     int ok = 1, seen = 1;
@@ -509,10 +493,9 @@ static void test_open_page(void)
     ((fn2)pg)(insn, U(K(I_RET)));
     sync_code(pg + OPEN_SLOT, 2);
     result("a pair store with writeback into its own page arrives",
-           pg[OPEN_SLOT + 1] == U(K(I_RET)) &&
-               (pg[OPEN_SLOT] == insn || pg[OPEN_SLOT] == replaced(insn)));
+           pg[OPEN_SLOT + 1] == U(K(I_RET)) && pg[OPEN_SLOT] == insn);
 
-    /* Longer than the hypervisor leaves a page open: 1 ms at most */
+    /* Not at once: several ticks of the hypervisor later */
     spin(freq / 200);
     u64 a = call0(pg + OPEN_SLOT);
     spin(1000);
@@ -570,20 +553,9 @@ static void test_el0_read(void)
 }
 
 /*
- * Under the hypervisor each of these is an hvc, and so an entry to EL2 that takes its lock.
- * A page that the hypervisor has made readable for one instruction is execute-only again at
- * the second such entry (the count of reads, src/hv/hv_xtrack.c).
- */
-static void two_entries(void)
-{
-    read_sysreg(pmcr_el0);
-    read_sysreg(pmcr_el0);
-}
-
-/*
- * Code and constants in one page, read by the code itself and from elsewhere. Without the
- * count of reads the page is readable and this is plain; with it the page is execute-only
- * once it has run, and every read below is the hypervisor's doing.
+ * Code and constants in one page, read by the code itself and from elsewhere. Under the
+ * hypervisor the page is execute-only once it has run, because an access in it was replaced,
+ * and every read below is the hypervisor's doing.
  */
 static void test_read_code(void)
 {
@@ -617,15 +589,16 @@ static void test_read_code(void)
 
     /* A pair: the syndrome does not describe it */
     u64 lo, hi;
-    two_entries();
     asm volatile("ldp %0, %1, [%2]" : "=&r"(lo), "=&r"(hi) : "r"(pg + READ_C64) : "memory");
     result("...and two registers at once", lo == C64 && hi == 0x7f81f00d80000001UL);
-    two_entries();
-    result("the access read as data is as expected",
+    /* ...the access itself and the ret behind it: 8 bytes, half of them replaced */
+    asm volatile("ldp %0, %1, [%2]" : "=&r"(lo), "=&r"(hi) : "r"(pg + READ_ACCESS) : "memory");
+    result("the access read as data, two registers at once, is what was written",
+           lo == (((u64)U(K(I_RET)) << 32) | U(K(I_MRS_X0_PMCCNTR))) && hi == C64);
+    result("...and so it is read as 4 bytes",
            as_expected(pg + READ_ACCESS, K(I_MRS_X0_PMCCNTR)));
 
     /* A store from elsewhere makes the page writable; it is scanned when it next runs */
-    two_entries();
     pg[READ_SPARE] = 0x600dc0de;
     result("a store into it from elsewhere arrives", *(volatile u32 *)(pg + READ_SPARE) == 0x600dc0de);
     result("...and its code reads the constant again", call0(pg + READ_LDR64) == C64);

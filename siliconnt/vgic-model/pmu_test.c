@@ -273,22 +273,39 @@ static void test_patch_range(void)
     page[PAGE_WORDS - 1] = MSR(PMINTENCLR_EL1, 3);
     memcpy(orig, page, sizeof(page));
 
-    CHECK(hv_pmu_patch_range(page, PAGE_WORDS) == 5, "first scan");
+    /* Counting changes nothing; replacing marks every word that it replaces */
+    static u64 map[PAGE_WORDS / 64 + 1];
+
+    memset(map, 0, sizeof(map));
+    CHECK(hv_pmu_count_accesses(page, PAGE_WORDS) == 5 && !memcmp(orig, page, sizeof(page)),
+          "counting the accesses");
+    CHECK(hv_pmu_patch_range(page, PAGE_WORDS, map) == 5, "first scan");
     for (int i = 0; i < PAGE_WORDS; i++) {
         bool was = i == 0 || i == 100 || i == 101 || i == 2000 || i == PAGE_WORDS - 1;
+        bool marked = map[i / 64] & (1UL << (i % 64));
+
+        CHECK(marked == was, "word %d is %smarked", i, marked ? "" : "not ");
         if (i == 0)
             CHECK(page[i] == MRS(CNTVCT_EL0, 9), "word 0 is 0x%08x", page[i]);
         else if (was)
             CHECK(page[i] != orig[i] && hv_pmu_unpatch_word(page[i]) == orig[i], "word %d", i);
         else
             CHECK(page[i] == orig[i], "word %d changed", i);
+        /* What a replaced word was. The guest has a read of CNTVCT_EL0 of its own at 102 */
+        if (was)
+            CHECK(hv_pmu_original_word(page[i]) == orig[i], "word %d was 0x%08x, not 0x%08x", i,
+                  orig[i], hv_pmu_original_word(page[i]));
     }
-    CHECK(hv_pmu_patch_range(page, PAGE_WORDS) == 0, "second scan");
-    CHECK(hv_pmu_patch_range(page, 0) == 0, "no words");
+    CHECK(hv_pmu_original_word(page[1]) == 0 && hv_pmu_original_word(page[2001]) == 0,
+          "a word that is nothing an access becomes has an original");
+    CHECK(hv_pmu_count_accesses(page, PAGE_WORDS) == 0, "accesses left after the scan");
+    memset(map, 0, sizeof(map));
+    CHECK(hv_pmu_patch_range(page, PAGE_WORDS, map) == 0 && !map[0] && !map[1], "second scan");
+    CHECK(hv_pmu_patch_range(page, 0, map) == 0, "no words");
 
     /* Only the words it is given */
     memcpy(page, orig, sizeof(page));
-    CHECK(hv_pmu_patch_range(page + 1, 99) == 0, "words 1..99");
+    CHECK(hv_pmu_patch_range(page + 1, 99, map) == 0, "words 1..99");
     CHECK(page[0] == orig[0] && page[100] == orig[100], "the words outside");
 }
 
@@ -475,7 +492,7 @@ static int scan_file(const char *path)
         return 1;
     }
     fclose(f);
-    printf("%s: %u accesses in %ld words\n", path, hv_pmu_patch_range(buf, size / 4), size / 4);
+    printf("%s: %u accesses in %ld words\n", path, hv_pmu_count_accesses(buf, size / 4), size / 4);
     free(buf);
     return 0;
 }

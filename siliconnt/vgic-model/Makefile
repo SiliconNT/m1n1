@@ -2,12 +2,16 @@
 #
 # Host-side model tests for src/hv/hv_vgic.c and src/hv/hv_wfi.c (test.c) and for
 # src/hv/hv_psci.c (psci_test.c), src/hv/hv_pmu.c (pmu_test.c), the page tables of
-# src/hv/hv_vm.c (pt_test.c) and src/hv/hv_xtrack.c (xtrack_test.c). They compile the real files for the build machine against
+# src/hv/hv_vm.c (pt_test.c), src/hv/hv_xtrack.c (xtrack_test.c) and src/hv/hv_xinsn.c
+# (xinsn_test.c, test_xinsn.py). They compile the real files for the build machine against
 # stand-in headers and play the hardware, the guest and the host around them.
 #
 #   make        build them and run them
 #   make pt     only the page table one
 #   make xtrack only the execution tracking one
+#   make xtrack-broken  ...against hv_xtrack.c with one thing wrong in it at a time: it must
+#               fail on each
+#   make xinsn  only the one for the instruction decoder of execution tracking
 #   make dbg    only the one for the debug registers, src/hv/hv_dbg.c (dbg_test.c)
 #   make psci   only the PSCI one, and test_hv_events.py: that the host has a handler for
 #               every event the hypervisor sends (needs the Python of the proxy client)
@@ -19,9 +23,9 @@ SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -pthread -I. -Ibuild
 ROUNDS ?= 200000
 
-.PHONY: all psci pmu pt xtrack dbg tsan clean
+.PHONY: all psci pmu pt xtrack xtrack-broken xinsn dbg tsan clean
 
-all: build/model psci pmu pt xtrack dbg
+all: build/model psci pmu pt xinsn xtrack xtrack-broken dbg
 	build/model $(ROUNDS)
 
 # The breakpoint and watchpoint registers of the guest, src/hv/hv_dbg.c
@@ -48,26 +52,64 @@ build/hv_vm_pt.inc: $(SRC)/hv/hv_vm.c
 
 build/hv_xpage.h: $(SRC)/hv/hv.h
 	@mkdir -p build
-	grep -E '^#define HV_X(PAGE|TRACK|OPROBE)_' $< > $@
+	grep -E '^#define HV_X(PAGE|TRACK)_' $< > $@
 
-# Execution tracking, src/hv/hv_xtrack.c, and the execute-only probe, src/hv/hv_xoprobe.c, with
-# the real hv_pmu.c and page states of its own
+# Execution tracking, src/hv/hv_xtrack.c, with the real hv_pmu.c and hv_xinsn.c and page
+# states of its own: a random guest, see xtrack_test.c
 xtrack: build/xtrack-model
-	build/xtrack-model
+	build/xtrack-model $(XTRACK_STEPS)
 
 build/hv_xtrack.inc: $(SRC)/hv/hv_xtrack.c
 	@mkdir -p build
 	sed -e '/^#include /d' $< > $@
 
-build/hv_xoprobe.inc: $(SRC)/hv/hv_xoprobe.c
-	@mkdir -p build
-	sed -e '/^#include /d' $< > $@
+XTRACK_DEPS := xtrack_test.c $(wildcard *.h) build/hv_xpage.h build/hv_pmu.c build/hv_xinsn.c \
+	build/hv_xinsn.h build/arm_cpu_regs.h
 
-build/xtrack-model: xtrack_test.c $(wildcard *.h) build/hv_xtrack.inc build/hv_xoprobe.inc build/hv_xpage.h build/hv_pmu.c build/arm_cpu_regs.h
-	$(CC) $(CFLAGS) -o $@ xtrack_test.c build/hv_pmu.c
+build/xtrack-model: $(XTRACK_DEPS) build/hv_xtrack.inc
+	$(CC) $(CFLAGS) -o $@ xtrack_test.c build/hv_pmu.c build/hv_xinsn.c
+
+# hv_xtrack.c with one thing wrong in it at a time. The test must fail on each: that is what
+# shows that it looks. Every change must change something (cmp), or the source has moved on
+include ../xtrack-broken.mk
+
+build/hv_xtrack-broken-%.inc: build/hv_xtrack.inc Makefile ../xtrack-broken.mk
+	sed -e '$(BREAK_$*)' $< > $@
+	! cmp -s $< $@
+
+build/xtrack-broken-%: $(XTRACK_DEPS) build/hv_xtrack-broken-%.inc
+	$(CC) $(CFLAGS) -Wno-error -DXTRACK_INC='"hv_xtrack-broken-$*.inc"' -o $@ xtrack_test.c build/hv_pmu.c build/hv_xinsn.c
+
+xtrack-broken: $(BROKEN:%=build/xtrack-broken-%)
+	@for n in $(BROKEN); do \
+		if timeout 300 build/xtrack-broken-$$n > build/xtrack-broken-$$n.log 2>&1; then \
+			echo "xtrack-broken-$$n: the test passes and must not"; exit 1; \
+		fi; \
+		grep -q -m1 '^FAIL' build/xtrack-broken-$$n.log || \
+			{ echo "xtrack-broken-$$n: ended without a failed check"; exit 1; }; \
+	done
+	@$(foreach n,$(BROKEN),echo "xtrack-broken: $(n) $(BREAK_$(n)_IS): $$(grep -m1 '^FAIL' build/xtrack-broken-$(n).log)";)
+	@echo "xtrack-broken: all $(words $(BROKEN)) failed, as they must"
 
 build/pt-model: pt_test.c $(wildcard *.h) build/hv_vm_pt.inc build/hv_xpage.h build/arm_cpu_regs.h
 	$(CC) $(CFLAGS) -o $@ pt_test.c
+
+# The instruction decoder of execution tracking, src/hv/hv_xinsn.c: where an instruction reads
+# or writes (xinsn_test.c), and every word against the disassembler of binutils (test_xinsn.py)
+xinsn: build/xinsn-model
+	build/xinsn-model
+	python3 test_xinsn.py build/xinsn-model $(XINSN_WORDS)
+
+build/hv_xinsn.c: $(SRC)/hv/hv_xinsn.c
+	@mkdir -p build
+	cp $< $@
+
+build/hv_xinsn.h: $(SRC)/hv/hv_xinsn.h
+	@mkdir -p build
+	cp $< $@
+
+build/xinsn-model: xinsn_test.c $(wildcard *.h) build/hv_xinsn.c build/hv_xinsn.h
+	$(CC) $(CFLAGS) -o $@ xinsn_test.c build/hv_xinsn.c
 
 # make pmu PMU_FILES="a.efi b.exe" also counts the accesses in those files
 pmu: build/pmu-model

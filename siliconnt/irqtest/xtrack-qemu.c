@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 /*
- * Runs a test guest (pmutest.bin) on QEMU's "virt" machine under an EL2 of its own, to check
- * the guest together with the execution tracking of the hypervisor before either goes near
- * the M4: `make qemu-pmu-el2` and `make qemu-pmu-el2-nosyn`.
+ * Runs a test guest (pmutest.bin or xitest.bin) on QEMU's "virt" machine under an EL2 of its
+ * own, to check the guest together with the execution tracking of the hypervisor before
+ * either goes near the M4: `make qemu-pmu-el2`, `make qemu-pmu-el2-nosyn`, `make qemu-xi-el2`,
+ * `make qemu-xi-el2-nosyn`, and `make qemu-xi-broken` with a hv_xtrack.c that has something
+ * wrong in it (XTRACK_INC).
  *
  * src/hv/hv_xtrack.c, src/hv/hv_xinsn.c and src/hv/hv_pmu.c are the real ones: the Makefile
  * drops their #include lines, and this file stands in for the rest of the hypervisor. It has
@@ -84,6 +86,10 @@ extern u8 guest[], guest_end[];
 #define HDR_NR_CPUS   0x18
 #define HDR_ARG       0x78
 #define ARG_STRICT    0x100
+/* What the guest is told: pmutest insists on replaced code; other bits are the Makefile's */
+#ifndef GUEST_ARG
+#define GUEST_ARG ARG_STRICT
+#endif
 
 /* ---- output ---- */
 
@@ -318,7 +324,10 @@ void *memset(void *dst, int c, u64 n)
 #include "hv_xinsn_h.inc"
 #include "hv_pmu.inc"
 #include "hv_xinsn.inc"
-#include "hv_xtrack.inc"
+#ifndef XTRACK_INC
+#define XTRACK_INC "hv_xtrack.inc"
+#endif
+#include XTRACK_INC
 
 /* ---- the hypervisor around them ---- */
 
@@ -440,17 +449,41 @@ static void tick_init(void)
     tick_arm();
 }
 
+static u64 el2_l1[512] __attribute__((aligned(4096)));
+
+/*
+ * The MMU of this EL2, every address mapped to itself: the hypervisor runs with its MMU on
+ * (src/memory.c), and only then may it access memory of the guest at an address that is not
+ * aligned, as it does when it carries out such an access of the guest.
+ */
+static void el2_mmu_on(void)
+{
+    /* Two blocks of 1 GB: devices (attribute 1, never executable), then memory (attribute 0) */
+    el2_l1[0] = BIT(54) | BIT(10) | BIT(6) | (1UL << 2) | 1;
+    el2_l1[1] = RAM_BASE | BIT(10) | (3UL << 8) | BIT(6) | 1;
+
+    msr(mair_el2, 0x00ff);
+    /* 39 bits of address from level 1, write-back walks, inner shareable, 40 bits of PA */
+    msr(tcr_el2, 25 | (1UL << 8) | (1UL << 10) | (3UL << 12) | (2UL << 16) | BIT(23) | BIT(31));
+    msr(ttbr0_el2, (u64)el2_l1);
+    asm volatile("isb\ntlbi alle2\ndsb nsh\nisb");
+    /* M, C and I, and nothing has to be aligned */
+    msr(sctlr_el2, 0x30c50830UL | 0x1005);
+    asm volatile("isb");
+}
+
 u64 shim_main(void)
 {
     if ((u64)guest_end > PAGED_END) {
         shim_puts("SHIM> the guest does not fit the memory that has pages of its own\n");
         shim_stop();
     }
+    el2_mmu_on();
 
     /* The guest writes characters to base + 0x20; the PL011 data register is at + 0 */
     *(u64 *)(guest + HDR_UART_BASE) = PL011_BASE - 0x20;
     *(u64 *)(guest + HDR_NR_CPUS) = 1;
-    *(u64 *)(guest + HDR_ARG) = ARG_STRICT;
+    *(u64 *)(guest + HDR_ARG) = GUEST_ARG;
 
     /* 64 MB of memory, the first NR_L3 * 2 MB of it in pages; the devices below. No memory is
      * executable: that is hv_pt_xtrack() */
@@ -471,6 +504,8 @@ u64 shim_main(void)
     /* An AArch64 guest under stage 2; physical interrupts come to EL2 (IMO) */
     msr(hcr_el2, BIT(31) | BIT(4) | BIT(0));
     msr(cnthctl_el2, 3);
+    /* SIMD and floating point are the guest's, and get_simd_state() reads them here */
+    msr(cptr_el2, 0x33ff);
     msr(cntvoff_el2, 0);
     msr(sctlr_el1, 0x30d00800);
     asm volatile("isb\ntlbi vmalls12e1is\ndsb ish\nisb");

@@ -270,8 +270,10 @@ static void verify(u64 ipa)
 
     switch (w.kind) {
         case K_HW: {
-            unsigned xn = (xtrack && w.state == HV_XPAGE_UNSCANNED) ? 2 : 0;
-            u64 ap = w.state == HV_XPAGE_SCANNED ? 1 : w.state == HV_XPAGE_XONLY ? 0 : 3;
+            /* Data cannot be executed, and a page that nobody has access to neither */
+            bool none = w.state == HV_XPAGE_NONE;
+            unsigned xn = (xtrack && (w.state == HV_XPAGE_UNSCANNED || none)) ? 2 : 0;
+            u64 ap = w.state == HV_XPAGE_SCANNED ? 1 : (w.state == HV_XPAGE_XONLY || none) ? 0 : 3;
             /* MemAttr 0b1111, S2AP, SH 0b11, AF */
             u64 attr = (0xfUL << 2) | (ap << 6) | (3UL << 8) | BIT(10);
 
@@ -541,15 +543,19 @@ static void test_m4(void)
     check(s2_walk(0x1000000000).level == 2 && s2_walk(0x1000000000).xn == 2,
           "device registers are not left as a block that cannot be executed");
 
-    /* A page that is scanned, opened, written to again: that page and no other */
+    /* A page that is scanned, taken away, written to again: that page and no other */
     t_set_scanned(0x10100005123, HV_XPAGE_SCANNED);
-    t_set_scanned(0x10100005000, HV_XPAGE_OPEN);
+    t_set_scanned(0x10100005000, HV_XPAGE_NONE);
+    check(s2_walk(0x10100005000).valid && (s2_walk(0x10100005000).attr >> 6 & 3) == 0 &&
+              s2_walk(0x10100005000).xn == 2,
+          "a page that nobody has access to: S2AP %ld and XN %d in the descriptor",
+          s2_walk(0x10100005000).attr >> 6 & 3, s2_walk(0x10100005000).xn);
     t_set_scanned(0x10100005ffc, HV_XPAGE_UNSCANNED);
     t_set_scanned(0x10100005000, HV_XPAGE_SCANNED);
     t_set_scanned(0x10100006000, HV_XPAGE_SCANNED);
     /* The last page of 2 MB and the first of the next; below m1n1, where there never were blocks */
     t_set_scanned(0x101001ff000, HV_XPAGE_SCANNED);
-    t_set_scanned(0x10100200000, HV_XPAGE_OPEN);
+    t_set_scanned(0x10100200000, HV_XPAGE_NONE);
     t_set_scanned(0x10000004000, HV_XPAGE_SCANNED);
     t_set_scanned(0x10000004000, HV_XPAGE_UNSCANNED);
     /* A page that executes and is neither read nor written, and what it was before and after */

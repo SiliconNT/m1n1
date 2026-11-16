@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# EL1 test guests for src/hv/hv_vgic.c, src/hv/hv_wfi.c, src/hv/hv_psci.c, src/hv/hv_pmu.c with
-# src/hv/hv_xtrack.c, and src/hv/hv_xoprobe.c.
+# EL1 test guests for src/hv/hv_vgic.c, src/hv/hv_wfi.c, src/hv/hv_psci.c, and src/hv/hv_pmu.c
+# with src/hv/hv_xtrack.c and src/hv/hv_xinsn.c.
 #
 #   make               build/irqtest.bin, build/sgitest.bin, build/gictest.bin,
-#                      build/wfitest.bin and build/pscitest.bin, the raw images that
-#                      run_irqtest.py and run_sgitest.py load under the hypervisor
+#                      build/wfitest.bin, build/pscitest.bin, build/pmutest.bin and
+#                      build/xitest.bin, the raw images that run_irqtest.py and
+#                      run_sgitest.py load under the hypervisor
 #   make qemu          run irqtest.bin on QEMU's virt machine (GICv3) to check the guest itself
 #   make qemu-sgi      the same for sgitest.bin, on one CPU
 #   make qemu-sgi-smp  ...and on QEMU_SMP_CPUS CPUs
@@ -17,13 +18,16 @@
 #   make qemu-psci-reset   ...and with SYSTEM_RESET
 #   make qemu-psci-strict  pscitest.bin expecting the hypervisor's answers, which QEMU's
 #                      PSCI does not give: shows that those checks can fail
-#   make qemu-xo       xotest.bin under an EL2 of its own that links the real execute-only
-#                      probe (xotest-qemu.c)
-#   make qemu-xo-leaky ...where an execute-only page can be read: shows that the checks of
-#                      xotest can fail
 #   make qemu-pmu-el2  pmutest.bin under an EL2 of its own that links the real execution
-#                      tracking and PMU code (pmutest-el2-qemu.c)
-#   make qemu-pmu-el2-count  ...with reads of pages with replaced instructions counted
+#                      tracking and PMU code (xtrack-qemu.c)
+#   make qemu-pmu-el2-nosyn  ...where ESR_EL2 never describes an access, so that every read
+#                      and store that EL2 carries out is taken apart from the instruction
+#   make qemu-xi       xitest.bin on QEMU with no EL2: checks the guest itself
+#   make qemu-xi-el2   xitest.bin under that EL2: every load and store that EL2 takes apart
+#                      against the same instruction where EL2 has no part
+#   make qemu-xi-el2-nosyn  ...where ESR_EL2 never describes an access
+#   make qemu-xi-broken     ...against hv_xtrack.c with one thing wrong in it at a time
+#                      (../xtrack-broken.mk): xitest must fail on each of QEMU_BROKEN
 
 ARCH ?= aarch64-linux-gnu-
 QEMU ?= qemu-system-aarch64
@@ -42,10 +46,10 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp \n	qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-xo qemu-xo-leaky qemu-pmu-el2 qemu-pmu-el2-count clean
+.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken clean
 .SECONDARY:
 
-all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xotest.bin
+all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin
 
 build/irqtest.o: irqtest.S
 	@mkdir -p build
@@ -67,14 +71,30 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o build/xotest.o: build/%.o: %.c sgitest.h gic.h
+build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o: build/%.o: %.c sgitest.h gic.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
-build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf build/xotest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
+build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
 	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/$*.o
 
-build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xotest.bin: build/%.bin: build/%.elf
+build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin: build/%.bin: build/%.elf
+	$(OBJCOPY) -O binary $< $@
+
+# xitest: its instructions are assembled (LSE and RCPC among them), and nothing of it that is
+# written to shares a page with what is executed (xitest.ld)
+build/xitest.o: xitest.c sgitest.h gic.h xitest.h
+	@mkdir -p build
+	$(CC) -c $(SGI_CFLAGS) -o $@ $<
+
+build/xitest-insns.o: xitest-insns.S xitest.h
+	@mkdir -p build
+	$(CC) -c -Wall -Werror -march=armv8.3-a -o $@ $<
+
+build/xitest.elf: build/sgitest-head.o build/xitest.o build/xitest-insns.o xitest.ld
+	$(LD) -T xitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/xitest.o build/xitest-insns.o
+
+build/xitest.bin: build/xitest.elf
 	$(OBJCOPY) -O binary $< $@
 
 # build/<image>-qemu-<cpus>.elf
@@ -95,6 +115,13 @@ build/pscitest-qemu-%.o: sgitest-qemu.S sgitest.h build/pscitest.bin
 build/pmutest-qemu-%.o: sgitest-qemu.S sgitest.h build/pmutest.bin
 	$(CC) -c -Wall -Werror -DNR_CPUS=1 -DGUEST_ARG=$* -DIMAGE='"build/pmutest.bin"' -o $@ $<
 
+# build/xitest-qemu-<argument for the image header>.elf, on one CPU
+build/xitest-qemu-%.o: sgitest-qemu.S sgitest.h build/xitest.bin
+	$(CC) -c -Wall -Werror -DNR_CPUS=1 -DGUEST_ARG=$* -DIMAGE='"build/xitest.bin"' -o $@ $<
+
+build/xitest-qemu-%.elf: build/xitest-qemu-%.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
+
 build/pmutest-qemu-%.elf: build/pmutest-qemu-%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
 
@@ -110,30 +137,13 @@ build/gictest-qemu-%.elf: build/gictest-qemu-%.o
 build/wfitest-qemu-%.elf: build/wfitest-qemu-%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
 
-# xotest under an EL2 that is the real probe, src/hv/hv_xoprobe.c without its #include lines,
-# and stand-ins for the rest of the hypervisor (xotest-qemu.c)
+# A guest under an EL2 that is the real src/hv/hv_xtrack.c, src/hv/hv_xinsn.c and
+# src/hv/hv_pmu.c without their #include lines, and stand-ins for the rest of the hypervisor
+# (xtrack-qemu.c)
 build/hv_xpage.h: ../../src/hv/hv.h
 	@mkdir -p build
-	grep -E '^#define HV_X(PAGE|TRACK|OPROBE)_' $< > $@
+	grep -E '^#define HV_X(PAGE|TRACK)_' $< > $@
 
-build/hv_xoprobe.inc: ../../src/hv/hv_xoprobe.c
-	@mkdir -p build
-	sed -e '/^#include /d' $< > $@
-
-build/xotest-qemu-head.o: xotest-qemu-head.S build/xotest.bin
-	$(CC) -c -Wall -Werror -DIMAGE='"build/xotest.bin"' -o $@ $<
-
-build/xotest-qemu.o: xotest-qemu.c build/hv_xpage.h build/hv_xoprobe.inc
-	$(CC) -c $(SGI_CFLAGS) -Ibuild -o $@ $<
-
-build/xotest-qemu-leaky.o: xotest-qemu.c build/hv_xpage.h build/hv_xoprobe.inc
-	$(CC) -c $(SGI_CFLAGS) -Ibuild -DXO_LEAKY -o $@ $<
-
-build/xotest-qemu.elf build/xotest-qemu-leaky.elf: build/%.elf: build/xotest-qemu-head.o build/%.o
-	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
-
-# pmutest under an EL2 that is the real src/hv/hv_xtrack.c and src/hv/hv_pmu.c without their
-# #include lines, and stand-ins for the rest of the hypervisor (pmutest-el2-qemu.c)
 build/hv_xtrack.inc: ../../src/hv/hv_xtrack.c
 	@mkdir -p build
 	sed -e '/^#include /d' $< > $@
@@ -142,16 +152,47 @@ build/hv_pmu.inc: ../../src/hv/hv_pmu.c
 	@mkdir -p build
 	sed -e '/^#include /d' $< > $@
 
-build/pmutest-el2-head.o: xotest-qemu-head.S build/pmutest.bin
-	$(CC) -c -Wall -Werror -DIMAGE='"build/pmutest.bin"' -o $@ $<
+build/hv_xinsn.inc: ../../src/hv/hv_xinsn.c
+	@mkdir -p build
+	sed -e '/^#include /d' $< > $@
 
-build/pmutest-el2-qemu.o: pmutest-el2-qemu.c build/hv_xpage.h build/hv_xtrack.inc build/hv_pmu.inc
+build/hv_xinsn_h.inc: ../../src/hv/hv_xinsn.h
+	@mkdir -p build
+	sed -e '/^#include /d' $< > $@
+
+XTRACK_INCS := build/hv_xpage.h build/hv_xtrack.inc build/hv_pmu.inc build/hv_xinsn.inc build/hv_xinsn_h.inc
+EL2_GUESTS := pmutest xitest
+
+$(EL2_GUESTS:%=build/%-el2-head.o): build/%-el2-head.o: xtrack-qemu-head.S build/%.bin
+	$(CC) -c -Wall -Werror -DIMAGE='"build/$*.bin"' -o $@ $<
+
+build/xtrack-qemu.o: xtrack-qemu.c $(XTRACK_INCS)
 	$(CC) -c $(SGI_CFLAGS) -Ibuild -o $@ $<
 
-build/pmutest-el2-qemu-count.o: pmutest-el2-qemu.c build/hv_xpage.h build/hv_xtrack.inc build/hv_pmu.inc
-	$(CC) -c $(SGI_CFLAGS) -Ibuild -DCOUNT_READS -o $@ $<
+build/xtrack-qemu-nosyn.o: xtrack-qemu.c $(XTRACK_INCS)
+	$(CC) -c $(SGI_CFLAGS) -Ibuild -DNO_SYNDROME -o $@ $<
 
-build/pmutest-el2-qemu.elf build/pmutest-el2-qemu-count.elf: build/%.elf: build/pmutest-el2-head.o build/%.o
+$(EL2_GUESTS:%=build/%-el2-qemu.elf): build/%-el2-qemu.elf: build/%-el2-head.o build/xtrack-qemu.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
+
+$(EL2_GUESTS:%=build/%-el2-qemu-nosyn.elf): build/%-el2-qemu-nosyn.elf: build/%-el2-head.o build/xtrack-qemu-nosyn.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
+
+# The same EL2 with one thing wrong in hv_xtrack.c, and xitest told to end at its first failure.
+# Two of them cannot show on QEMU: an access that is left as it is executes there (4), and
+# there is one core, which cannot catch a page in the middle of a change (6). Those are for
+# the model (../vgic-model, make xtrack-broken).
+include ../xtrack-broken.mk
+QEMU_BROKEN := $(filter-out 4 6,$(BROKEN))
+
+build/hv_xtrack-broken-%.inc: build/hv_xtrack.inc ../xtrack-broken.mk
+	sed -e '$(BREAK_$*)' $< > $@
+	! cmp -s $< $@
+
+build/xtrack-qemu-broken-%.o: xtrack-qemu.c $(XTRACK_INCS) build/hv_xtrack-broken-%.inc
+	$(CC) -c $(SGI_CFLAGS) -Wno-error -Ibuild -DXTRACK_INC='"hv_xtrack-broken-$*.inc"' -DGUEST_ARG=0x300 -o $@ $<
+
+build/xitest-el2-broken-%.elf: build/xitest-el2-head.o build/xtrack-qemu-broken-%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
 
 # The guests spin after they have printed DONE, so stop QEMU after a while
@@ -194,20 +235,39 @@ qemu-pmu: build/pmutest-qemu-0x0.elf
 qemu-pmu-strict: build/pmutest-qemu-0x100.elf
 	-timeout 30 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
-# QEMU enters these at EL2. xotest ends with SYSTEM_OFF, which its EL2 passes on to QEMU
-QEMU_XO_FLAGS := -M virt,gic-version=3,virtualization=on -cpu cortex-a72 -m 64 -nodefaults 	-display none -monitor none -serial stdio
-
-qemu-xo: build/xotest-qemu.elf
-	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
-
-qemu-xo-leaky: build/xotest-qemu-leaky.elf
-	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
+# QEMU enters these at EL2. The guest ends with SYSTEM_OFF, which its EL2 passes on to QEMU
+QEMU_EL2_FLAGS := -M virt,gic-version=3,virtualization=on -cpu cortex-a72 -m 64 -nodefaults -display none -monitor none -serial stdio
+# xitest has the atomic instructions of Armv8.1, which that core has not
+QEMU_XI_FLAGS := -M virt,gic-version=3 -cpu neoverse-n1 -m 64 -nodefaults -display none -monitor none -serial stdio
+QEMU_XI_EL2_FLAGS := -M virt,gic-version=3,virtualization=on -cpu neoverse-n1 -m 64 -nodefaults -display none -monitor none -serial stdio
 
 qemu-pmu-el2: build/pmutest-el2-qemu.elf
-	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
+	-timeout 30 $(QEMU) $(QEMU_EL2_FLAGS) -smp 1 -no-reboot -kernel $<
 
-qemu-pmu-el2-count: build/pmutest-el2-qemu-count.elf
-	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
+qemu-pmu-el2-nosyn: build/pmutest-el2-qemu-nosyn.elf
+	-timeout 30 $(QEMU) $(QEMU_EL2_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-xi: build/xitest-qemu-0x0.elf
+	-timeout 300 $(QEMU) $(QEMU_XI_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-xi-el2: build/xitest-el2-qemu.elf
+	-timeout 900 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-xi-el2-nosyn: build/xitest-el2-qemu-nosyn.elf
+	-timeout 900 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel $<
+
+# One variant: run it, and insist that the guest started and did not end without a failure
+define XI_BROKEN_RUN
+timeout 900 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel build/xitest-el2-broken-$(1).elf > build/xitest-el2-broken-$(1).log 2>&1; \
+grep -q 'xitest: start' build/xitest-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): the guest did not start"; exit 1; }; \
+if grep -q -E 'DONE pass fail = [0-9]+ 0[^0-9]*$$' build/xitest-el2-broken-$(1).log; then echo "qemu-xi-broken: $(1): the test passes and must not"; exit 1; fi; \
+grep -q -E 'FAIL|stops the guest|unexpected exception' build/xitest-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): ended without a failed check"; exit 1; }; \
+echo "qemu-xi-broken: $(1) $(BREAK_$(1)_IS): $$(grep -m1 -E 'FAIL|stops the guest|unexpected exception' build/xitest-el2-broken-$(1).log | tr -d '\r')";
+endef
+
+qemu-xi-broken: $(QEMU_BROKEN:%=build/xitest-el2-broken-%.elf)
+	@$(foreach n,$(QEMU_BROKEN),$(call XI_BROKEN_RUN,$(n)))
+	@echo "qemu-xi-broken: all $(words $(QEMU_BROKEN)) failed, as they must"
 
 clean:
 	rm -rf build

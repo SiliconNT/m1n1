@@ -141,7 +141,7 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 	hv_vuart.o \
 	hv_wdt.o \
 	hv_wfi.o \
-	hv_xoprobe.o \
+	hv_xinsn.o \
 	hv_xtrack.o)
 
 OBJECTS := \

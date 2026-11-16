@@ -84,9 +84,6 @@ def make_fakes(case):
                                 entered=None, sigints=[], writes=[], writes_at_entry=None,
                                 readbacks=[], printed=b"", kd={}, xtrack=None,
                                 xtrack_state=None,
-                                # hv_xtrack_count_reads(): what was said, and what had
-                                # happened by then (tracking on, m1n1 handed the guest)
-                                count_reads=[],
                                 # --loader m1n1
                                 selfboot=None, selfboot_sent=0.0, selfboot_done=False, interrupts=[],
                                 timeout_at_entry="not entered", debugger_at_entry=None,
@@ -216,8 +213,6 @@ def make_fakes(case):
                                   b"answered\n")
             rec.selfboot_done = True
             return 0
-        def hv_xtrack_count_reads(self, on):
-            rec.count_reads.append((bool(on), rec.xtrack is True, rec.selfboot is not None))
         def hv_xtrack(self):
             rec.xtrack = True
             # what was done already, and what was not, when tracking was turned on
@@ -1267,30 +1262,6 @@ with tempfile.TemporaryDirectory() as bc_tmp:
                          *image_args)
     check("--bugcheck, m1n1 loader: when m1n1 itself is in trouble, nothing more is asked of it",
           isinstance(code, str) and rec.guest_reads == [] and RECORDED not in out, f"{code!r}")
-
-# 52. --count-reads: the hypervisor keeps what it was last told, so it is told every time,
-# and before the guest's memory is made unexecutable or m1n1 is handed the guest
-rec, out, code = run({}, "--seconds", "1", *image_args)
-check("without --count-reads the hypervisor is told not to count, before tracking is on",
-      code == 0 and rec.count_reads == [(False, False, False)], f"{code!r} {rec.count_reads}")
-rec, out, code = run({}, "--seconds", "1", "--count-reads", *image_args)
-check("--count-reads: the hypervisor is told to count, before tracking is on, and it is said",
-      code == 0 and rec.count_reads == [(True, False, False)] and rec.xtrack is True and
-      "Reads of pages with replaced instructions: counted" in out, f"{code!r} {rec.count_reads}")
-rec, out, code = run({}, *M1N1, "--seconds", "1", "--count-reads", *image_args)
-check("--count-reads, m1n1 loader: told before m1n1 is handed the guest",
-      rec.selfboot is not None and rec.count_reads == [(True, False, False)] and
-      "Reads of pages with replaced instructions: counted" in out, f"{code!r} {rec.count_reads}")
-rec, out, code = run({}, *M1N1, "--seconds", "1", *image_args)
-check("m1n1 loader without --count-reads: told not to count",
-      rec.selfboot is not None and rec.count_reads == [(False, False, False)],
-      f"{code!r} {rec.count_reads}")
-rec, out, code = run({}, "--count-reads", "--xtrack", "off", *image_args)
-check("--count-reads without execution tracking is refused, nothing touched",
-      code != 0 and untouched(rec) and rec.count_reads == [], f"{code!r}")
-rec, out, code = run({}, "--check-only", "--count-reads", *image_args)
-check("--count-reads: check-only tells the hypervisor nothing",
-      code == 0 and rec.count_reads == [], f"{code!r} {rec.count_reads}")
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)

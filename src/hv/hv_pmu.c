@@ -33,8 +33,9 @@
  * untouched, as after a trapped access. HVC is undefined at EL0 (Arm DDI 0487 M.d, rule
  * RZVTPR), so these stay what they are on this core when code at EL0 executes them: undefined.
  *
- * When a page is scanned is decided in hv_xtrack.c. This file is the part that does not depend
- * on page tables: which words, what they become and what the answers are.
+ * When a page is scanned is decided in hv_xtrack.c, which also keeps the guest from reading
+ * what was replaced. This file is the part that does not depend on page tables: which words,
+ * what they become, what they were, and what the answers are.
  *
  * The answers: the control registers keep what is written to them, as far as a PMU with a
  * cycle counter and no event counters (PMCR_EL0.N = 0) has the bits. Writes of PMCCNTR_EL0
@@ -49,16 +50,16 @@
 #include "utils.h"
 
 /* MRS/MSR (register): 1101 0101 00 L 1 o0 op1 CRn CRm op2 Rt, op0 = 2 + o0 (C5.1.3) */
-#define SYSINSN_MASK 0xffd80000
+#define SYSINSN_MASK  0xffd80000
 #define SYSINSN_OP0_3 0xd5180000
-#define SYSINSN_L    BIT(21)
+#define SYSINSN_L     BIT(21)
 
 #define HVC_OPCODE 0xd4000002 // hvc #0
 #define HVC_MASK   0xffe0001f
 
-#define MRS_RT_MASK  0xffffffe0
-#define MRS_PMCCNTR  0xd53b9d00 // mrs x0, PMCCNTR_EL0
-#define MRS_CNTVCT   0xd53be040 // mrs x0, CNTVCT_EL0
+#define MRS_RT_MASK 0xffffffe0
+#define MRS_PMCCNTR 0xd53b9d00 // mrs x0, PMCCNTR_EL0
+#define MRS_CNTVCT  0xd53be040 // mrs x0, CNTVCT_EL0
 
 #define REG_OP1_3  BIT(8)
 #define REG_CRN_14 BIT(7)
@@ -86,9 +87,9 @@
 /* E, D, X, DP, LC, LP. P and C, the resets, read as zero; N, IDCODE and IMP are zero */
 #define PMCR_KEPT (BIT(0) | BIT(3) | BIT(4) | BIT(5) | BIT(6) | BIT(7))
 
-#define PMUSERENR_KEPT  GENMASK(3, 0)
-#define PMSELR_KEPT     GENMASK(4, 0)
-#define PMCCFILTR_KEPT  GENMASK(31, 24)
+#define PMUSERENR_KEPT GENMASK(3, 0)
+#define PMSELR_KEPT    GENMASK(4, 0)
+#define PMCCFILTR_KEPT GENMASK(31, 24)
 
 static struct pmu_cpu {
     u64 pmcr;
@@ -101,12 +102,12 @@ static struct pmu_cpu {
 } pmu_cpu[MAX_CPUS];
 
 static struct {
-    u64 pages;        // pages scanned
-    u64 patched;      // words replaced
-    u64 ccntr;        // ...of which were reads of the cycle counter
-    u64 reads;        // answers given, by kind
+    u64 pages;   // pages scanned
+    u64 patched; // words replaced
+    u64 ccntr;   // ...of which were reads of the cycle counter
+    u64 reads;   // answers given, by kind
     u64 writes;
-    u64 unknown;      // accesses to registers of the group that have no case below
+    u64 unknown; // accesses to registers of the group that have no case below
     u16 last_unknown;
 } pmu_stats;
 
@@ -172,8 +173,8 @@ u32 hv_pmu_patch_word(u32 insn)
     u32 crn = (insn >> 12) & 15;
     u32 crm = (insn >> 8) & 15;
     u32 op2 = (insn >> 5) & 7;
-    u32 imm = BIT(15) | (REG(op1, crn, crm, op2) << 6) | (insn & SYSINSN_L ? BIT(5) : 0) |
-              (insn & 31);
+    u32 imm =
+        BIT(15) | (REG(op1, crn, crm, op2) << 6) | (insn & SYSINSN_L ? BIT(5) : 0) | (insn & 31);
 
     return HVC_OPCODE | (imm << 5);
 }
@@ -201,11 +202,19 @@ u32 hv_pmu_unpatch_word(u32 insn)
 }
 
 /*
- * Replace the accesses in count words. Returns how many there were. Words that are already
- * what an access becomes, put there by an earlier scan or the guest's own, are left alone, so
- * scanning twice does no harm.
+ * What a word was before hv_pmu_patch_word() made it what it is now, or 0 if it is nothing
+ * that makes. Only for a word that is known to have been replaced: a read of CNTVCT_EL0 does
+ * not say whether the guest wrote it itself.
  */
-u32 hv_pmu_patch_range(u32 *words, u32 count)
+u32 hv_pmu_original_word(u32 insn)
+{
+    if ((insn & MRS_RT_MASK) == MRS_CNTVCT)
+        return MRS_PMCCNTR | (insn & 31);
+    return hv_pmu_unpatch_word(insn);
+}
+
+/* How many of count words are accesses. Nothing is changed */
+u32 hv_pmu_count_accesses(const u32 *words, u32 count)
 {
     u32 n = 0;
 
@@ -213,30 +222,36 @@ u32 hv_pmu_patch_range(u32 *words, u32 count)
         /* All of the group has 0xd51 or 0xd53 on top: one compare rejects nearly every word */
         if ((words[i] & SYSINSN_MASK) != SYSINSN_OP0_3)
             continue;
+        if (hv_pmu_is_access(words[i]))
+            n++;
+    }
+
+    pmu_stats.pages++;
+    return n;
+}
+
+/*
+ * Replace the accesses in count words, and set bit i of map (64 bits to an entry) for each
+ * word i that was one. Returns how many there were. Words that are already what an access
+ * becomes, put there by the guest, are left alone and not marked.
+ */
+u32 hv_pmu_patch_range(u32 *words, u32 count, u64 *map)
+{
+    u32 n = 0;
+
+    for (u32 i = 0; i < count; i++) {
+        if ((words[i] & SYSINSN_MASK) != SYSINSN_OP0_3)
+            continue;
         if (!hv_pmu_is_access(words[i]))
             continue;
         if (hv_pmu_is_ccntr_read(words[i]))
             pmu_stats.ccntr++;
         words[i] = hv_pmu_patch_word(words[i]);
+        map[i / 64] |= BIT(i % 64);
         n++;
     }
 
-    pmu_stats.pages++;
     pmu_stats.patched += n;
-    return n;
-}
-
-/*
- * How many of count words are what an access becomes: a read of CNTVCT_EL0, or one of the
- * HVCs. A read of CNTVCT_EL0 that the guest wrote itself counts too: the word does not say.
- */
-u32 hv_pmu_count_replaced(const u32 *words, u32 count)
-{
-    u32 n = 0;
-
-    for (u32 i = 0; i < count; i++)
-        if ((words[i] & MRS_RT_MASK) == MRS_CNTVCT || hv_pmu_unpatch_word(words[i]))
-            n++;
     return n;
 }
 
@@ -348,8 +363,7 @@ void hv_pmu_report(void)
 {
     printf("HV: PMU: %ld pages scanned, %ld instructions replaced (%ld of them reads of "
            "PMCCNTR_EL0, now reads of CNTVCT_EL0); %ld reads and %ld writes answered",
-           pmu_stats.pages, pmu_stats.patched, pmu_stats.ccntr, pmu_stats.reads,
-           pmu_stats.writes);
+           pmu_stats.pages, pmu_stats.patched, pmu_stats.ccntr, pmu_stats.reads, pmu_stats.writes);
     if (pmu_stats.unknown)
         printf(", %ld of them to registers that are not there (the last one 0x%x)",
                pmu_stats.unknown, pmu_stats.last_unknown);

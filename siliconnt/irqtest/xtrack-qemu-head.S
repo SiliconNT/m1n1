@@ -2,7 +2,7 @@
 
 /*
  * Entry, exception vectors and the guest image of the EL2 that runs a test guest (IMAGE) on
- * QEMU (xtrack-qemu.c): pmutest.bin.
+ * QEMU (xtrack-qemu.c): pmutest.bin or xitest.bin.
  */
 
     .text

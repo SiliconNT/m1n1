@@ -43,9 +43,9 @@ extern uint64_t ram_base;
 #define PTE_XN_ALL (0b10L << 53)
 /* One of the bits a descriptor leaves to software: this page has been scanned, see hv_xtrack.c */
 #define PTE_SW_SCANNED BIT(56)
-/* ...and it is open for the moment: scanned, executable and writable all the same */
-#define PTE_SW_OPEN BIT(57)
-/* ...or it is execute-only: scanned, executable, and neither read nor written (hv_xoprobe.c) */
+/* ...or nobody has access to it for the moment: its content is being changed */
+#define PTE_SW_NONE BIT(57)
+/* ...or it is execute-only: scanned, executable, and neither read nor written */
 #define PTE_SW_XONLY BIT(58)
 
 #define PTE_VALID BIT(0)
@@ -510,10 +510,10 @@ bool hv_pt_xtrack_on(void)
 
 /*
  * The state of the page of memory at this IPA while execution is tracked: HV_XPAGE_SCANNED
- * (executable, read-only), HV_XPAGE_UNSCANNED (writable, not executable), HV_XPAGE_OPEN
- * (executable and writable, for a short while), HV_XPAGE_XONLY (executable, and no data
- * access), or -1 if there is no memory there: device registers are not memory. *pa is where
- * the page is.
+ * (executable, read-only), HV_XPAGE_UNSCANNED (writable, not executable), HV_XPAGE_XONLY
+ * (executable, and no data access), HV_XPAGE_NONE (no access of any kind, for as long as
+ * hv_xtrack.c takes to change what is in it), or -1 if there is no memory there: device
+ * registers are not memory. *pa is where the page is.
  */
 int hv_pt_scanned(u64 ipa, u64 *pa)
 {
@@ -529,8 +529,8 @@ int hv_pt_scanned(u64 ipa, u64 *pa)
     *pa = pte & PTE_TARGET_MASK;
     if (pte & PTE_SW_XONLY)
         return HV_XPAGE_XONLY;
-    if (pte & PTE_SW_OPEN)
-        return HV_XPAGE_OPEN;
+    if (pte & PTE_SW_NONE)
+        return HV_XPAGE_NONE;
     return pte & PTE_SW_SCANNED ? HV_XPAGE_SCANNED : HV_XPAGE_UNSCANNED;
 }
 
@@ -546,8 +546,8 @@ int hv_pt_set_scanned(u64 ipa, int state)
     u64 attrs = PTE_ATTRIBUTES;
     if (state == HV_XPAGE_SCANNED)
         attrs = PTE_ATTRIBUTES_RO | PTE_SW_SCANNED;
-    else if (state == HV_XPAGE_OPEN)
-        attrs = PTE_ATTRIBUTES | PTE_SW_SCANNED | PTE_SW_OPEN;
+    else if (state == HV_XPAGE_NONE)
+        attrs = PTE_ATTRIBUTES_NONE | PTE_SW_NONE;
     else if (state == HV_XPAGE_XONLY)
         attrs = PTE_ATTRIBUTES_NONE | PTE_SW_SCANNED | PTE_SW_XONLY;
     if (hv_map(ipa, pa | attrs | PTE_VALID, PAGE_SIZE, 1) < 0)
@@ -1447,24 +1447,21 @@ bool hv_handle_dabort(struct exc_info *ctx)
     }
 
     /*
-     * A store into a page that was made read-only when it was scanned for execution, or an
-     * access to an execute-only page that the probe wants carried out here (hv_xoprobe.c)
+     * Memory: a store into a page of code, or a read of one that has replaced instructions in
+     * it and may only be executed (hv_xtrack.c)
      */
-    bool xstore = false;
-
     if (IS_HW(pte)) {
         switch (hv_xtrack_dabort(ctx, ipa, is_write)) {
             case HV_XTRACK_RETRY:
-                // The page is writable again: execute the store once more
+                // The page is what the instruction needs now: execute it once more
                 ctx->elr -= 4;
                 return true;
-            case HV_XTRACK_EMULATE:
-                // The store is in the page it writes to: carry it out here, as for a SW mapping
-                xstore = true;
-                break;
             case HV_XTRACK_SKIP:
-                // The access does not happen, and the guest goes on behind the instruction
+                // The access was carried out there, and the guest goes on behind the instruction
                 return true;
+            case HV_XTRACK_STOP:
+                // It has said why
+                return false;
             default:
                 printf("HV: Data abort on mapped page (0x%lx -> 0x%lx)\n", far, pte);
                 // Try again, this is usually a race
@@ -1475,7 +1472,7 @@ bool hv_handle_dabort(struct exc_info *ctx)
 
     hv_wdt_breadcrumb('1');
 
-    assert(IS_SW(pte) || xstore);
+    assert(IS_SW(pte));
 
     u64 elr = ctx->elr;
     u64 elr_pa = hv_translate_insn(elr);
@@ -1498,11 +1495,6 @@ bool hv_handle_dabort(struct exc_info *ctx)
         hv_wdt_breadcrumb('W');
 
         if (!emulate_store(ctx, insn, (u64 *)val, &width, &vaddr)) {
-            /* Not one EL2 can carry out: let the guest do it, with its page open for a while */
-            if (xstore && hv_xtrack_open(ipa, insn)) {
-                ctx->elr -= 4;
-                return true;
-            }
             printf("HV: store not emulated: 0x%08x at 0x%lx\n", insn, ipa);
             return false;
         }
@@ -1596,13 +1588,7 @@ bool hv_handle_dabort(struct exc_info *ctx)
             printf("HV: WARNING: Failed to emulate upper half but lower half did commit!\n");
             return false;
         }
-
-        if (xstore && is_write)
-            hv_xtrack_stored(ipa2);
     }
-
-    if (xstore && is_write)
-        hv_xtrack_stored(ipa);
 
     if (vaddrp0 != vaddrp1) {
         printf("HV: Straddled r/w data:\n");
