@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Run the sgitest guest (sgitest.c) under the hypervisor, or, given build/gictest.bin,
-build/wfitest.bin, build/pscitest.bin or build/pmutest.bin as the payload, the gictest guest
-(gictest.c), the wfitest guest (wfitest.c), the pscitest guest (pscitest.c) or the pmutest
-guest (pmutest.c): the five share their entry code and image header.
+build/wfitest.bin, build/pscitest.bin, build/pmutest.bin or build/xotest.bin as the payload,
+the gictest guest (gictest.c), the wfitest guest (wfitest.c), the pscitest guest (pscitest.c),
+the pmutest guest (pmutest.c) or the xotest guest (xotest.c): the six share their entry code
+and image header.
 
 The m1n1 on the target has to be built from this tree: the tests are about src/hv/hv_vgic.c,
-src/hv/hv_wfi.c, src/hv/hv_psci.c, src/hv/hv_pmu.c and src/hv/hv_xtrack.c.
+src/hv/hv_wfi.c, src/hv/hv_psci.c, src/hv/hv_pmu.c, src/hv/hv_xtrack.c and
+src/hv/hv_xoprobe.c.
+
+xotest needs --xtrack and --xoprobe: the second tells the hypervisor that the guest is the
+one that may ask for pages that execute and cannot be read or written, and may ask what came
+of the accesses to them. It ends with SYSTEM_OFF.
 
 pmutest needs --xtrack: no memory of the guest is executable then until the hypervisor has
 scanned it and replaced the accesses to PMUv3 registers, which the M4 does not have, whether
@@ -54,6 +60,9 @@ parser.add_argument("--guest-arg", type=lambda s: int(s, 0), default=0, metavar=
 parser.add_argument("--xtrack", action="store_true",
                     help="track execution: scan the memory of the guest before it runs "
                          "(for pmutest)")
+parser.add_argument("--xoprobe", action="store_true",
+                    help="turn on the execute-only probe of the hypervisor (for xotest; "
+                         "needs --xtrack)")
 parser.add_argument("--check-only", action="store_true",
                     help="only check which m1n1 is running and, for each --secondary, where "
                          "that CPU would start; then exit")
@@ -81,11 +90,15 @@ GICR_BASE = 0x51_0000_0000
 
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
-    sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest, pscitest or pmutest image of "
-             "this tree")
+    sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest, pscitest, pmutest or xotest "
+             "image of this tree")
 if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
     sys.exit(f"{args.payload}: UART base already filled in")
 secondary_entry_off = struct.unpack_from("<Q", image, SECONDARY_OFF)[0]
+
+if args.xoprobe and not args.xtrack:
+    sys.exit("--xoprobe: the probe works on pages that execution tracking has scanned, "
+             "it needs --xtrack")
 
 if len(set(args.secondary)) != len(args.secondary):
     sys.exit("--secondary: the same CPU twice")
@@ -239,6 +252,11 @@ if args.xtrack:
     if p.hv_xtrack() != 0:
         sys.exit("The hypervisor refused to track execution")
     print("Execution tracking: on")
+
+if args.xoprobe:
+    if p.hv_xoprobe() != 0:
+        sys.exit("The hypervisor refused to turn on the execute-only probe")
+    print("Execute-only probe: on")
 
 def start_secondary(die, cluster, core):
     """The guest wrote the CPU start register. Stands in for HV.start_secondary(), which

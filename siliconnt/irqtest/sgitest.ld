@@ -25,6 +25,7 @@ SECTIONS
         *(COMMON)
         . = ALIGN(16);
         QUAD(0x444e454954534753) /* "SGSTIEND" */
+        image_end = .;
     }
 
     /DISCARD/ : {

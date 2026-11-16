@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# EL1 test guests for src/hv/hv_vgic.c, src/hv/hv_wfi.c and src/hv/hv_psci.c.
+# EL1 test guests for src/hv/hv_vgic.c, src/hv/hv_wfi.c, src/hv/hv_psci.c, src/hv/hv_pmu.c with
+# src/hv/hv_xtrack.c, and src/hv/hv_xoprobe.c.
 #
 #   make               build/irqtest.bin, build/sgitest.bin, build/gictest.bin,
 #                      build/wfitest.bin and build/pscitest.bin, the raw images that
@@ -16,6 +17,10 @@
 #   make qemu-psci-reset   ...and with SYSTEM_RESET
 #   make qemu-psci-strict  pscitest.bin expecting the hypervisor's answers, which QEMU's
 #                      PSCI does not give: shows that those checks can fail
+#   make qemu-xo       xotest.bin under an EL2 of its own that links the real execute-only
+#                      probe (xotest-qemu.c)
+#   make qemu-xo-leaky ...where an execute-only page can be read: shows that the checks of
+#                      xotest can fail
 
 ARCH ?= aarch64-linux-gnu-
 QEMU ?= qemu-system-aarch64
@@ -34,10 +39,10 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp \n	qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict clean
+.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp \n	qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-xo qemu-xo-leaky clean
 .SECONDARY:
 
-all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin
+all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xotest.bin
 
 build/irqtest.o: irqtest.S
 	@mkdir -p build
@@ -59,14 +64,14 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o: build/%.o: %.c sgitest.h gic.h
+build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o build/xotest.o: build/%.o: %.c sgitest.h gic.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
-build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
+build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf build/xotest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
 	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/$*.o
 
-build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin: build/%.bin: build/%.elf
+build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xotest.bin: build/%.bin: build/%.elf
 	$(OBJCOPY) -O binary $< $@
 
 # build/<image>-qemu-<cpus>.elf
@@ -101,6 +106,28 @@ build/gictest-qemu-%.elf: build/gictest-qemu-%.o
 
 build/wfitest-qemu-%.elf: build/wfitest-qemu-%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
+
+# xotest under an EL2 that is the real probe, src/hv/hv_xoprobe.c without its #include lines,
+# and stand-ins for the rest of the hypervisor (xotest-qemu.c)
+build/hv_xpage.h: ../../src/hv/hv.h
+	@mkdir -p build
+	grep -E '^#define HV_X(PAGE|TRACK|OPROBE)_' $< > $@
+
+build/hv_xoprobe.inc: ../../src/hv/hv_xoprobe.c
+	@mkdir -p build
+	sed -e '/^#include /d' $< > $@
+
+build/xotest-qemu-head.o: xotest-qemu-head.S build/xotest.bin
+	$(CC) -c -Wall -Werror -DIMAGE='"build/xotest.bin"' -o $@ $<
+
+build/xotest-qemu.o: xotest-qemu.c build/hv_xpage.h build/hv_xoprobe.inc
+	$(CC) -c $(SGI_CFLAGS) -Ibuild -o $@ $<
+
+build/xotest-qemu-leaky.o: xotest-qemu.c build/hv_xpage.h build/hv_xoprobe.inc
+	$(CC) -c $(SGI_CFLAGS) -Ibuild -DXO_LEAKY -o $@ $<
+
+build/xotest-qemu.elf build/xotest-qemu-leaky.elf: build/%.elf: build/xotest-qemu-head.o build/%.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
 
 # The guests spin after they have printed DONE, so stop QEMU after a while
 qemu: build/qemu-shim.elf
@@ -141,6 +168,15 @@ qemu-pmu: build/pmutest-qemu-0x0.elf
 
 qemu-pmu-strict: build/pmutest-qemu-0x100.elf
 	-timeout 30 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
+
+# QEMU enters these at EL2. xotest ends with SYSTEM_OFF, which its EL2 passes on to QEMU
+QEMU_XO_FLAGS := -M virt,gic-version=3,virtualization=on -cpu cortex-a72 -m 64 -nodefaults 	-display none -monitor none -serial stdio
+
+qemu-xo: build/xotest-qemu.elf
+	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-xo-leaky: build/xotest-qemu-leaky.elf
+	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
 
 clean:
 	rm -rf build
