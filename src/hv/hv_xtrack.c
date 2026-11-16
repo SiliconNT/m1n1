@@ -605,10 +605,14 @@ static u64 xt_sext(u64 val, u32 size)
     return val;
 }
 
-/* The stack pointer that the guest was using: SP_EL1 at EL1h, SP_EL0 at EL1t and at EL0 */
-static bool xt_sp_is_el1(void)
+/*
+ * The stack pointer that the guest was using: SP_EL1 at EL1h, SP_EL0 at EL1t and at EL0. Both
+ * are in the context while the hypervisor runs: hv_exc.c reads them on the way in and writes
+ * them back on the way out, so what is to change has to change there.
+ */
+static u64 *xt_sp(struct exc_info *ctx)
 {
-    return (hv_get_spsr() & 0xf) == 5;
+    return &ctx->sp[(hv_get_spsr() & 0xf) == 5 ? 1 : 0];
 }
 
 union xt_simd {
@@ -624,9 +628,8 @@ union xt_simd {
 static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u64 ipa, u64 pc_page,
                     u32 *flags)
 {
-    bool sp_el1 = xt_sp_is_el1();
-    u64 sp = sp_el1 ? mrs(SP_EL1) : mrs(SP_EL0);
-    u64 va = hv_xinsn_addr(d, ctx->regs, sp, ctx->elr);
+    u64 *sp = xt_sp(ctx);
+    u64 va = hv_xinsn_addr(d, ctx->regs, *sp, ctx->elr);
     u32 len = d->size * d->count;
     bool rd = d->kind == XI_LOAD || d->kind == XI_ATOMIC || d->kind == XI_CAS;
     bool wr = d->kind != XI_LOAD;
@@ -822,10 +825,8 @@ static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u6
     if ((d->kind == XI_LOAD || d->kind == XI_STORE) && (d->mode == XI_PRE || d->mode == XI_POST)) {
         if (d->rn != 31)
             ctx->regs[d->rn] += d->imm;
-        else if (sp_el1)
-            msr(SP_EL1, sp + d->imm);
         else
-            msr(SP_EL0, sp + d->imm);
+            *sp += d->imm;
     }
 
     sysop("dmb ish");

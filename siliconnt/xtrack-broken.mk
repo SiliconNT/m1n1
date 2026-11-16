@@ -27,4 +27,6 @@ BREAK_10 := s/^                wr = false;$$/                ;/
 BREAK_10_IS := a CAS that does not find what it expects stores all the same
 BREAK_11 := s/^                    simd\[r\]\.d\[1\] = 0;$$/                    ;/
 BREAK_11_IS := a load into a SIMD register leaves its upper half as it was
-BROKEN := 1 2 3 4 5 6 7 8 9 10 11
+BREAK_12 := s/^            \*sp += d->imm;$$/            msr(SP_EL1, *sp + d->imm);/
+BREAK_12_IS := writeback to the stack pointer goes to the register and not to the context
+BROKEN := 1 2 3 4 5 6 7 8 9 10 11 12

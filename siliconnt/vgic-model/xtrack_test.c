@@ -479,7 +479,18 @@ static int data_abort(struct cpu *c, u32 insn, u64 pc, u64 far, u64 esr, bool el
     test_SP_EL1 = el0 ? 0x5e1 : c->sp;
     memcpy(test_simd, c->v, sizeof(test_simd));
 
+    /*
+     * What src/hv/hv_exc.c does around every exception: the stack pointers of the guest go
+     * into the context on the way in, and from the context into the registers on the way out.
+     * What is written to the registers in between is lost.
+     */
+    ctx.sp[0] = test_SP_EL0;
+    ctx.sp[1] = test_SP_EL1;
+
     int ret = hv_xtrack_dabort(&ctx, far, esr & BIT(6));
+
+    test_SP_EL0 = ctx.sp[0];
+    test_SP_EL1 = ctx.sp[1];
 
     for (int i = 0; i < 31; i++)
         c->x[i] = ctx.regs[i];

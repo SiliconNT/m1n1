@@ -45,6 +45,7 @@ typedef unsigned char u8;
 struct exc_info {
     u64 regs[32];
     u64 elr;
+    u64 sp[3];
     u64 cpu_id;
 };
 
@@ -398,6 +399,13 @@ void shim_sync(struct frame *f)
     ctx.regs[31] = 0;
     ctx.elr = f->elr;
     ctx.cpu_id = 0;
+    /*
+     * As hv_get_context() of src/hv/hv_exc.c has them, and as the way out there puts them
+     * back: a stack pointer of the guest that is written to the register in between is lost
+     */
+    ctx.sp[0] = mrs(sp_el0);
+    ctx.sp[1] = mrs(sp_el1);
+    ctx.sp[2] = 0;
 
     if (ec == 0x16) {
         /* hvc: the address to return to is behind the instruction */
@@ -425,6 +433,8 @@ void shim_sync(struct frame *f)
     for (int i = 0; i < 31; i++)
         f->regs[i] = ctx.regs[i];
     f->elr = ctx.elr;
+    msr(sp_el0, ctx.sp[0]);
+    msr(sp_el1, ctx.sp[1]);
 }
 
 /* The interrupt of the EL2 physical timer, PPI 26, to this EL2 */
