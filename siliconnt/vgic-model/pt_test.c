@@ -271,7 +271,7 @@ static void verify(u64 ipa)
     switch (w.kind) {
         case K_HW: {
             unsigned xn = (xtrack && w.state == HV_XPAGE_UNSCANNED) ? 2 : 0;
-            u64 ap = w.state == HV_XPAGE_SCANNED ? 1 : 3;
+            u64 ap = w.state == HV_XPAGE_SCANNED ? 1 : w.state == HV_XPAGE_XONLY ? 0 : 3;
             /* MemAttr 0b1111, S2AP, SH 0b11, AF */
             u64 attr = (0xfUL << 2) | (ap << 6) | (3UL << 8) | BIT(10);
 
@@ -552,6 +552,17 @@ static void test_m4(void)
     t_set_scanned(0x10100200000, HV_XPAGE_OPEN);
     t_set_scanned(0x10000004000, HV_XPAGE_SCANNED);
     t_set_scanned(0x10000004000, HV_XPAGE_UNSCANNED);
+    /* A page that executes and is neither read nor written, and what it was before and after */
+    t_set_scanned(0x10100006000, HV_XPAGE_XONLY);
+    check(s2_walk(0x10100006000).valid && (s2_walk(0x10100006000).attr >> 6 & 3) == 0 &&
+              s2_walk(0x10100006000).xn == 0,
+          "an execute-only page: S2AP %ld and XN %d in the descriptor",
+          s2_walk(0x10100006000).attr >> 6 & 3, s2_walk(0x10100006000).xn);
+    t_set_scanned(0x10100006000, HV_XPAGE_SCANNED);
+    t_set_scanned(0x10100006000, HV_XPAGE_XONLY);
+    t_set_scanned(0x10100006000, HV_XPAGE_UNSCANNED);
+    t_set_scanned(0x10100006000, HV_XPAGE_SCANNED);
+    t_set_scanned(0x101001ff000, HV_XPAGE_XONLY);
 
     /* What is not memory has no state, and gets none */
     check(hv_pt_scanned(0x5000000000, &pa) < 0 && hv_pt_scanned(0x103dc000000, &pa) < 0 &&

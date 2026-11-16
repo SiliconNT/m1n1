@@ -29,6 +29,8 @@ extern uint64_t ram_base;
 
 #define PTE_ATTRIBUTES    (PTE_ACCESS | PTE_SH_NS | PTE_S2AP_RW | PTE_MEMATTR_UNCHANGED)
 #define PTE_ATTRIBUTES_RO (PTE_ACCESS | PTE_SH_NS | PTE_S2AP_RO | PTE_MEMATTR_UNCHANGED)
+/* S2AP 0b00: no data access, read or write (Arm DDI 0487 M.d, D8.4.2.1.1, table D8-76) */
+#define PTE_ATTRIBUTES_NONE (PTE_ACCESS | PTE_SH_NS | PTE_MEMATTR_UNCHANGED)
 
 #define PTE_LOWER_ATTRIBUTES GENMASK(11, 2)
 
@@ -43,6 +45,8 @@ extern uint64_t ram_base;
 #define PTE_SW_SCANNED BIT(56)
 /* ...and it is open for the moment: scanned, executable and writable all the same */
 #define PTE_SW_OPEN BIT(57)
+/* ...or it is execute-only: scanned, executable, and neither read nor written (hv_xoprobe.c) */
+#define PTE_SW_XONLY BIT(58)
 
 #define PTE_VALID BIT(0)
 #define PTE_TYPE  BIT(1)
@@ -507,8 +511,9 @@ bool hv_pt_xtrack_on(void)
 /*
  * The state of the page of memory at this IPA while execution is tracked: HV_XPAGE_SCANNED
  * (executable, read-only), HV_XPAGE_UNSCANNED (writable, not executable), HV_XPAGE_OPEN
- * (executable and writable, for a short while), or -1 if there is no memory there: device
- * registers are not memory. *pa is where the page is.
+ * (executable and writable, for a short while), HV_XPAGE_XONLY (executable, and no data
+ * access), or -1 if there is no memory there: device registers are not memory. *pa is where
+ * the page is.
  */
 int hv_pt_scanned(u64 ipa, u64 *pa)
 {
@@ -522,6 +527,8 @@ int hv_pt_scanned(u64 ipa, u64 *pa)
         return -1;
 
     *pa = pte & PTE_TARGET_MASK;
+    if (pte & PTE_SW_XONLY)
+        return HV_XPAGE_XONLY;
     if (pte & PTE_SW_OPEN)
         return HV_XPAGE_OPEN;
     return pte & PTE_SW_SCANNED ? HV_XPAGE_SCANNED : HV_XPAGE_UNSCANNED;
@@ -541,6 +548,8 @@ int hv_pt_set_scanned(u64 ipa, int state)
         attrs = PTE_ATTRIBUTES_RO | PTE_SW_SCANNED;
     else if (state == HV_XPAGE_OPEN)
         attrs = PTE_ATTRIBUTES | PTE_SW_SCANNED | PTE_SW_OPEN;
+    else if (state == HV_XPAGE_XONLY)
+        attrs = PTE_ATTRIBUTES_NONE | PTE_SW_SCANNED | PTE_SW_XONLY;
     if (hv_map(ipa, pa | attrs | PTE_VALID, PAGE_SIZE, 1) < 0)
         return -1;
 
@@ -1418,7 +1427,10 @@ bool hv_handle_dabort(struct exc_info *ctx)
         return false;
     }
 
-    /* A store into a page that was made read-only when it was scanned for execution */
+    /*
+     * A store into a page that was made read-only when it was scanned for execution, or an
+     * access to an execute-only page that the probe wants carried out here (hv_xoprobe.c)
+     */
     bool xstore = false;
 
     if (IS_HW(pte)) {
@@ -1431,6 +1443,9 @@ bool hv_handle_dabort(struct exc_info *ctx)
                 // The store is in the page it writes to: carry it out here, as for a SW mapping
                 xstore = true;
                 break;
+            case HV_XTRACK_SKIP:
+                // The access does not happen, and the guest goes on behind the instruction
+                return true;
             default:
                 printf("HV: Data abort on mapped page (0x%lx -> 0x%lx)\n", far, pte);
                 // Try again, this is usually a race
@@ -1563,11 +1578,11 @@ bool hv_handle_dabort(struct exc_info *ctx)
             return false;
         }
 
-        if (xstore)
+        if (xstore && is_write)
             hv_xtrack_stored(ipa2);
     }
 
-    if (xstore)
+    if (xstore && is_write)
         hv_xtrack_stored(ipa);
 
     if (vaddrp0 != vaddrp1) {

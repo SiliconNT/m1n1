@@ -134,11 +134,13 @@ bool hv_pt_xtrack_on(void);
 #define HV_XPAGE_UNSCANNED 0
 #define HV_XPAGE_SCANNED   1
 #define HV_XPAGE_OPEN      2
+#define HV_XPAGE_XONLY     3
 int hv_pt_scanned(u64 ipa, u64 *pa);
 int hv_pt_set_scanned(u64 ipa, int state);
 #define HV_XTRACK_NONE    0
 #define HV_XTRACK_RETRY   1
 #define HV_XTRACK_EMULATE 2
+#define HV_XTRACK_SKIP    3
 void hv_xtrack_init(void);
 bool hv_xtrack_iabort(struct exc_info *ctx);
 int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write);
@@ -146,6 +148,16 @@ void hv_xtrack_stored(u64 ipa);
 bool hv_xtrack_open(u64 ipa, u32 insn);
 void hv_xtrack_close(void);
 void hv_xtrack_report(void);
+
+/* The execute-only probe: what the core does with a page it may execute and not read */
+#define HV_XOPROBE_DEMOTE  0
+#define HV_XOPROBE_SKIP    1
+#define HV_XOPROBE_EMULATE 2
+void hv_xoprobe_init(void);
+int hv_xoprobe_enable(void);
+bool hv_xoprobe_hvc(struct exc_info *ctx, u16 imm);
+int hv_xoprobe_dabort(struct exc_info *ctx, u64 ipa, int state, bool is_write);
+void hv_xoprobe_report(void);
 
 /* AMCC interrupt filtering */
 bool hv_amcc_init(void);

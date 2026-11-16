@@ -204,21 +204,26 @@ bool hv_xtrack_iabort(struct exc_info *ctx)
 /*
  * A data abort on memory that has a hardware mapping. Is it a store into a page that is
  * read-only because it has been scanned, and what is to be done about it?
+ *
+ * An abort that is not such a store goes to the execute-only probe (hv_xoprobe.c), which
+ * says HV_XTRACK_NONE unless a test guest has asked it for something else.
  */
 int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write)
 {
     u64 pa;
 
-    if (!is_write || !hv_pt_xtrack_on())
+    if (!hv_pt_xtrack_on())
         return HV_XTRACK_NONE;
 
     u64 page = ipa & ~(XTRACK_PAGE - 1);
     int state = hv_pt_scanned(page, &pa);
+    if (state == HV_XPAGE_XONLY || !is_write)
+        return hv_xoprobe_dabort(ctx, ipa, state, is_write);
     /* An open page takes stores: this one faulted on what was left in the TLB */
     if (state == HV_XPAGE_OPEN)
         return HV_XTRACK_RETRY;
     if (state != HV_XPAGE_SCANNED)
-        return HV_XTRACK_NONE;
+        return hv_xoprobe_dabort(ctx, ipa, state, is_write);
 
     /* ctx->elr is where the store is: the caller has not moved it yet */
     u64 pc = hv_translate(ctx->elr, true, false, NULL);
@@ -238,8 +243,12 @@ void hv_xtrack_stored(u64 ipa)
 {
     u64 pa;
 
+    if (!hv_pt_xtrack_on())
+        return;
+
     /* An open page is scanned when it is closed */
-    if (!hv_pt_xtrack_on() || hv_pt_scanned(ipa, &pa) != HV_XPAGE_SCANNED)
+    int state = hv_pt_scanned(ipa, &pa);
+    if (state != HV_XPAGE_SCANNED && state != HV_XPAGE_XONLY)
         return;
     if (hv_xtrack_scan(pa))
         xtrack_stats.restores++;

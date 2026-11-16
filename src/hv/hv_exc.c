@@ -667,14 +667,16 @@ bool hv_exc_sync(struct exc_info *ctx)
             hv_wdt_breadcrumb('H');
             /*
              * A guest that is not macOS under the SPTM emulation gets PSCI, and the PMUv3
-             * registers through the hvcs that hv_pmu.c puts into its code; nothing else
+             * registers through the hvcs that hv_pmu.c puts into its code; nothing else,
+             * unless the host has said that it is the test guest of the execute-only probe
              */
             if (hv_sptm_mode == SPTM_NONE && (FIELD_GET(ESR_ISS, ctx->esr) & BIT(15)) &&
                 hv_pt_xtrack_on())
                 handled = hv_pmu_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr)) ||
                           hv_psci_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr));
             else if (hv_sptm_mode == SPTM_NONE)
-                handled = hv_psci_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr));
+                handled = hv_xoprobe_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr)) ||
+                          hv_psci_hvc(ctx, FIELD_GET(ESR_ISS, ctx->esr));
             else
                 handled = hv_hvc_dispatch(ctx, FIELD_GET(ESR_ISS, ctx->esr));
             protect_elr = true; // HVC alread leaves ELR past the instruction

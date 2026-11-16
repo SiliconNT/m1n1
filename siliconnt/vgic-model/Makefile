@@ -48,9 +48,10 @@ build/hv_vm_pt.inc: $(SRC)/hv/hv_vm.c
 
 build/hv_xpage.h: $(SRC)/hv/hv.h
 	@mkdir -p build
-	grep -E '^#define HV_X(PAGE|TRACK)_' $< > $@
+	grep -E '^#define HV_X(PAGE|TRACK|OPROBE)_' $< > $@
 
-# Execution tracking, src/hv/hv_xtrack.c, with the real hv_pmu.c and page states of its own
+# Execution tracking, src/hv/hv_xtrack.c, and the execute-only probe, src/hv/hv_xoprobe.c, with
+# the real hv_pmu.c and page states of its own
 xtrack: build/xtrack-model
 	build/xtrack-model
 
@@ -58,7 +59,11 @@ build/hv_xtrack.inc: $(SRC)/hv/hv_xtrack.c
 	@mkdir -p build
 	sed -e '/^#include /d' $< > $@
 
-build/xtrack-model: xtrack_test.c $(wildcard *.h) build/hv_xtrack.inc build/hv_xpage.h build/hv_pmu.c build/arm_cpu_regs.h
+build/hv_xoprobe.inc: $(SRC)/hv/hv_xoprobe.c
+	@mkdir -p build
+	sed -e '/^#include /d' $< > $@
+
+build/xtrack-model: xtrack_test.c $(wildcard *.h) build/hv_xtrack.inc build/hv_xoprobe.inc build/hv_xpage.h build/hv_pmu.c build/arm_cpu_regs.h
 	$(CC) $(CFLAGS) -o $@ xtrack_test.c build/hv_pmu.c
 
 build/pt-model: pt_test.c $(wildcard *.h) build/hv_vm_pt.inc build/hv_xpage.h build/arm_cpu_regs.h

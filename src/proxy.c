@@ -566,6 +566,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = selfboot_run_loaded(request->args[0], request->args[1],
                                                 request->args[2], uartproxy_iodev);
             break;
+        case P_HV_XOPROBE:
+            reply->retval = hv_xoprobe_enable();
+            break;
 
         case P_FB_INIT:
             fb_init(request->args[0]);

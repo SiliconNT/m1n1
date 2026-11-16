@@ -216,6 +216,7 @@ void hv_init(void)
     hv_pmu_init();
     hv_dbg_init();
     hv_xtrack_init();
+    hv_xoprobe_init();
 
     // Set deep WFI back to defaults
     if (cpu_features->apple_sysregs_unlocked)
@@ -332,6 +333,7 @@ void hv_start(void *entry, u64 regs[4])
     hv_pmu_report();
     hv_dbg_report();
     hv_xtrack_report();
+    hv_xoprobe_report();
     spin_unlock(&bhl);
 }
 

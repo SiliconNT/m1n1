@@ -153,6 +153,7 @@ typedef enum {
     P_HV_SET_GENTER_TRAP,
     P_HV_XTRACK,
     P_SELFBOOT_RUN,
+    P_HV_XOPROBE,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,

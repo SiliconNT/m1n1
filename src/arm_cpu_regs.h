@@ -54,6 +54,7 @@
 #define SYS_CNTP_CVAL_EL02 sys_reg(3, 5, 14, 2, 2)
 
 #define SYS_ESR_EL2  sys_reg(3, 4, 5, 2, 0)
+#define SYS_HPFAR_EL2 sys_reg(3, 4, 6, 0, 4)
 #define ESR_ISS2     GENMASK(36, 32)
 #define ESR_EC       GENMASK(31, 26)
 #define ESR_EC_SHIFT 26
