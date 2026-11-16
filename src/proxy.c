@@ -569,6 +569,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_XOPROBE:
             reply->retval = hv_xoprobe_enable();
             break;
+        case P_HV_XTRACK_COUNT_READS:
+            hv_xtrack_count_reads(request->args[0]);
+            break;
 
         case P_FB_INIT:
             fb_init(request->args[0]);

@@ -130,6 +130,10 @@ parser.add_argument("--disk", type=pathlib.Path,
 parser.add_argument("--xtrack", choices=("on", "off"), default="on",
                     help="execution tracking: scan the memory of the guest before it runs "
                          "(default), or do not")
+parser.add_argument("--count-reads", action="store_true",
+                    help="an experiment: the pages that execution tracking replaces instructions "
+                         "in become execute-only, and the hypervisor counts the reads of them "
+                         "and prints the counts when the guest has stopped")
 parser.add_argument("--bugcheck", type=pathlib.Path, metavar="DIR",
                     help="when the guest has stopped, look in its memory for what the Windows "
                          "kernel recorded of a bug check, print it, and write the memory its "
@@ -154,6 +158,8 @@ if args.loader == "m1n1" and not args.disk:
     parser.error("--loader m1n1: m1n1 does not start the firmware without a boot disk (--disk)")
 if args.loader == "m1n1" and args.xtrack == "off":
     parser.error("--loader m1n1: m1n1 always turns execution tracking on")
+if args.count_reads and args.xtrack == "off":
+    parser.error("--count-reads: without execution tracking no instruction is replaced")
 
 PAGE = 0x4000
 
@@ -793,6 +799,7 @@ def m1n1_loads():
 
     wait_for_debugger()
 
+    count_reads()
     heap_before = p.heapblock_alloc(0)
     print(f"Handing over to m1n1 (P_SELFBOOT_RUN): guest RAM from 0x{layout.phys_base:x}, "
           f"image 0x{len(image):x} bytes, disk 0x{len(disk):x} bytes")
@@ -835,6 +842,14 @@ def m1n1_loads():
           f"{(heap_after - heap_before) / (1 << 20):.1f} MiB; "
           f"{(u.heap_base - heap_after) / (1 << 20):.1f} MiB are left below its limit")
     return 2 if check_stage2(io_ranges) else 0
+
+def count_reads():
+    """The hypervisor keeps what it was last told, over hv_init() too (src/hv/hv_xtrack.c): so
+    it is told before every run, whichever of the two loads the guest."""
+    p.hv_xtrack_count_reads(args.count_reads)
+    if args.count_reads:
+        print("Reads of pages with replaced instructions: counted, and such pages are "
+              "execute-only")
 
 if args.loader == "m1n1":
     reader.start()
@@ -909,6 +924,7 @@ if args.xtrack == "off":
     print("Execution tracking: off. A guest that reads the PMUv3 cycle counter takes an "
           "exception")
 else:
+    count_reads()
     if p.hv_xtrack() != 0:
         sys.exit("The hypervisor refused to track execution. The guest has not run.")
     print("Execution tracking: on")

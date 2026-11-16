@@ -63,6 +63,10 @@ parser.add_argument("--xtrack", action="store_true",
 parser.add_argument("--xoprobe", action="store_true",
                     help="turn on the execute-only probe of the hypervisor (for xotest; "
                          "needs --xtrack)")
+parser.add_argument("--count-reads", action="store_true",
+                    help="an experiment: pages that instructions are replaced in become "
+                         "execute-only and the hypervisor counts the reads of them (needs "
+                         "--xtrack, not with --xoprobe)")
 parser.add_argument("--check-only", action="store_true",
                     help="only check which m1n1 is running and, for each --secondary, where "
                          "that CPU would start; then exit")
@@ -99,6 +103,11 @@ secondary_entry_off = struct.unpack_from("<Q", image, SECONDARY_OFF)[0]
 if args.xoprobe and not args.xtrack:
     sys.exit("--xoprobe: the probe works on pages that execution tracking has scanned, "
              "it needs --xtrack")
+
+if args.count_reads and (not args.xtrack or args.xoprobe):
+    sys.exit("--count-reads: it counts reads of pages that execution tracking has replaced "
+             "instructions in, so it needs --xtrack; and the execute-only pages are then "
+             "not the probe's, so not with --xoprobe")
 
 if len(set(args.secondary)) != len(args.secondary):
     sys.exit("--secondary: the same CPU twice")
@@ -245,6 +254,11 @@ for slot, index in enumerate(slots):
           f"0x{1 << core:x} to 0x{start_reg:x}")
 
 hv.load_raw(bytes(image), entryoffset=0)
+
+# The hypervisor keeps what it was last told (src/hv/hv_xtrack.c), so it is told every time
+p.hv_xtrack_count_reads(args.count_reads)
+if args.count_reads:
+    print("Reads of pages with replaced instructions: counted, and such pages are execute-only")
 
 if args.xtrack:
     # After the memory of the guest has been mapped and filled: this changes the mappings

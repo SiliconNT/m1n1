@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Entry, exception vectors and the guest image of the EL2 that runs xotest.bin (IMAGE) on
- * QEMU: see xotest-qemu.c.
+ * Entry, exception vectors and the guest image of the EL2 that runs a test guest (IMAGE) on
+ * QEMU: xotest.bin under xotest-qemu.c, pmutest.bin under pmutest-el2-qemu.c.
  */
 
     .text
@@ -39,7 +39,8 @@ shim_vectors:
     bad_vector 7
     .balign 0x80
     b       lower_sync              /* synchronous, from EL1 or EL0 */
-    bad_vector 9
+    .balign 0x80
+    b       lower_irq               /* an interrupt while EL1 or EL0 ran */
     bad_vector 10
     bad_vector 11
     bad_vector 12
@@ -49,7 +50,7 @@ shim_vectors:
     .balign 0x80
 
 /* struct exc_info of xotest-qemu.c: x0 to x30, then the address to return to */
-lower_sync:
+    .macro  lower_entry handler
     sub     sp, sp, #256
     stp     x0, x1, [sp]
     stp     x2, x3, [sp, #16]
@@ -69,7 +70,7 @@ lower_sync:
     mrs     x0, elr_el2
     stp     x30, x0, [sp, #240]
     mov     x0, sp
-    bl      shim_sync
+    bl      \handler
     ldp     x30, x0, [sp, #240]
     msr     elr_el2, x0
     ldp     x0, x1, [sp]
@@ -89,6 +90,13 @@ lower_sync:
     ldp     x28, x29, [sp, #224]
     add     sp, sp, #256
     eret
+    .endm
+
+lower_sync:
+    lower_entry shim_sync
+
+lower_irq:
+    lower_entry shim_irq
 
 bad_entry:
     bl      shim_bad

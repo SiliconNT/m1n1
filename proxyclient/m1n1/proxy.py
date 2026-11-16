@@ -677,6 +677,7 @@ class M1N1Proxy(Reloadable):
     P_HV_XTRACK = 0xc14
     P_SELFBOOT_RUN = 0xc15
     P_HV_XOPROBE = 0xc16
+    P_HV_XTRACK_COUNT_READS = 0xc17
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1185,6 +1186,8 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_SELFBOOT_RUN, phys_base, image_size, disk_size, signed=True)
     def hv_xoprobe(self):
         return self.request(self.P_HV_XOPROBE, signed=True)
+    def hv_xtrack_count_reads(self, on):
+        return self.request(self.P_HV_XTRACK_COUNT_READS, 1 if on else 0)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

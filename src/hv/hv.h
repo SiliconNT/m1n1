@@ -75,6 +75,7 @@ bool hv_pt_is_ram(u64 ipa);
 int hv_pt_set_writable(u64 ipa, bool writable);
 u64 hv_translate(u64 addr, bool s1only, bool w, u64 *par_out);
 u64 hv_pt_walk(u64 addr);
+u64 hv_translate_insn(u64 addr);
 bool hv_emulate_pt_store(struct exc_info *ctx, u64 far, u64 ipa, u64 *bytes);
 bool hv_handle_dabort(struct exc_info *ctx);
 bool hv_pa_write(struct exc_info *ctx, u64 addr, u64 *val, int width);
@@ -120,6 +121,7 @@ bool hv_pmu_is_access(u32 insn);
 u32 hv_pmu_patch_word(u32 insn);
 u32 hv_pmu_unpatch_word(u32 insn);
 u32 hv_pmu_patch_range(u32 *words, u32 count);
+u32 hv_pmu_count_replaced(const u32 *words, u32 count);
 bool hv_pmu_hvc(struct exc_info *ctx, u16 imm);
 void hv_pmu_report(void);
 
@@ -148,6 +150,9 @@ void hv_xtrack_stored(u64 ipa);
 bool hv_xtrack_open(u64 ipa, u32 insn);
 void hv_xtrack_close(void);
 void hv_xtrack_report(void);
+/* For an experiment: pages with replaced instructions are execute-only and reads are counted */
+void hv_xtrack_count_reads(bool on);
+bool hv_xtrack_counts_reads(void);
 
 /* The execute-only probe: what the core does with a page it may execute and not read */
 #define HV_XOPROBE_DEMOTE  0

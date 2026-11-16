@@ -21,6 +21,9 @@
 #                      probe (xotest-qemu.c)
 #   make qemu-xo-leaky ...where an execute-only page can be read: shows that the checks of
 #                      xotest can fail
+#   make qemu-pmu-el2  pmutest.bin under an EL2 of its own that links the real execution
+#                      tracking and PMU code (pmutest-el2-qemu.c)
+#   make qemu-pmu-el2-count  ...with reads of pages with replaced instructions counted
 
 ARCH ?= aarch64-linux-gnu-
 QEMU ?= qemu-system-aarch64
@@ -39,7 +42,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp \n	qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-xo qemu-xo-leaky clean
+.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp \n	qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-xo qemu-xo-leaky qemu-pmu-el2 qemu-pmu-el2-count clean
 .SECONDARY:
 
 all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xotest.bin
@@ -129,6 +132,28 @@ build/xotest-qemu-leaky.o: xotest-qemu.c build/hv_xpage.h build/hv_xoprobe.inc
 build/xotest-qemu.elf build/xotest-qemu-leaky.elf: build/%.elf: build/xotest-qemu-head.o build/%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
 
+# pmutest under an EL2 that is the real src/hv/hv_xtrack.c and src/hv/hv_pmu.c without their
+# #include lines, and stand-ins for the rest of the hypervisor (pmutest-el2-qemu.c)
+build/hv_xtrack.inc: ../../src/hv/hv_xtrack.c
+	@mkdir -p build
+	sed -e '/^#include /d' $< > $@
+
+build/hv_pmu.inc: ../../src/hv/hv_pmu.c
+	@mkdir -p build
+	sed -e '/^#include /d' $< > $@
+
+build/pmutest-el2-head.o: xotest-qemu-head.S build/pmutest.bin
+	$(CC) -c -Wall -Werror -DIMAGE='"build/pmutest.bin"' -o $@ $<
+
+build/pmutest-el2-qemu.o: pmutest-el2-qemu.c build/hv_xpage.h build/hv_xtrack.inc build/hv_pmu.inc
+	$(CC) -c $(SGI_CFLAGS) -Ibuild -o $@ $<
+
+build/pmutest-el2-qemu-count.o: pmutest-el2-qemu.c build/hv_xpage.h build/hv_xtrack.inc build/hv_pmu.inc
+	$(CC) -c $(SGI_CFLAGS) -Ibuild -DCOUNT_READS -o $@ $<
+
+build/pmutest-el2-qemu.elf build/pmutest-el2-qemu-count.elf: build/%.elf: build/pmutest-el2-head.o build/%.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
+
 # The guests spin after they have printed DONE, so stop QEMU after a while
 qemu: build/qemu-shim.elf
 	-timeout 15 $(QEMU) $(QEMU_FLAGS) -kernel $<
@@ -176,6 +201,12 @@ qemu-xo: build/xotest-qemu.elf
 	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
 
 qemu-xo-leaky: build/xotest-qemu-leaky.elf
+	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-pmu-el2: build/pmutest-el2-qemu.elf
+	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
+
+qemu-pmu-el2-count: build/pmutest-el2-qemu-count.elf
 	-timeout 30 $(QEMU) $(QEMU_XO_FLAGS) -smp 1 -no-reboot -kernel $<
 
 clean:

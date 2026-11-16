@@ -72,6 +72,7 @@ bool hv_pmu_is_access(u32 insn);
 u32 hv_pmu_patch_word(u32 insn);
 u32 hv_pmu_unpatch_word(u32 insn);
 u32 hv_pmu_patch_range(u32 *words, u32 count);
+u32 hv_pmu_count_replaced(const u32 *words, u32 count);
 bool hv_pmu_hvc(struct exc_info *ctx, u16 imm);
 void hv_pmu_report(void);
 void hv_dbg_init(void);

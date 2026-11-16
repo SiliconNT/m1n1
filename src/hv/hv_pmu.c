@@ -226,6 +226,20 @@ u32 hv_pmu_patch_range(u32 *words, u32 count)
     return n;
 }
 
+/*
+ * How many of count words are what an access becomes: a read of CNTVCT_EL0, or one of the
+ * HVCs. A read of CNTVCT_EL0 that the guest wrote itself counts too: the word does not say.
+ */
+u32 hv_pmu_count_replaced(const u32 *words, u32 count)
+{
+    u32 n = 0;
+
+    for (u32 i = 0; i < count; i++)
+        if ((words[i] & MRS_RT_MASK) == MRS_CNTVCT || hv_pmu_unpatch_word(words[i]))
+            n++;
+    return n;
+}
+
 static u64 hv_pmu_read(struct pmu_cpu *p, u32 reg)
 {
     switch (reg) {

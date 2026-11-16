@@ -210,6 +210,12 @@ static u64 hv_translate(u64 addr, bool s1, bool w, u64 *par_out)
     return (par & 0x0000fffffffff000UL) | (addr & (PAGE - 1));
 }
 
+/* There is no hv_xtrack.c here to count reads */
+static bool hv_xtrack_counts_reads(void)
+{
+    return false;
+}
+
 #include "hv_xoprobe.inc"
 
 /* ---- the hypervisor around the probe ---- */
@@ -233,6 +239,13 @@ void shim_bad(u64 vector)
     shim_hex(mrs(far_el2));
     shim_puts("\n");
     shim_stop();
+}
+
+/* No interrupt is enabled here */
+void shim_irq(struct exc_info *ctx)
+{
+    (void)ctx;
+    shim_bad(9);
 }
 
 void shim_sync(struct exc_info *ctx)

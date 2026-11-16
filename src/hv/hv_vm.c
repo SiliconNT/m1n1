@@ -659,6 +659,25 @@ u64 hv_pt_walk(u64 addr)
     return l4d;
 }
 
+/*
+ * Where EL2 finds the instruction at this address of the guest, or 0. Stage 1 as the guest
+ * has it, and stage 2 from the tables here: the address translation instructions for both
+ * stages ask for the read permission of stage 2, which a page that is execute-only does not
+ * have (hv_xtrack.c), and the instruction is in it all the same.
+ */
+u64 hv_translate_insn(u64 addr)
+{
+    u64 ipa = hv_translate(addr, true, false, NULL);
+
+    if (!ipa || ipa >= BIT(vaddr_bits))
+        return 0;
+
+    u64 pte = hv_pt_walk(ipa);
+    if (!IS_HW(pte))
+        return 0;
+    return (pte & PTE_TARGET_MASK_L4) | (ipa & MASK(VADDR_L4_OFFSET_BITS));
+}
+
 #define CHECK_RN                                                                                   \
     if (Rn == 31)                                                                                  \
     return false
@@ -1459,7 +1478,7 @@ bool hv_handle_dabort(struct exc_info *ctx)
     assert(IS_SW(pte) || xstore);
 
     u64 elr = ctx->elr;
-    u64 elr_pa = hv_translate(elr, false, false, NULL);
+    u64 elr_pa = hv_translate_insn(elr);
     if (!elr_pa) {
         printf("HV: Failed to fetch instruction for data abort at 0x%lx\n", elr);
         return false;

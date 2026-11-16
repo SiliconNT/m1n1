@@ -54,6 +54,7 @@ enum {
     PG_PATCH,    /* code that writes an instruction into its own page and runs it */
     PG_EL0,      /* code that runs at EL0 first and at EL1 afterwards */
     PG_EL0_READ, /* code that reads the cycle counter at EL0 */
+    PG_READ,     /* code with an access, and constants that it and code elsewhere read */
     PG_OPEN,    /* code that stores into its own page in a way EL2 does not carry out */
     /*
      * Looks like accesses all over and is never executed. It has to stay between two pages
@@ -114,6 +115,33 @@ static const u32 tpl_el0[] = {K(0xd2898600), K(0xd4000001), K(0xd2803c20), K(I_R
 #define EL1_MARK 0x1e1
 /* For EL0: mrs x0, PMCCNTR_EL0; svc #0 */
 static const u32 tpl_el0_read[] = {K(I_MRS_X0_PMCCNTR), K(0xd4000001)};
+
+/*
+ * A page that Windows has many of: instructions, one of them an access, and constants between
+ * them that the instructions read.
+ *    0: ldr x0, c64;  ret      2: ldrsw x0, c32;  ret      4: ldr w0, c32;  ret
+ *    6: mrs x0, PMCCNTR_EL0;  ret
+ *    8: c64: .quad 0x8877665544332211     10: c32: .word 0x80000001     11: .word 0x7f81f00d
+ *   12: str w0, [x1];  ret                14: .word 0x0badc0de, 0
+ */
+static const u32 tpl_read[] = {K(0x58000100), K(I_RET),     K(0x98000100),       K(I_RET),
+                               K(0x180000c0), K(I_RET),     K(I_MRS_X0_PMCCNTR), K(I_RET),
+                               K(0x44332211), K(0x88776655), K(0x80000001),      K(0x7f81f00d),
+                               K(0xb9000020), K(I_RET),     K(0x0badc0de),       K(0)};
+#define READ_LDR64  0
+#define READ_LDRSW  2
+#define READ_LDR32  4
+#define READ_ACCESS 6
+#define READ_C64    8
+#define READ_C32    10
+#define READ_BYTES  11
+#define READ_STORE  12
+#define READ_SPARE  14
+#define C64         0x8877665544332211UL
+
+/* The transmit register of the UART, from its base in the image header (sgitest-head.S) */
+#define UTXH 0x20
+extern u64 hdr_uart_base;
 
 /* What hv_pmu.c makes of an access (the layout of the immediate is in its header comment) */
 static u32 replaced(u32 insn)
@@ -541,6 +569,74 @@ static void test_el0_read(void)
     result("...and the read is as expected afterwards", as_expected(pg, K(I_MRS_X0_PMCCNTR)));
 }
 
+/*
+ * Under the hypervisor each of these is an hvc, and so an entry to EL2 that takes its lock.
+ * A page that the hypervisor has made readable for one instruction is execute-only again at
+ * the second such entry (the count of reads, src/hv/hv_xtrack.c).
+ */
+static void two_entries(void)
+{
+    read_sysreg(pmcr_el0);
+    read_sysreg(pmcr_el0);
+}
+
+/*
+ * Code and constants in one page, read by the code itself and from elsewhere. Without the
+ * count of reads the page is readable and this is plain; with it the page is execute-only
+ * once it has run, and every read below is the hypervisor's doing.
+ */
+static void test_read_code(void)
+{
+    u32 *pg = page(PG_READ);
+
+    EMIT(pg, tpl_read);
+    u64 a = call0(pg + READ_ACCESS);
+    spin(1000);
+    u64 b = call0(pg + READ_ACCESS);
+    result("a page of code with an access and constants: the access works", b > a);
+
+    result("its code reads a 64-bit constant of the page", call0(pg + READ_LDR64) == C64);
+    result("...a 32-bit one, sign-extended", call0(pg + READ_LDRSW) == 0xffffffff80000001UL);
+    result("...and a 32-bit one into a 32-bit register", call0(pg + READ_LDR32) == 0x80000001UL);
+
+    u64 v1 = *(volatile u8 *)(pg + READ_BYTES);
+    u64 v2 = *(volatile unsigned short *)(pg + READ_BYTES);
+    u64 v4 = *(volatile u32 *)(pg + READ_C32);
+    u64 v8 = *(volatile u64 *)(pg + READ_C64);
+    result("code elsewhere reads 1, 2, 4 and 8 bytes of it",
+           v1 == 0x0d && v2 == 0xf00d && v4 == 0x80000001 && v8 == C64);
+
+    long s1 = *(volatile signed char *)((u8 *)(pg + READ_BYTES) + 2);
+    long s2 = *(volatile short *)(pg + READ_BYTES);
+    long s4 = *(volatile int *)(pg + READ_C32);
+    result("...and 1, 2 and 4 bytes sign-extended", s1 == -127 && s2 == -4083 && s4 == -2147483647);
+
+    /* At the first byte of a page the access may have begun in the page before */
+    u64 first = *(volatile u64 *)pg;
+    result("...and the first 8 bytes of the page", first == (((u64)U(K(I_RET)) << 32) | 0x58000100));
+
+    /* A pair: the syndrome does not describe it */
+    u64 lo, hi;
+    two_entries();
+    asm volatile("ldp %0, %1, [%2]" : "=&r"(lo), "=&r"(hi) : "r"(pg + READ_C64) : "memory");
+    result("...and two registers at once", lo == C64 && hi == 0x7f81f00d80000001UL);
+    two_entries();
+    result("the access read as data is as expected",
+           as_expected(pg + READ_ACCESS, K(I_MRS_X0_PMCCNTR)));
+
+    /* A store from elsewhere makes the page writable; it is scanned when it next runs */
+    two_entries();
+    pg[READ_SPARE] = 0x600dc0de;
+    result("a store into it from elsewhere arrives", *(volatile u32 *)(pg + READ_SPARE) == 0x600dc0de);
+    result("...and its code reads the constant again", call0(pg + READ_LDR64) == C64);
+
+    /* The hypervisor has to read the instruction to carry out the store: from a page like this */
+    line("     a character written by code in that page: ");
+    ((fn2)(pg + READ_STORE))('Y', hdr_uart_base + UTXH);
+    put("\n");
+    result("its code writes to a device register", 1);
+}
+
 static void test_timing(void)
 {
     u64 freq = read_sysreg(cntfrq_el0);
@@ -602,6 +698,7 @@ void boot_main(void)
     test_open_page();
     test_el0();
     test_el0_read();
+    test_read_code();
     test_timing();
     test_untouched();
 

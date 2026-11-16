@@ -558,6 +558,17 @@ static void test_m4(void)
               s2_walk(0x10100006000).xn == 0,
           "an execute-only page: S2AP %ld and XN %d in the descriptor",
           s2_walk(0x10100006000).attr >> 6 & 3, s2_walk(0x10100006000).xn);
+    /* Where EL2 reads an instruction of the guest: in such a page too, to the byte */
+    check(hv_translate_insn(0x10100006a4a) == 0x10100006a4a &&
+              hv_translate_insn(0x10100005ffd) == 0x10100005ffd &&
+              hv_translate_insn(0x1000000127) == 0x1000000127,
+          "hv_translate_insn() in an execute-only page, a read-only page and a block: 0x%lx "
+          "0x%lx 0x%lx",
+          hv_translate_insn(0x10100006a4a), hv_translate_insn(0x10100005ffd),
+          hv_translate_insn(0x1000000127));
+    check(hv_translate_insn(0x5000000000) == 0 && hv_translate_insn(0x103dc000000) == 0 &&
+              hv_translate_insn(1UL << 43) == 0,
+          "hv_translate_insn() finds an instruction in a hook, a hole or past the end");
     t_set_scanned(0x10100006000, HV_XPAGE_SCANNED);
     t_set_scanned(0x10100006000, HV_XPAGE_XONLY);
     t_set_scanned(0x10100006000, HV_XPAGE_UNSCANNED);

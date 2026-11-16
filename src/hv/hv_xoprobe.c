@@ -113,6 +113,11 @@ int hv_xoprobe_enable(void)
         printf("HV: execute-only probe: execution is not tracked\n");
         return -1;
     }
+    /* Then the execute-only pages are those of the count (hv_xtrack.c) */
+    if (hv_xtrack_counts_reads()) {
+        printf("HV: execute-only probe: not while reads are counted\n");
+        return -1;
+    }
     xo_enabled = true;
     printf("HV: execute-only probe: on\n");
     return 0;

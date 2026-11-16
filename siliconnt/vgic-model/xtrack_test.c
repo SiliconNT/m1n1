@@ -3,6 +3,8 @@
  * Host-side model test for src/hv/hv_xtrack.c: which page is scanned, and which page changes
  * state, when the guest executes or writes somewhere. And for src/hv/hv_xoprobe.c: what the
  * calls of the execute-only probe answer, and what becomes of a data abort while it is on.
+ * And for the count of reads in hv_xtrack.c: which pages become execute-only, what a read of
+ * one gives the guest, and when a page that was lent is taken back.
  *
  * The guest (Windows) has 4 KB pages. A page that runs is scanned and the accesses to PMUv3
  * registers in it are replaced (the real src/hv/hv_pmu.c, linked in). The pages next to it
@@ -21,7 +23,9 @@
 #include "hv_xpage.h" /* HV_XPAGE_* and HV_XTRACK_* of the real hv.h, see the Makefile */
 #include "smp.h"
 
-#define mrs(reg)  0UL
+/* The registers the two files read: the count and rate of the timer, and HPFAR_EL2 */
+static u64 test_CNTPCT_EL0, test_CNTFRQ_EL0, test_HPFAR_EL2;
+#define mrs(reg)  (test_##reg)
 #define sysop(op) ((void)0)
 
 #define ARENA_IPA 0x10100000000UL
@@ -35,6 +39,7 @@ static u32 arena[NR_PAGES * WORDS] __attribute__((aligned(0x4000)));
 static int state[NR_PAGES];
 static u64 test_esr, test_far;
 static bool test_xtrack_on = true;
+static u64 test_spsr = 5; /* EL1h */
 
 static void dc_cvau_range(void *addr, size_t size)
 {
@@ -58,7 +63,7 @@ static u64 hv_get_far(void)
 
 static u64 hv_get_spsr(void)
 {
-    return 5; /* EL1h */
+    return test_spsr;
 }
 
 static u64 hv_translate(u64 addr, bool s1, bool w, u64 *par_out)
@@ -102,6 +107,7 @@ static int hv_pt_set_scanned(u64 ipa, int st)
 }
 
 void hv_xtrack_close(void);
+bool hv_xtrack_counts_reads(void);
 
 #include "hv_xoprobe.inc"
 #include "hv_xtrack.inc"
@@ -327,6 +333,276 @@ static void test_xoprobe(void)
           "one disarmed and another armed: states %d and %d", state[1], state[4]);
 }
 
+/* ---- the count of reads of pages with replaced instructions ---- */
+
+#define I_NOP 0xd503201f
+
+/* ESR_EL2 of a load that the syndrome describes: 1 << sas bytes into register rt */
+static u64 syn(int sas, bool sse, int rt, bool sf)
+{
+    return 0x9200000f | BIT(24) | ((u64)sas << 22) | (sse ? BIT(21) : 0) | ((u64)rt << 16) |
+           (sf ? BIT(15) : 0);
+}
+
+/* A load that ESR_EL2 does not describe: a pair, say */
+#define NOSYN 0x9200000fUL
+
+static struct exc_info rd;
+
+/* A load at ipa by the instruction at pc, with this ESR_EL2. The registers are in rd */
+static int xo_load(u64 ipa, u64 pc, u64 esr)
+{
+    for (int i = 0; i < 32; i++)
+        rd.regs[i] = 0x5a5a000000000000UL + i;
+    rd.cpu_id = 0;
+    rd.elr = pc;
+    test_esr = esr;
+    test_far = ipa;
+    return hv_xtrack_dabort(&rd, ipa, false);
+}
+
+static u8 *bytes(int page)
+{
+    return (u8 *)&arena[page * WORDS];
+}
+
+static void test_count_reads(void)
+{
+    hv_pmu_init();
+    hv_xtrack_init();
+    hv_xoprobe_init();
+    test_CNTFRQ_EL0 = 1000;
+    test_CNTPCT_EL0 = 0;
+    for (int n = 0; n < NR_PAGES; n++) {
+        state[n] = HV_XPAGE_UNSCANNED;
+        for (int i = 0; i < WORDS; i++)
+            arena[n * WORDS + i] = I_NOP;
+    }
+    /* Pages 2 and 3 have an access each, page 4 a read of CNTVCT_EL0 of the guest's own */
+    arena[2 * WORDS + 6] = MRS_PMCCNTR | 3;
+    arena[3 * WORDS + 6] = MRS_PMCCNTR | 4;
+    arena[4 * WORDS + 6] = MRS_CNTVCT | 5;
+    arena[2 * WORDS + 8] = 0x44332211;
+    arena[2 * WORDS + 9] = 0x88776655;
+    arena[2 * WORDS + 10] = 0x80000001;
+    arena[2 * WORDS + 11] = 0x7f81f00d;
+
+    /* Said off, nothing is different: a page with an access becomes read-only */
+    check(!hv_xtrack_counts_reads() && iabort(IPA(3, 0)) && state[3] == HV_XPAGE_SCANNED &&
+              load(IPA(3, 8), IPA(1, 0)) == HV_XTRACK_NONE,
+          "reads are counted before anybody said so: state %d", state[3]);
+    state[3] = HV_XPAGE_UNSCANNED;
+    arena[3 * WORDS + 6] = MRS_PMCCNTR | 4;
+
+    hv_xtrack_count_reads(true);
+    hv_xtrack_init();
+    check(hv_xtrack_counts_reads(), "hv_xtrack_init() turned the count off");
+    check(hv_xoprobe_enable() < 0, "the probe can be turned on while reads are counted");
+
+    /* Which pages */
+    check(iabort(IPA(1, 0)) && state[1] == HV_XPAGE_SCANNED,
+          "a page with nothing to replace: state %d", state[1]);
+    check(iabort(IPA(4, 0)) && state[4] == HV_XPAGE_SCANNED,
+          "a page with a read of CNTVCT_EL0 that was never replaced: state %d", state[4]);
+    check(iabort(IPA(2, 0)) && state[2] == HV_XPAGE_XONLY &&
+              arena[2 * WORDS + 6] == (MRS_CNTVCT | 3),
+          "a page with an access: state %d, the access now 0x%08x", state[2],
+          arena[2 * WORDS + 6]);
+    check(rc_stats.armed == 1 && rc_stats.armed_max == 1 && rc_page(IPA(2, 0), false) &&
+              rc_page(IPA(2, 0), false)->arms == 1 && !rc_page(IPA(1, 0), false),
+          "one page is execute-only: %lu now, %lu at most", rc_stats.armed, rc_stats.armed_max);
+    check(iabort(IPA(2, 4)) && state[2] == HV_XPAGE_XONLY,
+          "an instruction abort on the execute-only page: state %d", state[2]);
+
+    /* Loads that ESR_EL2 describes are carried out, and the page stays as it is */
+    check(xo_load(IPA(2, 8), IPA(1, 3), syn(3, false, 5, true)) == HV_XTRACK_SKIP &&
+              rd.regs[5] == 0x8877665544332211UL && rd.regs[4] == 0x5a5a000000000004UL &&
+              state[2] == HV_XPAGE_XONLY,
+          "8 bytes into x5: 0x%lx, state %d", rd.regs[5], state[2]);
+    check(xo_load(IPA(2, 10), IPA(1, 3), syn(2, true, 0, true)) == HV_XTRACK_SKIP &&
+              rd.regs[0] == 0xffffffff80000001UL,
+          "4 bytes, sign-extended into x0: 0x%lx", rd.regs[0]);
+    check(xo_load(IPA(2, 10), IPA(1, 3), syn(2, false, 30, false)) == HV_XTRACK_SKIP &&
+              rd.regs[30] == 0x80000001UL,
+          "4 bytes into w30: 0x%lx", rd.regs[30]);
+    check(xo_load(IPA(2, 11) + 2, IPA(1, 3), syn(0, true, 7, false)) == HV_XTRACK_SKIP &&
+              rd.regs[7] == 0xffffff81UL,
+          "1 byte, sign-extended into w7: 0x%lx", rd.regs[7]);
+    check(xo_load(IPA(2, 11) + 3, IPA(1, 3), syn(0, true, 7, true)) == HV_XTRACK_SKIP &&
+              rd.regs[7] == 0x7f,
+          "1 byte that is not negative, sign-extended into x7: 0x%lx", rd.regs[7]);
+    check(xo_load(IPA(2, 11), IPA(1, 3), syn(1, true, 8, true)) == HV_XTRACK_SKIP &&
+              rd.regs[8] == 0xfffffffffffff00dUL,
+          "2 bytes, sign-extended into x8: 0x%lx", rd.regs[8]);
+    check(xo_load(IPA(2, 11), IPA(1, 3), syn(1, false, 8, false)) == HV_XTRACK_SKIP &&
+              rd.regs[8] == 0xf00d,
+          "2 bytes into w8: 0x%lx", rd.regs[8]);
+    check(xo_load(IPA(2, 8), IPA(1, 3), syn(3, false, 31, true)) == HV_XTRACK_SKIP &&
+              rd.regs[31] == 0x5a5a00000000001fUL,
+          "8 bytes into the zero register: slot 31 is now 0x%lx", rd.regs[31]);
+    /* What is in the page now, the replaced instruction included */
+    check(xo_load(IPA(2, 6), IPA(1, 3), syn(2, false, 1, false)) == HV_XTRACK_SKIP &&
+              rd.regs[1] == (MRS_CNTVCT | 3),
+          "the replaced instruction read as data: 0x%lx", rd.regs[1]);
+    /* The last 8 bytes of the page, and its first byte */
+    bytes(2)[0xfff] = 0xc3;
+    bytes(2)[0] = 0x3c;
+    check(xo_load(IPA(2, 1022), IPA(1, 3), syn(3, false, 2, true)) == HV_XTRACK_SKIP &&
+              rd.regs[2] >> 56 == 0xc3 && state[2] == HV_XPAGE_XONLY,
+          "the last 8 bytes of the page: 0x%lx", rd.regs[2]);
+    check(xo_load(IPA(2, 0), IPA(1, 3), syn(0, false, 2, false)) == HV_XTRACK_SKIP &&
+              rd.regs[2] == 0x3c,
+          "the first byte of the page: 0x%lx", rd.regs[2]);
+    check(rc_stats.reads == 11 && rc_stats.carried == 11 && rc_stats.lent == 0 &&
+              rc_stats.same == 0 && rc_stats.el0 == 0 && rc_page(IPA(2, 0), false)->reads == 11,
+          "11 reads carried out: %lu counted, %lu carried out, %lu for the page", rc_stats.reads,
+          rc_stats.carried, rc_page(IPA(2, 0), false)->reads);
+
+    /* By instruction, by where it came from, by time */
+    check(rc_pc(IPA(1, 3))->reads == 11 && rc_pc(IPA(1, 3))->flags == RC_PC_CARRIED &&
+              rc_pc(IPA(1, 3))->far == IPA(2, 0) &&
+              rc_pc(IPA(1, 3))->esr == syn(0, false, 2, false),
+          "the instruction in page 1: %lu reads, flags %u", rc_pc(IPA(1, 3))->reads,
+          rc_pc(IPA(1, 3))->flags);
+    test_spsr = 0; /* EL0t */
+    test_CNTPCT_EL0 = 12 * 1000;
+    check(xo_load(IPA(2, 8), IPA(2, 0), syn(3, false, 0, true)) == HV_XTRACK_SKIP &&
+              rc_stats.el0 == 1 && rc_stats.same == 1 &&
+              rc_pc(IPA(2, 0))->flags == (RC_PC_CARRIED | RC_PC_EL0 | RC_PC_SAME) &&
+              rc_slots[0].carried == 11 && rc_slots[2].carried == 1,
+          "a read at EL0 of the page the instruction is in, 12 s into the run: flags %u, slots "
+          "%u %u",
+          rc_pc(IPA(2, 0))->flags, rc_slots[0].carried, rc_slots[2].carried);
+    test_spsr = 5;
+    test_CNTPCT_EL0 = (u64)RC_SLOTS * RC_SLOT_SECONDS * 1000;
+    check(xo_load(IPA(2, 8), IPA(1, 3), syn(3, false, 0, true)) == HV_XTRACK_SKIP &&
+              rd.regs[0] == 0x8877665544332211UL && rc_stats.late == 1,
+          "a read after the last slot is carried out and counted as late: %lu", rc_stats.late);
+    test_CNTPCT_EL0 = 0;
+
+    /* What ESR_EL2 does not describe: the page is lent, and taken back two entries later */
+    check(xo_load(IPA(2, 8), IPA(1, 5), NOSYN) == HV_XTRACK_RETRY &&
+              state[2] == HV_XPAGE_SCANNED && rd.regs[0] == 0x5a5a000000000000UL &&
+              rc_stats.lent == 1 && rc_stats.lent_nosyn == 1 &&
+              rc_pc(IPA(1, 5))->flags == RC_PC_LENT && rc_slots[0].lent == 1,
+          "a load without a syndrome: state %d", state[2]);
+    hv_xtrack_close();
+    check(state[2] == HV_XPAGE_SCANNED && rc_stats.rearmed == 0,
+          "the lent page is taken back at the next entry: state %d", state[2]);
+    hv_xtrack_close();
+    check(state[2] == HV_XPAGE_XONLY && rc_stats.rearmed == 1 && rc_stats.armed == 1 &&
+              rc_page(IPA(2, 0), false)->arms == 1,
+          "the lent page is not taken back at the entry after: state %d", state[2]);
+
+    /* An access that may have begun in the page before, or goes on into the next */
+    check(xo_load(IPA(2, 0), IPA(1, 3), syn(3, false, 2, true)) == HV_XTRACK_RETRY &&
+              state[2] == HV_XPAGE_SCANNED && rc_stats.lent_edge == 1,
+          "8 bytes at the first byte of the page: state %d", state[2]);
+    hv_xtrack_close();
+    hv_xtrack_close();
+    check(xo_load(IPA(2, 1023), IPA(1, 3), syn(3, false, 2, true)) == HV_XTRACK_RETRY &&
+              state[2] == HV_XPAGE_SCANNED && rc_stats.lent_edge == 2,
+          "8 bytes from the last 4 of the page: state %d", state[2]);
+    hv_xtrack_close();
+    hv_xtrack_close();
+    check(state[2] == HV_XPAGE_XONLY, "page 2 is not execute-only again: state %d", state[2]);
+
+    /* One instruction that reads two such pages gets both */
+    check(iabort(IPA(3, 0)) && state[3] == HV_XPAGE_XONLY && rc_stats.armed == 2,
+          "page 3 runs: state %d", state[3]);
+    check(xo_load(IPA(2, 1023), IPA(1, 9), NOSYN) == HV_XTRACK_RETRY, "a pair across two pages");
+    hv_xtrack_close();
+    check(xo_load(IPA(3, 0), IPA(1, 9), NOSYN) == HV_XTRACK_RETRY &&
+              state[2] == HV_XPAGE_SCANNED && state[3] == HV_XPAGE_SCANNED,
+          "the second page of the pair: states %d and %d", state[2], state[3]);
+    hv_xtrack_close();
+    check(state[2] == HV_XPAGE_XONLY && state[3] == HV_XPAGE_SCANNED,
+          "one entry later: states %d and %d", state[2], state[3]);
+    hv_xtrack_close();
+    check(state[3] == HV_XPAGE_XONLY && rc_stats.armed == 2 && rc_stats.armed_max == 2,
+          "two entries later: state %d", state[3]);
+
+    /* More pages lent than there is room for: the oldest goes back */
+    for (int i = 0; i < RC_MAX_LENT + 3; i++) {
+        state[3] = HV_XPAGE_XONLY;
+        xo_load(IPA(3, 8), IPA(1, 9), NOSYN);
+    }
+    check(rc_nr_lent == RC_MAX_LENT && state[3] == HV_XPAGE_SCANNED,
+          "%d pages lent at once: %u on the list", RC_MAX_LENT + 3, rc_nr_lent);
+    hv_xtrack_close();
+    hv_xtrack_close();
+    check(rc_nr_lent == 0 && state[3] == HV_XPAGE_XONLY, "the list is not empty: %u", rc_nr_lent);
+
+    /* A store from elsewhere: writable, as for a read-only page, and when it runs again... */
+    u64 arms = rc_page(IPA(2, 0), false)->arms;
+    check(store(IPA(2, 8), IPA(1, 0)) == HV_XTRACK_RETRY && state[2] == HV_XPAGE_UNSCANNED &&
+              rc_stats.armed == 1 && rc_stats.writable == 1,
+          "a store into the execute-only page 2 from page 1: state %d", state[2]);
+    check(iabort(IPA(2, 0)) && state[2] == HV_XPAGE_XONLY && rc_stats.armed == 2 &&
+              rc_page(IPA(2, 0), false)->arms == arms + 1,
+          "...execute-only again, though nothing was replaced this time: state %d", state[2]);
+    /* ...unless what was replaced is gone */
+    check(store(IPA(2, 6), IPA(1, 0)) == HV_XTRACK_RETRY, "a second store into page 2");
+    arena[2 * WORDS + 6] = I_NOP;
+    check(iabort(IPA(2, 0)) && state[2] == HV_XPAGE_SCANNED && rc_stats.armed == 1,
+          "page 2 with the replaced instruction overwritten: state %d", state[2]);
+    check(xo_load(IPA(2, 8), IPA(1, 3), syn(3, false, 5, true)) == HV_XTRACK_NONE,
+          "a load from page 2, which is readable, is taken for one that is counted");
+
+    /* A lent page that is written to is not taken back */
+    check(xo_load(IPA(3, 8), IPA(1, 9), NOSYN) == HV_XTRACK_RETRY &&
+              store(IPA(3, 8), IPA(1, 0)) == HV_XTRACK_RETRY && state[3] == HV_XPAGE_UNSCANNED,
+          "page 3 lent and then written to: state %d", state[3]);
+    u64 rearmed = rc_stats.rearmed;
+    hv_xtrack_close();
+    hv_xtrack_close();
+    check(state[3] == HV_XPAGE_UNSCANNED && rc_stats.rearmed == rearmed && rc_stats.armed == 0,
+          "...and is taken back all the same: state %d", state[3]);
+
+    /* A store from within: carried out by EL2, and the page is what the scan after it says */
+    check(iabort(IPA(3, 0)) && state[3] == HV_XPAGE_XONLY, "page 3 runs again");
+    check(store(IPA(3, 8), IPA(3, 0)) == HV_XTRACK_EMULATE && state[3] == HV_XPAGE_XONLY,
+          "a store into the execute-only page 3 from within: state %d", state[3]);
+    hv_xtrack_stored(IPA(3, 8));
+    check(state[3] == HV_XPAGE_XONLY, "...after which its state is %d", state[3]);
+    arena[3 * WORDS + 6] = I_NOP;
+    hv_xtrack_stored(IPA(3, 6));
+    check(state[3] == HV_XPAGE_SCANNED && rc_stats.armed == 0,
+          "a store from within that overwrites the replaced instruction: state %d", state[3]);
+    check(store(IPA(1, 5), IPA(1, 0)) == HV_XTRACK_EMULATE, "a store into page 1 from within");
+    arena[1 * WORDS + 5] = MRS_PMCCNTR | 9;
+    hv_xtrack_stored(IPA(1, 5));
+    check(state[1] == HV_XPAGE_XONLY && arena[1 * WORDS + 5] == (MRS_CNTVCT | 9) &&
+              rc_stats.armed == 1,
+          "a store from within that writes an access into page 1: state %d", state[1]);
+
+    /* A page opened for a store EL2 cannot carry out is execute-only again when it is closed */
+    arms = rc_page(IPA(1, 0), false)->arms;
+    check(hv_xtrack_open(IPA(1, 8), 0x28810520) && state[1] == HV_XPAGE_OPEN, "page 1 opened");
+    hv_xtrack_close();
+    check(state[1] == HV_XPAGE_XONLY && rc_page(IPA(1, 0), false)->arms == arms &&
+              rc_stats.armed == 1,
+          "page 1 closed: state %d", state[1]);
+
+    /* No room in the table: the page stays readable, and that is counted */
+    for (u32 i = 0; i < RC_MAX_PAGES; i++)
+        if (!rc_pages[i].page)
+            rc_pages[i].page = 0x7000000000UL + i * 0x1000UL;
+    arena[5 * WORDS + 6] = MRS_PMCCNTR | 1;
+    check(iabort(IPA(5, 0)) && state[5] == HV_XPAGE_SCANNED && rc_stats.pages_lost == 1 &&
+              arena[5 * WORDS + 6] == (MRS_CNTVCT | 1),
+          "a page with an access and no room in the table: state %d, %lu lost", state[5],
+          rc_stats.pages_lost);
+
+    /* Said off again */
+    hv_xtrack_count_reads(false);
+    hv_xtrack_init();
+    state[6] = HV_XPAGE_UNSCANNED;
+    arena[6 * WORDS + 6] = MRS_PMCCNTR | 2;
+    check(iabort(IPA(6, 0)) && state[6] == HV_XPAGE_SCANNED && hv_xoprobe_enable() == 0,
+          "the count said off: state %d", state[6]);
+}
+
 int main(void)
 {
     struct exc_info ctx = {.cpu_id = 0};
@@ -385,6 +661,7 @@ int main(void)
           "a translation fault on page 1 is taken for a first execution");
 
     test_xoprobe();
+    test_count_reads();
 
     printf("xtrack-model: %lu checks, %lu failed\n", checks, failures);
     if (failures)
