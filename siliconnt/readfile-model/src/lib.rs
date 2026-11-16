@@ -176,10 +176,15 @@ mod tests {
     /// bytes at a time, in turns: with a piece smaller than the files, their clusters end up
     /// between each other's.
     fn insert_disk(files: &[(&str, &[u8])], piece: usize) {
-        insert_disk_of(PART_SECTORS, files, piece)
+        insert_disk_of(PART_SECTORS, 1, files, piece)
     }
 
-    fn insert_disk_of(part_sectors: usize, files: &[(&str, &[u8])], piece: usize) {
+    fn insert_disk_of(
+        part_sectors: usize,
+        cluster_sectors: usize,
+        files: &[(&str, &[u8])],
+        piece: usize,
+    ) {
         let mut disk = vec![0u8; (PART_LBA + part_sectors) * SECTOR];
 
         // The header in LBA 1, the entries from LBA 2. Entry 1 is left empty
@@ -205,7 +210,7 @@ mod tests {
             };
             let options = FormatVolumeOptions::new()
                 .bytes_per_sector(SECTOR as u16)
-                .bytes_per_cluster(SECTOR as u32)
+                .bytes_per_cluster((cluster_sectors * SECTOR) as u32)
                 .fat_type(fatfs::FatType::Fat32);
             fatfs::format_volume(&mut volume, options).unwrap();
             volume.pos = 0;
@@ -457,6 +462,7 @@ mod tests {
         let bootdisk = contents(673_185_792, 16);
         insert_disk_of(
             262144,
+            1,
             &[
                 ("siliconnt/firmware.fd", &firmware),
                 ("siliconnt/bootdisk.img", &bootdisk),
@@ -476,6 +482,40 @@ mod tests {
             size.div_ceil(SECTOR),
             reads(),
             SECTOR
+        );
+    }
+
+    /// `make big`: it fills 6 GB of memory
+    #[test]
+    #[ignore]
+    fn a_file_the_size_of_the_boot_disk_in_clusters_of_8_sectors() {
+        // The same two files in a partition of 4 GiB whose clusters are 32 KiB, 8 sectors
+        // each: what `newfs_msdos -F 32 -c 8` is asked for on the M4
+        const CLUSTER_SECTORS: usize = 8;
+        let firmware = contents(31_457_280, 17);
+        let bootdisk = contents(673_185_792, 18);
+        insert_disk_of(
+            1_048_576,
+            CLUSTER_SECTORS,
+            &[
+                ("siliconnt/firmware.fd", &firmware),
+                ("siliconnt/bootdisk.img", &bootdisk),
+            ],
+            WHOLE,
+        );
+        let mut dest = vec![UNTOUCHED; bootdisk.len() + SECTOR];
+
+        let size = read_file(PART_UUID, "siliconnt/bootdisk.img", &mut dest).unwrap();
+
+        assert_eq!(size, bootdisk.len());
+        assert!(dest[..size] == bootdisk[..]);
+        assert!(dest[size..].iter().all(|&b| b == UNTOUCHED));
+        println!(
+            "{} bytes, {} sectors, in {} calls of nvme_read() with clusters of {} bytes",
+            size,
+            size.div_ceil(SECTOR),
+            reads(),
+            CLUSTER_SECTORS * SECTOR
         );
     }
 
