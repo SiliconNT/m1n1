@@ -87,7 +87,9 @@ def make_fakes(case):
                                 # --loader m1n1
                                 selfboot=None, selfboot_sent=0.0, selfboot_done=False, interrupts=[],
                                 timeout_at_entry="not entered", debugger_at_entry=None,
-                                pt_walks=[], heap_reads=[], context_fault=None, image_base=None)
+                                pt_walks=[], heap_reads=[], context_fault=None, image_base=None,
+                                # --bugcheck: what rec.stopped was at each read of guest memory
+                                guest_reads=[])
     heap_top = case.get("heap_top", M4["heap_top"])
 
     def stage2(addr):
@@ -148,6 +150,11 @@ def make_fakes(case):
                     if len(rec.readbacks) == case.get("bad_readback"):
                         data[-1] ^= 1
                     return bytes(data)
+            # --bugcheck: memory of the guest as the case has it, (first, after last, read)
+            first, top, read = case.get("guest_mem", (0, 0, None))
+            if first <= addr < top:
+                rec.guest_reads.append(rec.stopped)
+                return read(addr, size)
             off = addr - M4["m1n1_base"]
             data = m1n1_image[off:off + size]
             return case.get("version", data)
@@ -249,7 +256,10 @@ def make_fakes(case):
                 sysreg.SCTLR_EL12: case.get("sctlr_el1", 0x30d50980),
                 sysreg.CPACR_EL12: 0,
             }
+            self.regs.update(case.get("regs", {}))
         def mrs(self, reg):
+            if reg in case.get("mrs_fails", ()):
+                raise RuntimeError("the proxy did not answer")
             return self.regs.get(reg, 0)
         def compressed_writemem(self, dest, data, progress=None):
             # The real one sends a gzip stream and has m1n1 unpack it at dest. m1n1 compares
@@ -1170,6 +1180,88 @@ rec, out, code = run({}, "--seconds", "1", "--disk", disk_path, *image_args)
 check("without --loader the host loads, and m1n1 is not asked to",
       code == 0 and rec.hv_inited and rec.hv_start == (IMAGE_BASE, BOOTARGS) and
       rec.selfboot is None and rec.pt_walks == [] and rec.heap_reads == [])
+
+# ---- --bugcheck: what Windows recorded of a bug check, read before the guest is left ----
+
+from test_bugcheck import windows_model
+
+def windows(model, **case):
+    """The fake target with the model's memory as part of guest RAM, and the guest's three
+    registers that say where the kernel and its tables are."""
+    assert M4["heap_top"] <= model.ram[0] and model.ram[1] <= MEM_TOP
+    return {"guest_mem": (*model.ram, model.read_phys),
+            "regs": {sysreg.VBAR_EL12: model.regs["VBAR_EL1"],
+                     sysreg.TTBR1_EL12: model.regs["TTBR1_EL1"],
+                     sysreg.TCR_EL12: model.regs["TCR_EL1"]}, **case}
+
+RECORDED = "==== what Windows recorded of a bug check ===="
+with tempfile.TemporaryDirectory() as bc_tmp:
+    # 46. both loaders: the guest has reset itself after a bug check
+    for loader, extra in (("host", ()), ("m1n1", M1N1)):
+        model = windows_model()
+        out_dir = pathlib.Path(bc_tmp) / loader
+        rec, out, code = run(windows(model, stop_code="GUEST_RESET"), *extra, "--seconds", "30",
+                             "--bugcheck", str(out_dir), *image_args)
+        check(f"--bugcheck, {loader} loader: the code and the parameters are printed",
+              code == 0 and "Bug check 0x109" in out and
+              f"parameter 3 = 0x{model.parameters[2]:x}  (stor port.sys + 0x1234)" in out and
+              "parameter 4 = 0x1" in out, f"{code!r} {tty(out)[-1500:]}")
+        check(f"--bugcheck, {loader} loader: after the reason of the stop, before the guest is left",
+              -1 < out.find("Run ended: the guest called PSCI SYSTEM_RESET") < out.find(RECORDED)
+              < out.find("Hypervisor exited.") and rec.guest_reads and
+              set(rec.guest_reads) == {None} and rec.stopped == "EXIT_GUEST",
+              f"{set(rec.guest_reads)} {rec.stopped}")
+        names = sorted(p.name for p in out_dir.iterdir()) if out_dir.exists() else None
+        check(f"--bugcheck, {loader} loader: the files are in the directory",
+              names == ["bugcheck.json", "ntoskrnl.exe.mem", "parameter_1.mem", "stor_port.sys.mem"],
+              f"{names}")
+        check(f"--bugcheck, {loader} loader: how long the guest ran is said",
+              re.search(r"^The guest ran for \d+\.\d s$", out, re.M) is not None, tty(out)[-1500:])
+
+        # 47. stopped by hand, no bug check
+        model = windows_model(code=None)
+        out_dir = pathlib.Path(bc_tmp) / (loader + "-none")
+        rec, out, code = run(windows(model, guest=ctrl_c), *extra, "--seconds", "0",
+                             "--bugcheck", str(out_dir), *image_args)
+        check(f"--bugcheck, {loader} loader: stopped by Ctrl-C with no bug check recorded: said",
+              code == 0 and rec.stopped == "EXIT_GUEST" and
+              "No bug check recorded" in out and "Hypervisor exited." in out, tty(out)[-1500:])
+
+        # 48. the guest is still in the firmware: its registers are not the kernel's
+        out_dir = pathlib.Path(bc_tmp) / (loader + "-fw")
+        rec, out, code = run({"stop_code": "GUEST_RESET"}, *extra, "--seconds", "30",
+                             "--bugcheck", str(out_dir), *image_args)
+        check(f"--bugcheck, {loader} loader: a guest that is not in the Windows kernel: said, "
+              "nothing read, the guest left",
+              code == 0 and rec.stopped == "EXIT_GUEST" and rec.guest_reads == [] and
+              "the guest is not in the Windows kernel" in out, tty(out)[-1500:])
+
+        # 49. reading fails in a way the reader does not expect: the event is answered all the same
+        model = windows_model()
+        out_dir = pathlib.Path(bc_tmp) / (loader + "-broken")
+        rec, out, code = run(windows(model, stop_code="GUEST_RESET",
+                                     mrs_fails=(sysreg.TTBR1_EL12,)), *extra, "--seconds", "30",
+                             "--bugcheck", str(out_dir), *image_args)
+        check(f"--bugcheck, {loader} loader: a failure while reading does not keep the script "
+              "from leaving the guest",
+              code == 0 and rec.stopped == "EXIT_GUEST" and "Hypervisor exited." in out and
+              "PROBLEM: what Windows recorded of a bug check was not read (RuntimeError: the "
+              "proxy did not answer)" in out, f"{code!r} {tty(out)[-1500:]}")
+
+        # 50. without the option nothing of this happens
+        model = windows_model()
+        rec, out, code = run(windows(model, stop_code="GUEST_RESET"), *extra, "--seconds", "30",
+                             *image_args)
+        check(f"without --bugcheck, {loader} loader: guest memory is not read",
+              code == 0 and rec.guest_reads == [] and RECORDED not in out)
+
+    # 51. m1n1 itself in trouble: nothing is read either
+    model = windows_model()
+    rec, out, code = run(windows(model, stop_reason="HV", stop_code="PANIC"), *M1N1,
+                         "--seconds", "30", "--bugcheck", str(pathlib.Path(bc_tmp) / "panic"),
+                         *image_args)
+    check("--bugcheck, m1n1 loader: when m1n1 itself is in trouble, nothing more is asked of it",
+          isinstance(code, str) and rec.guest_reads == [] and RECORDED not in out, f"{code!r}")
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)

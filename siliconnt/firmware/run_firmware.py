@@ -84,11 +84,19 @@ run, and the "Run ended:" line says that the guest would have hung there. The on
 that is expected is the one the script asks for, by the timer or Ctrl-C. After the guest
 has been left the script reports how far the top of m1n1's heap has moved, and looks up in
 the stage 2 tables whether what m1n1 mapped is what it was to map.
+
+With --bugcheck the script looks, when the guest has stopped and before it leaves it, for
+what the Windows kernel has recorded of a bug check: the stop code and its four parameters,
+which without a kernel debugger appear nowhere else. It prints them and writes the memory
+they may be about to the directory given (bugcheck.py). This is the same with both loaders.
 """
 import sys, os, pathlib, argparse, signal, struct, threading, hashlib, time, socket, select
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.append(str(HERE.parents[1] / "proxyclient"))
+sys.path.append(str(HERE))
+
+import bugcheck
 
 DEFAULT_IMAGE = (pathlib.Path.home() / "src" / "siliconnt-firmware" / "Build" /
                  "MacBookProM4-AARCH64" / "DEBUG_CLANGPDB" / "FV" / "MACBOOKPROM4_EFI.fd")
@@ -122,6 +130,11 @@ parser.add_argument("--disk", type=pathlib.Path,
 parser.add_argument("--xtrack", choices=("on", "off"), default="on",
                     help="execution tracking: scan the memory of the guest before it runs "
                          "(default), or do not")
+parser.add_argument("--bugcheck", type=pathlib.Path, metavar="DIR",
+                    help="when the guest has stopped, look in its memory for what the Windows "
+                         "kernel recorded of a bug check, print it, and write the memory its "
+                         "parameters may be about to this directory. Those files are memory of "
+                         "Windows: the directory is not to be inside a repository")
 parser.add_argument("--image-only", action="store_true",
                     help="only check the firmware image and the disk image; do not open any port")
 parser.add_argument("--check-only", action="store_true",
@@ -585,6 +598,25 @@ def load_disk(disk, base):
           f"{len(disk) / (1 << 20) / elapsed:.1f} MB/s; every piece passed m1n1's CRC-32 "
           "check, the first and the last page read back the same")
 
+def guest_ran(since):
+    if since is not None:
+        print(f"The guest ran for {time.monotonic() - since:.1f} s")
+
+def bugcheck_report():
+    """--bugcheck. Called while the guest is stopped and has not been left: its registers
+    and its tables are still its own. Whatever goes wrong here is said and nothing more:
+    the event that stopped the guest still has to be answered."""
+    if not args.bugcheck:
+        return
+    try:
+        regs = {"VBAR_EL1": u.mrs(VBAR_EL12), "TTBR1_EL1": u.mrs(TTBR1_EL12),
+                "TCR_EL1": u.mrs(TCR_EL12)}
+        bugcheck.report(iface.readmem, regs, (layout.phys_base, layout.mem_top), args.bugcheck)
+    except Exception as e:
+        print(f"PROBLEM: what Windows recorded of a bug check was not read "
+              f"({type(e).__name__}: {e})")
+    sys.stdout.flush()
+
 # The events with which the hypervisor says that it has stopped the guest for good
 # (src/hv/hv_psci.c), by their names in HV_EVENT (proxyclient/m1n1/hv/types.py)
 GUEST_STOPS = {
@@ -711,7 +743,6 @@ def m1n1_loads():
             print(f"Run ended: m1n1 itself is in trouble ({event}); it has printed what it "
                   "knows above")
             sys.exit("m1n1 was not answered and waits. Power the M4 off.")
-        ctx = iface.readstruct(info, ExcInfo)
         interrupted = reason == START.HV and name == "USER_INTERRUPT"
         if interrupted:
             why = f"--seconds {args.seconds} ran out" if timed_out.is_set() else "interrupted (Ctrl-C)"
@@ -721,6 +752,11 @@ def m1n1_loads():
             why = ("the hypervisor could not deal with this by itself; without a host the "
                    "guest would hang here")
         print(f"Run ended: {why} ({event})")
+        guest_ran(run.entering)
+        # First, before anything that has not been done on the machine before: this needs
+        # only registers and memory read
+        bugcheck_report()
+        ctx = iface.readstruct(info, ExcInfo)
         where = ""
         if layout.image_base <= ctx.elr < layout.image_base + layout.image_size:
             where = f" (firmware image + 0x{ctx.elr - layout.image_base:x})"
@@ -895,6 +931,8 @@ def stop_guest(entry_msg=None, exit_msg=None):
     else:
         why = "a guest exception that nobody handled"
     print(f"Run ended: {why} ({hv.exc_reason.name}/{event})")
+    guest_ran(entered)
+    bugcheck_report()
     where = ""
     if layout.image_base <= ctx.elr < layout.image_base + layout.image_size:
         where = f" (firmware image + 0x{ctx.elr - layout.image_base:x})"
@@ -915,9 +953,13 @@ hv.run_shell = stop_guest
 timer = threading.Timer(args.seconds, time_out)
 timer.daemon = True
 enter_guest = p.hv_start
+# When the guest was entered, by time.monotonic()
+entered = None
 
 def enter_guest_timed(*hv_start_args):
+    global entered
     print(f"Entering the firmware at 0x{hv_start_args[0]:x}, x0 = 0x{hv_start_args[1]:x}")
+    entered = time.monotonic()
     if args.seconds:
         timer.start()
     else:
