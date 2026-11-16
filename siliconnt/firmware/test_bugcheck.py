@@ -43,7 +43,17 @@ class Model:
         self.va = {}          # page of virtual memory -> page of physical memory
         self.reads = []       # every read_phys(): (address, size)
         self.fail_at = None   # a physical page whose read raises
+        # A level 0 table of 256 entries is half a page. Windows puts TTBR0's into the first
+        # half of a page and TTBR1's into the second (R25: TTBR0_EL1 0x4001001947e000,
+        # TTBR1_EL1 0x4001001947e800). The first half here is full of descriptors that lead
+        # nowhere good.
         self.root = self.alloc()
+        if self.low >> 39 == 0xff:
+            for off in range(0, 0x800, 8):
+                struct.pack_into("<Q", self.pages[self.root], off, 0x200000000 | 3)
+            self.root += 0x800
+        # ASID 0x40 in the bits above the address, as in R25
+        self.ttbr1 = self.root | 0x40 << 48
 
     def alloc(self, count=1):
         base = self.next
@@ -68,11 +78,11 @@ class Model:
 
     def _table(self, table, index, entry=None):
         """The table a table descriptor points to, made if it is not there."""
-        off = index * 8
-        desc, = struct.unpack_from("<Q", self.pages[table], off)
+        page, off = table & ~(PAGE - 1), (table & PAGE - 1) + index * 8
+        desc, = struct.unpack_from("<Q", self.pages[page], off)
         if not desc & 1:
             desc = self.alloc() | 3
-            struct.pack_into("<Q", self.pages[table], off, desc)
+            struct.pack_into("<Q", self.pages[page], off, desc)
         return desc & 0x0000fffffffff000
 
     def map(self, va, pa=None):
@@ -108,7 +118,7 @@ class Model:
             self.pages[self.va[page]][(va + i) - page] = byte
 
     def mem(self):
-        return bugcheck.GuestMemory(self.read_phys, self.root, self.tcr, (RAM_BASE, RAM_TOP))
+        return bugcheck.GuestMemory(self.read_phys, self.ttbr1, self.tcr, (RAM_BASE, RAM_TOP))
 
 def pe_header(timestamp, size_of_image):
     """As much of a PE32+ header as bugcheck.py reads, laid out as in the kernel's file."""
@@ -168,7 +178,7 @@ def windows_model(code=0x109, parameters=None, timestamp=bugcheck.TIME_DATE_STAM
         m.write(at, struct.pack("<QQ", flink, blink))
 
     m.regs = {"VBAR_EL1": KERNEL + bugcheck.RVA["KiArm64ExceptionVectors"],
-              "TTBR1_EL1": m.root | 1, "TCR_EL1": TCR}
+              "TTBR1_EL1": m.ttbr1 | 1, "TCR_EL1": TCR}
     m.ram = (RAM_BASE, RAM_TOP)
     m.kernel, m.driver, m.pool, m.parameters = KERNEL, DRIVER, POOL, parameters
     return m
@@ -229,7 +239,8 @@ def main():
     # A table descriptor that points outside guest RAM: not followed
     m2 = Model()
     m2.map(KERNEL)
-    struct.pack_into("<Q", m2.pages[m2.root], ((KERNEL & m2.low) >> 39) * 8, 0x200000000 | 3)
+    struct.pack_into("<Q", m2.pages[m2.root & ~(PAGE - 1)],
+                     (m2.root & PAGE - 1) + ((KERNEL & m2.low) >> 39) * 8, 0x200000000 | 3)
     check("a table outside guest RAM is not read", m2.mem().translate(KERNEL) is None)
     # A page outside guest RAM: mapped as far as the tables go, but not ours to read
     m2 = Model()
@@ -257,7 +268,7 @@ def main():
         check(f"{name} is refused", refused)
 
     # T1SZ = 25: three levels, starting at level 1
-    m3 = Model()
+    m3 = Model(2 << 30 | 25 << 16)
     va = 0xffffff8000000000 + 0x7654000
     l1 = m3.root
     l2 = m3._table(l1, va >> 30 & 0x1ff)

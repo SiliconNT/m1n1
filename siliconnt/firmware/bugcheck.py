@@ -79,18 +79,26 @@ class GuestMemory:
         self.bits = 64 - t1sz
         # Each level resolves 9 bits, the first one what is left over (table D8-18)
         self.first = 4 - -(-(self.bits - 12) // 9)
-        self.root = ttbr1 & OA
+        # The first table has as many entries as it resolves bits, and TTBR1_EL1 holds its
+        # address down to the bit that its size leaves (table D8-10): a table of 256 entries
+        # is half a page and may start in the middle of one. Windows has TTBR0's table in
+        # the first half of a page and TTBR1's in the second.
+        size = 8 << self.bits - (12 + 9 * (3 - self.first))
+        self.root = ttbr1 & (1 << 48) - 1 & ~(size - 1)
         self.tables = {}
 
     def in_ram(self, pa, size=1):
         return self.ram_base <= pa and pa + size <= self.ram_top
 
-    def table(self, pa):
-        if pa not in self.tables:
-            if not self.in_ram(pa, PAGE):
+    def entry(self, table, index):
+        """A descriptor, or None if the table is not in the guest's RAM. Tables are read and
+        kept a page at a time; all but the first start at a page."""
+        page = table & ~(PAGE - 1)
+        if page not in self.tables:
+            if not self.in_ram(page, PAGE):
                 return None
-            self.tables[pa] = self.read_phys(pa, PAGE)
-        return self.tables[pa]
+            self.tables[page] = self.read_phys(page, PAGE)
+        return struct.unpack_from("<Q", self.tables[page], (table & PAGE - 1) + index * 8)[0]
 
     def translate(self, va):
         """The address in the guest's RAM, or None."""
@@ -99,11 +107,8 @@ class GuestMemory:
         table = self.root
         for level in range(self.first, 4):
             shift = 12 + 9 * (3 - level)
-            entries = self.table(table)
-            if entries is None:
-                return None
-            desc, = struct.unpack_from("<Q", entries, ((va & (1 << self.bits) - 1) >> shift & 0x1ff) * 8)
-            if not desc & 1:
+            desc = self.entry(table, (va & (1 << self.bits) - 1) >> shift & 0x1ff)
+            if desc is None or not desc & 1:
                 return None
             if level < 3 and desc & 2:
                 table = desc & OA
