@@ -19,7 +19,10 @@
  * not read through it.
  *
  * Raw image, MMU off at the start, EL1h, entry points and image header of sgitest
- * (sgitest-head.S). It ends with PSCI SYSTEM_OFF. `make qemu-xo` runs it on QEMU under a
+ * (sgitest-head.S). It ends with PSCI SYSTEM_OFF, with SCTLR_EL1 as it found it: the
+ * hypervisor leaves the EL1 registers of one guest to the next, and a guest that starts with
+ * the MMU on and this one's tables gone does not get to its first instruction (SiliconNT
+ * R26). `make qemu-xo` runs it on QEMU under a
  * small EL2 of its own that links the real probe (xotest-qemu.c).
  */
 
@@ -830,12 +833,14 @@ static void test_cache(void)
 
 void boot_main(void)
 {
+    u64 sctlr = read_sysreg(sctlr_el1);
+
     line("start\n");
     line("CurrentEL = ");
     put_dec((read_sysreg(CurrentEL) >> 2) & 3);
     put("\n");
     value("the page under test", XO);
-    value("SCTLR_EL1 as the guest found it", read_sysreg(sctlr_el1));
+    value("SCTLR_EL1 as the guest found it", sctlr);
 
     if (!mmu_on()) {
         result("stage 1: no room for the map of this image and this UART", 0);
@@ -864,6 +869,11 @@ void boot_main(void)
     put(" ");
     put_dec(nr_fail);
     put("\n");
+
+    /* Everything is mapped where it is, so the map can go while this runs */
+    write_sysreg(sctlr_el1, sctlr);
+    asm volatile("isb");
+    line("SCTLR_EL1 is as it was\n");
 
     psci_system_off();
     line("FAIL SYSTEM_OFF returned\n");
