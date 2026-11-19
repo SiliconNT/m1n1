@@ -383,11 +383,19 @@ static struct {
 
     u64 ram_base, ram_top;
     u32 events, cmds, xfers, mmio_rd, mmio_wr, irqs;
+    u32 win_access[HV_XHCI_NWIN];
     struct {
         u32 off, val;
         u8 write;
     } trace[24];
     u32 trace_n;
+    struct {
+        u64 ptr;
+        u32 status, control, trb_len, trb_done;
+    } evlog[16];
+    u32 evlog_n, evlog_trb_len, evlog_trb_done;
+    u8 setuplog[12][8];
+    u32 setuplog_n;
 } hc;
 
 static void trace_access(u32 off, u32 val, bool write)
@@ -461,9 +469,21 @@ static void update_irq(void)
     }
     if (hc.irq_injected)
         return;
-    if (!hv_vgic3_spi_enabled(HV_XHCI_IRQ))
+    /* Raise every SPI the guest enabled among the variants' interrupts (normally just one) */
+    bool any = false;
+    for (int w = 0; w < HV_XHCI_NWIN; w++) {
+        u32 irq = hv_xhci_win_irq[w];
+        bool dup = false;
+        for (int v = 0; v < w; v++)
+            if (hv_xhci_win_irq[v] == irq)
+                dup = true;
+        if (dup || !hv_vgic3_spi_enabled(irq))
+            continue;
+        hv_vgic_inject_spi(irq);
+        any = true;
+    }
+    if (!any)
         return; /* retried from the tick */
-    hv_vgic_inject_spi(HV_XHCI_IRQ);
     hc.irq_injected = true;
     hc.irqs++;
 }
@@ -513,6 +533,10 @@ static void post_event(u64 ptr, u32 status, u32 control)
     }
 
     struct trb e = {ptr, status, (control & ~TRB_C) | (hc.evt.ccs ? TRB_C : 0)};
+    hc.evlog[hc.evlog_n % ARRAY_SIZE(hc.evlog)] =
+        (typeof(hc.evlog[0])){ptr, status, control, hc.evlog_trb_len, hc.evlog_trb_done};
+    hc.evlog_n++;
+    hc.evlog_trb_len = hc.evlog_trb_done = 0;
     /* Write the cycle bit last */
     guest_write(addr, &e, 12);
     sysop("dmb ish");
@@ -833,6 +857,8 @@ static bool run_td(struct slot *s, u32 slot_id, u32 dci)
                 break;
             }
             memcpy(&s->setup, &t.ptr, 8);
+            memcpy(hc.setuplog[hc.setuplog_n % ARRAY_SIZE(hc.setuplog)], &t.ptr, 8);
+            hc.setuplog_n++;
             s->have_setup = true;
             s->ctrl_stall = !handle_setup(s);
             done = 8;
@@ -930,6 +956,8 @@ static bool run_td(struct slot *s, u32 slot_id, u32 dci)
         td_total += done;
         ring_advance(r);
         hc.xfers++;
+        hc.evlog_trb_len = len;
+        hc.evlog_trb_done = done;
 
         if (type == TRB_EVENT_DATA) {
             if (t.control & TRB_IOC) {
@@ -1601,7 +1629,12 @@ static void reg_write(u32 off, u32 val)
 static bool xhci_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     UNUSED(ctx);
-    u32 off = addr - HV_XHCI_BASE;
+    int win = 0;
+    for (int w = 0; w < HV_XHCI_NWIN; w++)
+        if (addr >= hv_xhci_win_base[w] && addr < hv_xhci_win_base[w] + HV_XHCI_SIZE)
+            win = w;
+    u32 off = addr - hv_xhci_win_base[win];
+    hc.win_access[win]++;
 
     spin_lock(&hc.lock);
     if (width <= 2) {
@@ -1695,9 +1728,13 @@ void hv_xhci_dump(void)
     printf("xhci: iman %x erstsz %u erstba %lx erdp %lx evt seg %lx/%u enq %u ccs %d\n", hc.iman,
            hc.erstsz, hc.erstba, hc.erdp, hc.evt.seg_base, hc.evt.seg_size, hc.evt.enq,
            hc.evt.ccs);
-    printf("xhci: mmio rd %u wr %u, cmds %u, events %u, xfers %u, irqs %u, level %d inj %d, spi%u %s\n",
-           hc.mmio_rd, hc.mmio_wr, hc.cmds, hc.events, hc.xfers, hc.irqs, hc.irq_level,
-           hc.irq_injected, HV_XHCI_IRQ, hv_vgic3_spi_enabled(HV_XHCI_IRQ) ? "enabled" : "masked");
+    printf("xhci: mmio rd %u wr %u, cmds %u, events %u, xfers %u, irqs %u, level %d inj %d\n", hc.mmio_rd,
+           hc.mmio_wr, hc.cmds, hc.events, hc.xfers, hc.irqs, hc.irq_level, hc.irq_injected);
+    printf("xhci: windows:");
+    for (int w = 0; w < HV_XHCI_NWIN; w++)
+        printf(" %s@0x%lx: %u accesses, spi%u %s;", hv_xhci_win_name[w], hv_xhci_win_base[w],
+               hc.win_access[w], hv_xhci_win_irq[w], hv_vgic3_spi_enabled(hv_xhci_win_irq[w]) ? "enabled" : "masked");
+    printf("\n");
     for (u32 i = 1; i <= MAX_SLOTS; i++) {
         struct slot *s = &hc.slots[i];
         if (s->state == SLOT_DISABLED)
@@ -1711,6 +1748,24 @@ void hv_xhci_dump(void)
            usbdev.config, usbdev.protocol[0], usbdev.protocol[1], usbdev.idle[0], usbdev.idle[1],
            usbdev.leds, (usbdev.rq[0].tail - usbdev.rq[0].head) % RQ_SIZE,
            (usbdev.rq[1].tail - usbdev.rq[1].head) % RQ_SIZE);
+    u32 ne = min(hc.evlog_n, (u32)ARRAY_SIZE(hc.evlog));
+    printf("xhci: last %u events of %u (type/slot/ep cc len trb-done/len ptr):", ne, hc.evlog_n);
+    for (u32 k = 0; k < ne; k++) {
+        u32 i = (hc.evlog_n - ne + k) % ARRAY_SIZE(hc.evlog);
+        printf("%s%lu/%lu/%lu cc%lu len%u trb%u/%u %lx", k % 3 ? "  " : "\n  ",
+               FIELD_GET(TRB_TYPE, hc.evlog[i].control), FIELD_GET(TRB_SLOT_ID, hc.evlog[i].control),
+               FIELD_GET(TRB_EP_ID, hc.evlog[i].control), FIELD_GET(TRB_CC, hc.evlog[i].status),
+               hc.evlog[i].status & 0xffffff, hc.evlog[i].trb_done, hc.evlog[i].trb_len, hc.evlog[i].ptr);
+    }
+    printf("\n");
+    u32 ns = min(hc.setuplog_n, (u32)ARRAY_SIZE(hc.setuplog));
+    printf("xhci: last %u setup packets of %u (bmRequestType bRequest wValue wIndex wLength):", ns, hc.setuplog_n);
+    for (u32 k = 0; k < ns; k++) {
+        u8 *b = hc.setuplog[(hc.setuplog_n - ns + k) % ARRAY_SIZE(hc.setuplog)];
+        printf("%s%02x %02x %04x %04x %04x", k % 4 ? "  |  " : "\n  ", b[0], b[1], b[2] | b[3] << 8, b[4] | b[5] << 8,
+               b[6] | b[7] << 8);
+    }
+    printf("\n");
     u32 n = min(hc.trace_n, (u32)ARRAY_SIZE(hc.trace));
     printf("xhci: last %u register accesses (of %u):", n, hc.trace_n);
     for (u32 k = 0; k < n; k++) {
@@ -1729,11 +1784,16 @@ int hv_xhci_init(u64 guest_base, u64 guest_end)
     hc.ram_top = guest_end;
     hc_reset();
 
-    if (hv_map_hook(HV_XHCI_BASE, xhci_hook, HV_XHCI_SIZE) < 0) {
-        printf("xhci: failed to map MMIO hook\n");
-        return -1;
+    for (int w = 0; w < HV_XHCI_NWIN; w++) {
+        if (hv_map_hook(hv_xhci_win_base[w], xhci_hook, HV_XHCI_SIZE) < 0) {
+            printf("xhci: failed to map MMIO hook for window %d\n", w);
+            return -1;
+        }
     }
     hc.inited = true;
-    printf("xhci: emulated controller at 0x%lx, IRQ %u\n", (u64)HV_XHCI_BASE, HV_XHCI_IRQ);
+    printf("xhci: emulated controller at 0x%lx, IRQ %u (aliases:", (u64)HV_XHCI_BASE, HV_XHCI_IRQ);
+    for (int w = 1; w < HV_XHCI_NWIN; w++)
+        printf(" 0x%lx/%u", hv_xhci_win_base[w], hv_xhci_win_irq[w]);
+    printf(")\n");
     return 0;
 }

@@ -311,12 +311,13 @@ static void map_debug_hooks(void)
  */
 
 static u32 *shadow_fb;      /* guest-visible, xRGB8888 */
-static u32 *shadow_prev;    /* host copy of what was last converted */
+static u64 *shadow_hash;    /* per row: hash of the pixels last converted */
 static u32 *real_fb;        /* iBoot's framebuffer, x2r10g10b10 */
 static u32  fb_w, fb_h, fb_stride_px;
 static bool shadow_run;     /* converter active */
-static u32  shadow_row;     /* next row to scan */
+static u32  shadow_pass;    /* passes done; every pass force-converts one slice as a safety net */
 #define SHADOW_SLICES 8
+#define SHADOW_FPS    60
 
 static inline u32 pix8to10(u32 p)
 {
@@ -329,21 +330,43 @@ static inline u32 pix10to8(u32 p)
     return (((p >> 22) & 0xff) << 16) | (((p >> 12) & 0xff) << 8) | ((p >> 2) & 0xff);
 }
 
+/*
+ * Change detection by a per-row hash of the guest's pixels: one read of the shadow buffer per
+ * pass (a Retina frame is 24 MB; comparing against a saved copy read twice that). Two
+ * multiply-xor lanes so the loop is memory bound. A collision would leave a row stale, which
+ * the forced slice in shadow_tick() repairs within SHADOW_SLICES passes.
+ */
+static inline u64 shadow_row_hash(const u32 *row)
+{
+    const u64 *q = (const u64 *)row;
+    u64 h0 = 0x9e3779b97f4a7c15ULL, h1 = 0xc2b2ae3d27d4eb4fULL;
+    u32 n = fb_w / 2, i = 0;
+    for (; i + 1 < n; i += 2) {
+        h0 = (h0 ^ q[i]) * 0x100000001b3ULL;
+        h1 = (h1 ^ q[i + 1]) * 0x100000001b3ULL;
+    }
+    for (; i < n; i++)
+        h0 = (h0 ^ q[i]) * 0x100000001b3ULL;
+    if (fb_w & 1)
+        h1 ^= row[fb_w - 1];
+    return h0 ^ (h1 * 0x9e3779b97f4a7c15ULL);
+}
+
 static void shadow_convert_rows(u32 from, u32 to, bool force)
 {
     for (u32 y = from; y < to; y++) {
         u32 *src = shadow_fb + y * fb_stride_px;
-        u32 *prv = shadow_prev + y * fb_stride_px;
         u32 *dst = real_fb + y * fb_stride_px;
-        if (!force && !memcmp(src, prv, fb_w * 4))
+        u64 h = shadow_row_hash(src);
+        if (!force && h == shadow_hash[y])
             continue;
-        for (u32 x = 0; x < fb_w; x++) {
-            u32 p = src[x];
-            prv[x] = p;
-            dst[x] = pix8to10(p);
-        }
+        shadow_hash[y] = h;
+        for (u32 x = 0; x < fb_w; x++)
+            dst[x] = pix8to10(src[x]);
     }
 }
+
+static void shadow_tick(void);
 
 static void shadow_start(void)
 {
@@ -360,7 +383,16 @@ static void shadow_stop(void)
     shadow_run = false;
 }
 
-/* Called on every hypervisor tick; converts one slice of the screen every 1/(20*SLICES) s */
+/*
+ * Called on every hypervisor tick of the interruptible CPU, before it takes the big hypervisor
+ * lock (run 44: a slice of a Retina frame is ~2 ms of pixel conversion; done under the lock it
+ * stalled every other CPU's MMIO trap for that long). Converts one slice every 1/(20*SLICES) s.
+ */
+void hv_standalone_shadow_tick(void)
+{
+    shadow_tick();
+}
+
 static void shadow_tick(void)
 {
     static u64 next;
@@ -369,13 +401,18 @@ static void shadow_tick(void)
     u64 now = get_ticks();
     if (now < next)
         return;
-    next = now + mrs(CNTFRQ_EL0) / (HV_TICK_RATE_STANDALONE * SHADOW_SLICES) * SHADOW_SLICES;
+    next = now + mrs(CNTFRQ_EL0) / SHADOW_FPS;
+    /*
+     * Whole frame every pass, changed rows only (run 44: one slice per 100 Hz tick made a full
+     * frame take 80 ms, so the pointer and the console lagged by that much). One slice per pass
+     * is converted unconditionally as a safety net against hash collisions.
+     */
     u32 rows = (fb_h + SHADOW_SLICES - 1) / SHADOW_SLICES;
-    u32 end = shadow_row + rows;
-    if (end > fb_h)
-        end = fb_h;
-    shadow_convert_rows(shadow_row, end, false);
-    shadow_row = end >= fb_h ? 0 : end;
+    u32 slice = shadow_pass++ % SHADOW_SLICES;
+    u32 f0 = slice * rows, f1 = min(f0 + rows, fb_h);
+    shadow_convert_rows(0, f0, false);
+    shadow_convert_rows(f0, f1, true);
+    shadow_convert_rows(f1, fb_h, false);
 }
 
 /*
@@ -383,16 +420,21 @@ static void shadow_tick(void)
  * guest, print the input/xHCI state, and give the picture back on the next toggle.
  */
 static bool overlay_had_shadow;
+static volatile bool overlay_active; /* the sampler's periodic prints stay off the overlay (run 41: garbled text) */
 
 void hv_debug_overlay(bool on)
 {
     if (on) {
+        overlay_active = true;
         overlay_had_shadow = shadow_run;
         shadow_stop();
         if (!hv_verbose)
             fb_init(false);
         fb_set_active(true);
+        fb_clear(int2rgb(0)); /* the guest's text would otherwise show through ours */
         printf("HV: ---- debug overlay (Fn+Esc again to resume) ----\n");
+        hv_standalone_dump_cpus();
+        hv_prof_dump();
         hv_input_stats();
         hv_xhci_dump();
     } else {
@@ -404,6 +446,7 @@ void hv_debug_overlay(bool on)
             shadow_start();
         else
             fb_set_active(hv_verbose);
+        overlay_active = false;
     }
 }
 
@@ -454,8 +497,8 @@ int hv_boot(void)
         phys_base += shadow_size;
         shadow_fb = (u32 *)shadow_base;
         real_fb = (u32 *)cur_boot_args.video.base;
-        shadow_prev = malloc(fb_stride_px * fb_h * 4);
-        if (!shadow_prev) {
+        shadow_hash = malloc(fb_h * sizeof(u64));
+        if (!shadow_hash) {
             printf("HV: no memory for the shadow framebuffer cache\n");
             shadow_fb = NULL;
         }
@@ -650,7 +693,8 @@ int hv_boot(void)
         for (u32 y = 0; y < fb_h; y++)
             for (u32 x = 0; x < fb_w; x++)
                 shadow_fb[y * fb_stride_px + x] = pix10to8(real_fb[y * fb_stride_px + x]);
-        memcpy(shadow_prev, shadow_fb, fb_stride_px * fb_h * 4);
+        for (u32 y = 0; y < fb_h; y++)
+            shadow_hash[y] = shadow_row_hash(shadow_fb + y * fb_stride_px);
         tba->video.base = shadow_base;
         tba->video.depth = 32 | (cur_boot_args.video.depth & ~0xffULL);
         printf("HV: guest framebuffer: 32 bpp shadow at 0x%lx (%ux%u), real one at 0x%lx is 30 bpp\n",
@@ -863,6 +907,333 @@ static const char *reason_name(uartproxy_boot_reason_t reason, u32 type)
     return "?";
 }
 
+/*
+ * Guest address -> "image.pdb+offset". UEFI drivers, bootmgfw/winload and the NT kernel are all
+ * PE/COFF images loaded page aligned, with a CodeView (RSDS) entry in the debug directory that
+ * names the PDB -- the same lookup the firmware's exception dump does. Walk back from the
+ * address page by page until an "MZ" header whose SizeOfImage covers it turns up.
+ */
+/*
+ * hv_pt_is_ram() only says the IPA has a direct (HW) stage-2 mapping, which pass-through MMIO
+ * has too: run 43 died at EL2 with a bus error reading 0x1400006000 while the stack scan walked
+ * back from a guest pointer. Only touch what is really RAM.
+ */
+static bool guest_read32(u64 va, u32 *out)
+{
+    u64 pa = hv_translate(va, false, false, NULL);
+    if (!pa || pa < ram_base || pa >= ram_base + mem_size_actual || !hv_pt_is_ram(pa & ~0x3fffULL))
+        return false;
+    *out = read32(pa);
+    return true;
+}
+
+static bool guest_read64(u64 va, u64 *out)
+{
+    u32 lo, hi;
+    if (!guest_read32(va, &lo) || !guest_read32(va + 4, &hi))
+        return false;
+    *out = ((u64)hi << 32) | lo;
+    return true;
+}
+
+static u64 guest_image_base_found; /* base of the image guest_image_name() last resolved */
+
+static int guest_image_name(u64 addr, char *buf, size_t len)
+{
+    u32 w, e_lfanew, size_of_image;
+    for (u64 base = addr & ~0xfffULL; addr - base < 32 * 1024 * 1024; base -= 0x1000) {
+        if (!guest_read32(base, &w))
+            return -1; /* fell off RAM */
+        if ((w & 0xffff) != 0x5a4d)
+            continue;
+        if (!guest_read32(base + 0x3c, &e_lfanew) || e_lfanew > 0x1000 ||
+            !guest_read32(base + e_lfanew, &w) || w != 0x00004550)
+            continue;
+        u64 opt = base + e_lfanew + 24;
+        if (!guest_read32(opt + 56, &size_of_image) || addr - base >= size_of_image)
+            continue;
+        if (!guest_read32(opt, &w) || (w & 0xffff) != 0x20b) /* PE32+ */
+            continue;
+        guest_image_base_found = base;
+        snprintf(buf, len, "<MZ@0x%lx>+0x%lx", base, addr - base);
+        u32 nrva, dbg_rva, dbg_size;
+        if (!guest_read32(opt + 108, &nrva) || nrva <= 6 || !guest_read32(opt + 112 + 6 * 8, &dbg_rva) ||
+            !guest_read32(opt + 112 + 6 * 8 + 4, &dbg_size) || !dbg_rva)
+            return 0;
+        for (u32 off = 0; off + 28 <= dbg_size && off < 28 * 8; off += 28) {
+            u32 type, raw_rva, raw_ptr;
+            if (!guest_read32(base + dbg_rva + off + 12, &type) || type != 2) /* CODEVIEW */
+                continue;
+            if (!guest_read32(base + dbg_rva + off + 20, &raw_rva) ||
+                !guest_read32(base + dbg_rva + off + 24, &raw_ptr))
+                break;
+            u64 cv = base + (raw_rva ? raw_rva : raw_ptr);
+            u32 sig;
+            if (!guest_read32(cv, &sig))
+                break;
+            u64 path = sig == 0x53445352 ? cv + 24 : sig == 0x3031424e ? cv + 16 : 0; /* RSDS / NB10 */
+            if (!path)
+                break;
+            char name[96];
+            int n = 0, start = 0;
+            for (; n < (int)sizeof(name) - 1; n++) {
+                u32 c;
+                if (!guest_read32((path + n) & ~3ULL, &c))
+                    break;
+                c = (c >> (8 * ((path + n) & 3))) & 0xff;
+                if (!c)
+                    break;
+                name[n] = c;
+                if (c == '\\' || c == '/')
+                    start = n + 1;
+            }
+            name[n] = 0;
+            if (n > start)
+                snprintf(buf, len, "%s+0x%lx", name + start, addr - base);
+            return 0;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+static void guest_stack_images_filtered(u64 sp, int words, int max_shown, const char *skip_prefix);
+
+/* Words on the guest stack that point into some image: a poor man's backtrace */
+static void guest_stack_images_n(u64 sp, int words, int max_shown)
+{
+    guest_stack_images_filtered(sp, words, max_shown, NULL);
+}
+
+/* As above, skipping pointers into the image whose name starts with skip_prefix (e.g. the kernel) */
+static void guest_stack_images_filtered(u64 sp, int words, int max_shown, const char *skip_prefix)
+{
+    char name[128];
+    int shown = 0;
+    for (int i = 0; i < words; i++) {
+        u32 lo, hi;
+        if (!guest_read32(sp + 8 * i, &lo) || !guest_read32(sp + 8 * i + 4, &hi))
+            break;
+        u64 v = ((u64)hi << 32) | lo;
+        if (v < 0x10000 || (v & 3))
+            continue;
+        if (guest_image_name(v, name, sizeof(name)) < 0)
+            continue;
+        if (skip_prefix && !strncmp(name, skip_prefix, strlen(skip_prefix)))
+            continue;
+        printf("HV sample:   [sp+0x%03x] 0x%lx %s\n", 8 * i, v, name);
+        if (++shown >= max_shown)
+            break;
+    }
+}
+
+static void guest_stack_images(u64 sp, int words)
+{
+    guest_stack_images_n(sp, words, 12);
+}
+
+/*
+ * Walk the guest's frame-pointer chain (Windows on ARM64 keeps x29 chains everywhere: [fp] = caller's
+ * fp, [fp+8] = return address) and name each return address. Stops at the first frame that does not
+ * read, does not move up the stack, or does not point into an image.
+ */
+static void guest_fp_backtrace(u64 fp, u64 lr, int max_frames)
+{
+    char name[128];
+    u64 prev = 0;
+    if (lr && guest_image_name(lr, name, sizeof(name)) == 0)
+        printf("HV sample:   lr   %s\n", name);
+    for (int i = 0; i < max_frames; i++) {
+        u32 lo, hi;
+        if (!fp || (fp & 7) || fp <= prev)
+            break;
+        if (!guest_read32(fp + 8, &lo) || !guest_read32(fp + 12, &hi))
+            break;
+        u64 ret = ((u64)hi << 32) | lo;
+        if (!guest_read32(fp, &lo) || !guest_read32(fp + 4, &hi))
+            break;
+        u64 next = ((u64)hi << 32) | lo;
+        if (guest_image_name(ret, name, sizeof(name)) < 0)
+            break;
+        printf("HV sample:   fp%-2d %s\n", i, name);
+        prev = fp;
+        fp = next;
+    }
+}
+
+/*
+ * Every CPU records where its guest was at its last host timer tick (the sampler itself only
+ * runs on the interruptible CPU). The Fn+Esc overlay prints them all with image names and the
+ * return addresses on each stack: when Windows bugchecks, the crashing CPU sits in
+ * KeBugCheckEx and the frames below it name the driver that faulted.
+ */
+static struct {
+    u64 pc, spsr, sp1, sp0, fp, lr;
+    u64 pmc0, cnt, pmc0_hz; /* PMC0 (the guest's PMCCNTR) and CNTPCT at the last tick, and the rate between ticks */
+    u32 n;
+} cpu_last[MAX_CPUS];
+
+void hv_standalone_note_cpu(int cpu, u64 pc, u64 spsr, u64 sp1, u64 sp0, u64 fp, u64 lr)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return;
+    u64 pmc0 = mrs(SYS_IMP_APL_PMC0), cnt = mrs(CNTPCT_EL0);
+    if (cpu_last[cpu].n && cnt > cpu_last[cpu].cnt)
+        cpu_last[cpu].pmc0_hz = (pmc0 - cpu_last[cpu].pmc0) * mrs(CNTFRQ_EL0) / (cnt - cpu_last[cpu].cnt);
+    cpu_last[cpu].pmc0 = pmc0;
+    cpu_last[cpu].cnt = cnt;
+    cpu_last[cpu].pc = pc;
+    cpu_last[cpu].spsr = spsr;
+    cpu_last[cpu].sp1 = sp1;
+    cpu_last[cpu].sp0 = sp0;
+    cpu_last[cpu].fp = fp;
+    cpu_last[cpu].lr = lr;
+    cpu_last[cpu].n++;
+}
+
+/*
+ * KeBugCheckEx leaves its five arguments in the kernel's KiBugCheckData[] (and sets
+ * KiBugCheckActive). Those are the numbers the blue screen does not show: for 0x7E
+ * SYSTEM_THREAD_EXCEPTION_NOT_HANDLED they are the exception code, the faulting PC, the
+ * EXCEPTION_RECORD and the CONTEXT -- the context is the complete register file at the fault.
+ * The variables are not exported, so their RVAs are per kernel build, keyed by the PE
+ * TimeDateStamp (from the public ntkrnlmp.pdb of that build).
+ */
+static const struct {
+    u32 timestamp;
+    u32 active_rva, data_rva;
+    const char *build;
+} kernel_builds[] = {
+    {0x409ce488, 0xdbbf08, 0xdbbf40, "26300.9457 arm64 (Windows11_Client_arm64_en-us_26300_9457.iso WinPE)"},
+};
+
+static void guest_name_or_hex(u64 v, char *buf, size_t len)
+{
+    if (v < 0x10000 || guest_image_name(v, buf, len) < 0)
+        snprintf(buf, len, "0x%lx", v);
+}
+
+static void guest_dump_bugcheck(u64 kbase)
+{
+    u32 e_lfanew, ts;
+    if (!guest_read32(kbase + 0x3c, &e_lfanew) || !guest_read32(kbase + e_lfanew + 8, &ts))
+        return;
+    int b = -1;
+    for (unsigned i = 0; i < sizeof(kernel_builds) / sizeof(kernel_builds[0]); i++)
+        if (kernel_builds[i].timestamp == ts)
+            b = i;
+    if (b < 0) {
+        printf("HV bugcheck: kernel TimeDateStamp 0x%x unknown, add it to kernel_builds[]\n", ts);
+        return;
+    }
+    u32 active;
+    u64 p[5];
+    if (!guest_read32(kbase + kernel_builds[b].active_rva, &active))
+        return;
+    for (int i = 0; i < 5; i++)
+        if (!guest_read64(kbase + kernel_builds[b].data_rva + 8 * i, &p[i]))
+            return;
+    if (!active && !p[0]) {
+        printf("HV bugcheck: none (KiBugCheckActive 0, kernel %s)\n", kernel_builds[b].build);
+        return;
+    }
+    char n1[128], n2[128], n3[128];
+    guest_name_or_hex(p[1], n1, sizeof(n1));
+    guest_name_or_hex(p[2], n2, sizeof(n2));
+    guest_name_or_hex(p[3], n3, sizeof(n3));
+    printf("HV bugcheck: 0x%lx (active %u) P1 %s P2 %s P3 %s P4 0x%lx\n", p[0], active, n1, n2, n3, p[4]);
+
+    u64 rec = 0, ctx = 0;
+    if (p[0] == 0x7e || p[0] == 0x1000007e) { /* code, address, EXCEPTION_RECORD*, CONTEXT* */
+        rec = p[3];
+        ctx = p[4];
+    } else if (p[0] == 0x1e) { /* code, address, param0, param1 */
+        return;
+    } else if (p[0] == 0x139 || p[0] == 0x3b || p[0] == 0x7f) { /* ..., trap frame / context */
+        ctx = p[0] == 0x3b ? p[3] : 0;
+    }
+    if (rec) {
+        u32 code, nparams;
+        u64 addr, info0, info1;
+        if (guest_read32(rec, &code) && guest_read64(rec + 0x10, &addr) && guest_read32(rec + 0x18, &nparams) &&
+            guest_read64(rec + 0x20, &info0) && guest_read64(rec + 0x28, &info1)) {
+            guest_name_or_hex(addr, n1, sizeof(n1));
+            printf("HV exception: code 0x%x at %s nparams %u info[0] 0x%lx info[1] 0x%lx\n", code, n1, nparams,
+                   info0, info1);
+            if (code == 0xc0000005)
+                printf("HV exception: access violation: %s address 0x%lx\n",
+                       info0 == 0 ? "read" : info0 == 1 ? "write" : info0 == 8 ? "execute" : "?", info1);
+        }
+    }
+    if (ctx) {
+        /* ARM64 CONTEXT: ContextFlags, Cpsr, X0..X28 at +0x8, Fp +0xf0, Lr +0xf8, Sp +0x100, Pc +0x108 */
+        u64 x[31], sp, pc;
+        u32 cpsr;
+        bool ok = guest_read32(ctx + 4, &cpsr) && guest_read64(ctx + 0x100, &sp) && guest_read64(ctx + 0x108, &pc);
+        for (int i = 0; ok && i < 31; i++)
+            ok = guest_read64(ctx + 8 + 8 * i, &x[i]);
+        if (!ok) {
+            printf("HV context: 0x%lx unreadable\n", ctx);
+            return;
+        }
+        guest_name_or_hex(pc, n1, sizeof(n1));
+        guest_name_or_hex(x[30], n2, sizeof(n2));
+        printf("HV context: pc %s lr %s sp 0x%lx cpsr 0x%x\n", n1, n2, sp, cpsr);
+        for (int i = 0; i < 30; i += 5)
+            printf("HV context: x%-2d %016lx %016lx %016lx %016lx %016lx\n", i, x[i], x[i + 1], x[i + 2], x[i + 3],
+                   x[i + 4]);
+        u32 insn[6];
+        bool code_ok = true;
+        for (int i = 0; i < 6; i++)
+            code_ok = code_ok && guest_read32(pc - 20 + 4 * i, &insn[i]);
+        if (code_ok)
+            printf("HV context: code %08x %08x %08x %08x %08x [%08x]\n", insn[0], insn[1], insn[2], insn[3], insn[4],
+                   insn[5]);
+        guest_fp_backtrace(x[29], x[30], 12);
+        guest_stack_images_n(sp, 256, 10);
+    }
+}
+
+void hv_standalone_dump_cpus(void)
+{
+    char name[128];
+    u64 kbase = 0;
+    for (int c = 0; c < MAX_CPUS; c++) {
+        if (!cpu_last[c].n)
+            continue;
+        u64 pc = cpu_last[c].pc, spsr = cpu_last[c].spsr;
+        if (guest_image_name(pc, name, sizeof(name)) < 0)
+            snprintf(name, sizeof(name), "?");
+        else if (!kbase && !strncmp(name, "ntkrnlmp", 8))
+            kbase = guest_image_base_found;
+        printf("HV cpu%d: EL%lu%s pc 0x%lx %s", c, (spsr >> 2) & 3, (spsr & 0x80) ? " I" : "", pc, name);
+        printf(" fp 0x%lx pmc0 %lu MHz\n", cpu_last[c].fp, cpu_last[c].pmc0_hz / 1000000);
+        guest_fp_backtrace(cpu_last[c].fp, cpu_last[c].lr, 24);
+        /* Anything on the stack pointing outside the kernel: the faulting driver's return
+         * addresses and EXCEPTION_RECORD.ExceptionAddress survive there even when the frame
+         * chain stops at the trap frame. */
+        if (pc >> 63)
+            guest_stack_images_filtered((spsr & 1) ? cpu_last[c].sp1 : cpu_last[c].sp0, 1024, 8, "ntkrnlmp");
+    }
+    /*
+     * The guest's view of the cycle counter on this CPU: the Apple PMU controls (PMCR1_EL12 is
+     * the copy that applies while the guest runs at EL1/EL0) and what the kernel measured --
+     * KPCR is in TPIDR_EL1, its KPRCB at +0x980, Prcb->MHz / CycleCounterFrequency at
+     * +0x774 / +0x778 (ntkrnlmp 26300.9457; KiIntSteerSnapPerf divides by the latter).
+     */
+    printf("HV pmu(cpu%d): PMCR0 0x%lx PMCR1 0x%lx PMCR1_EL12 0x%lx PMC0 0x%lx\n", smp_id(), mrs(SYS_IMP_APL_PMCR0),
+           mrs(SYS_IMP_APL_PMCR1), mrs(SYS_IMP_APL_PMCR1_EL12), mrs(SYS_IMP_APL_PMC0));
+    u64 kpcr = mrs(TPIDR_EL1);
+    if (kpcr >> 63) {
+        u32 mhz;
+        u64 ccf;
+        if (guest_read32(kpcr + 0x980 + 0x774, &mhz) && guest_read64(kpcr + 0x980 + 0x778, &ccf))
+            printf("HV prcb(cpu%d): KPCR 0x%lx MHz %u CycleCounterFrequency %lu\n", smp_id(), kpcr, mhz, ccf);
+    }
+    if (kbase)
+        guest_dump_bugcheck(kbase);
+}
+
 static void die_dump(struct exc_info *ctx, const char *why)
 {
     /* Take the screen back from the guest, keeping what it drew outside the console column */
@@ -894,6 +1265,12 @@ static void die_dump(struct exc_info *ctx, const char *why)
     if (elr_phys && (elr_phys & 3) == 0 && hv_pt_is_ram(elr_phys & ~0x3fffULL))
         printf("Insn at ELR: %08x %08x %08x %08x (last is ELR)\n", read32(elr_phys - 12),
                read32(elr_phys - 8), read32(elr_phys - 4), read32(elr_phys));
+    {
+        char name[128];
+        if (guest_image_name(ctx->elr, name, sizeof(name)) == 0)
+            printf("ELR is in %s\n", name);
+        guest_stack_images(ctx->sp[(ctx->spsr & 1) ? 1 : 0], 64);
+    }
     for (int i = 0; i < 32; i += 4)
         printf("x%-2d %016lx %016lx %016lx %016lx\n", i, r[i], r[i + 1], r[i + 2], r[i + 3]);
     printf("HV: halted. Photograph this screen.\n");
@@ -915,10 +1292,12 @@ void hv_standalone_tick(struct exc_info *ctx)
     static u64 last_pc, same_count;
     static int ticks;
 
-    shadow_tick();
+    /* shadow_tick() runs from hv_standalone_shadow_tick() before the big lock is taken */
     hv_input_tick();
+    hv_standalone_note_cpu(smp_id(), ctx->elr, ctx->spsr, ctx->sp[1], ctx->sp[0], ctx->regs[29],
+                           ctx->regs[30]);
 
-    if (!hv_verbose)
+    if (!hv_verbose || overlay_active)
         return;
     if (++ticks % hv_tick_hz)
         return;
@@ -936,7 +1315,8 @@ void hv_standalone_tick(struct exc_info *ctx)
         printf("HV: guest now runs at kernel addresses (pc 0x%lx)\n", pc);
         shadow_start();
     }
-    if (pc == last_pc) {
+    /* A guest spinning in a small loop alternates between a few PCs: same 256-byte window = stuck */
+    if ((pc & ~0xffULL) == (last_pc & ~0xffULL)) {
         same_count++;
         if (same_count != 3 && same_count != 30 && same_count % 300)
             return; /* only report a stuck PC a few times */
@@ -953,10 +1333,12 @@ void hv_standalone_tick(struct exc_info *ctx)
         insn = read32(pa);
 
     bool idle = pa && hv_pt_is_ram(pa & ~0x3fffULL) && read32(pa - 4) == 0xd503207f; /* after wfi */
-    printf("HV sample: pc 0x%lx (insn %08x) spsr 0x%lx%s%s | EL1 vbar 0x%lx elr 0x%lx esr 0x%lx far "
-           "0x%lx spsr 0x%lx\n",
-           pc, insn, ctx->spsr, same_count ? " [unchanged]" : "", idle ? " [idle, after wfi]" : "",
-           vbar, elr1, esr1, far1, spsr1);
+    char image[128] = "?";
+    guest_image_name(pc, image, sizeof(image));
+    printf("HV sample: pc 0x%lx = %s (insn %08x) spsr 0x%lx%s%s | EL1 vbar 0x%lx elr 0x%lx esr 0x%lx "
+           "far 0x%lx spsr 0x%lx\n",
+           pc, image, insn, ctx->spsr, same_count ? " [unchanged]" : "",
+           idle ? " [idle, after wfi]" : "", vbar, elr1, esr1, far1, spsr1);
     if (vbar && pc >= vbar && pc < vbar + 0x800)
         printf("HV sample: guest is inside its own exception vector (+0x%lx): it took an EL1 "
                "exception it cannot handle\n",
@@ -982,6 +1364,8 @@ void hv_standalone_tick(struct exc_info *ctx)
                 printf(" %08x", read32(pa - 4 * i));
             printf(" [%08x]\n", insn);
         }
+        printf("HV sample: return addresses on the stack:\n");
+        guest_stack_images(ctx->sp[(ctx->spsr & 1) ? 1 : 0], 96);
     }
 }
 

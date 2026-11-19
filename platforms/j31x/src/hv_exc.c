@@ -595,7 +595,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         SYSREG_MAP(SYS_PMCCNTR_EL0, SYS_IMP_APL_PMC0)
         case SYSREG_ISS(SYS_PMCCFILTR_EL0):
             if(is_read) {
-                u64 pmcr1_value = mrs(SYS_IMP_APL_PMCR1);
+                u64 pmcr1_value = mrs(SYS_IMP_APL_PMCR1_EL12);
                 u64 calculated_value = 0;
                 //
                 // If EL0/EL1 counting is disabled, set bit 30 of PMCCFILTR to 1.
@@ -616,7 +616,14 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 regs[rt] = calculated_value;
             }
             else {
-                u64 pmcr1_value = mrs(SYS_IMP_APL_PMCR1);
+                /*
+                 * m1n1 runs EL2 with VHE, so PMCR1_EL1 here is the EL2 copy; the copy that
+                 * governs counting while the guest runs at EL1/EL0 is PMCR1_EL12 (run 41:
+                 * the HAL measured a cycle counter frequency of 0 and KeIntSteerSnapPerf
+                 * divided by it; writing only the EL2 copy is the likely reason PMCCNTR
+                 * stood still for the guest). Keep both copies in step.
+                 */
+                u64 pmcr1_value = mrs(SYS_IMP_APL_PMCR1_EL12);
                 //
                 // If we're being asked to disable counting cycles for a given EL, set the appropriate bit for
                 // PMCR1 respectively.
@@ -631,9 +638,10 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     pmcr1_value |= BIT(8);
                 }
                 else {
-                    pmcr1_value &= ~(BIT(16));
+                    pmcr1_value &= ~(BIT(8));
                 }
                 sysop("isb");
+                msr(SYS_IMP_APL_PMCR1_EL12, pmcr1_value);
                 msr(SYS_IMP_APL_PMCR1, pmcr1_value);
                 sysop("isb");
                 printf("HV PMUv3 Redirect (OK): msr PMCCFILTR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
@@ -720,6 +728,9 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 if((regs[rt] & counters_enable_mask) != 0) {
                     if((regs[rt] & BIT(31)) != 0) {
                         pmcr0_value |= BIT(0);
+                        /* PMC0 only counts at the guest's EL1/EL0 with the EL12 copy of PMCR1 set (run 41) */
+                        u64 pmcr1_guest = mrs(SYS_IMP_APL_PMCR1_EL12) | BIT(8) | BIT(16);
+                        msr(SYS_IMP_APL_PMCR1_EL12, pmcr1_guest);
                     }
                     sysop("isb");
                     msr(SYS_IMP_APL_PMCR0, pmcr0_value);
@@ -1123,6 +1134,66 @@ static void hv_get_context(struct exc_info *ctx)
     sysop("isb");
 }
 
+/*
+ * EL2 time profiler (standalone hv, Fn+Esc overlay): how much of each CPU's time goes to the
+ * hypervisor, how much of that is waiting for the big hypervisor lock, and which traps are
+ * responsible (run 44: Windows runs but feels slow).
+ */
+enum { PROF_SYNC_FAST, PROF_SYNC_MSR, PROF_DABORT_GIC, PROF_DABORT_XHCI, PROF_DABORT_OTHER, PROF_FIQ_FAST,
+       PROF_FIQ_SLOW, PROF_IRQ, PROF_SHADOW, PROF_N };
+static const char *prof_names[PROF_N] = {"msr-fast", "msr", "gic", "xhci", "mmio", "fiq", "fiq-slow", "irq", "shadow"};
+static struct {
+    u64 ticks[PROF_N];
+    u32 count[PROF_N];
+    u64 lock_wait;
+} prof[MAX_CPUS], prof_snap[MAX_CPUS];
+static u64 prof_snap_time;
+static int prof_cat[MAX_CPUS]; /* category of the trap being handled on this CPU */
+
+static inline void prof_set(int cat)
+{
+    prof_cat[smp_id()] = cat;
+}
+
+static inline void prof_end(u64 t0)
+{
+    int c = smp_id();
+    prof[c].ticks[prof_cat[c]] += mrs(CNTPCT_EL0) - t0;
+    prof[c].count[prof_cat[c]]++;
+}
+
+void hv_prof_dump(void)
+{
+    u64 now = mrs(CNTPCT_EL0), freq = mrs(CNTFRQ_EL0);
+    u64 dt = now - prof_snap_time;
+    if (!prof_snap_time || !dt) {
+        printf("HV prof: first snapshot taken, open the overlay again for rates\n");
+    } else {
+        for (int c = 0; c < MAX_CPUS; c++) {
+            u64 total = 0;
+            for (int i = 0; i < PROF_N; i++)
+                total += prof[c].ticks[i] - prof_snap[c].ticks[i];
+            if (!total)
+                continue;
+            u64 lock = prof[c].lock_wait - prof_snap[c].lock_wait;
+            printf("HV prof cpu%d: el2 %lu.%lu%% lock-wait %lu.%lu%% |", c, total * 100 / dt, total * 1000 / dt % 10,
+                   lock * 100 / dt, lock * 1000 / dt % 10);
+            for (int i = 0; i < PROF_N; i++) {
+                u32 n = prof[c].count[i] - prof_snap[c].count[i];
+                if (!n)
+                    continue;
+                u64 t = prof[c].ticks[i] - prof_snap[c].ticks[i];
+                /* count per second and average microseconds per trap */
+                printf(" %s %lu/s %luus", prof_names[i], (u64)n * freq / dt, t * 1000000 / freq / n);
+            }
+            printf("\n");
+        }
+        printf("HV prof: over the last %lu ms\n", dt * 1000 / freq);
+    }
+    memcpy(prof_snap, prof, sizeof(prof));
+    prof_snap_time = now;
+}
+
 static void hv_exc_entry(void)
 {
     // Enable SErrors in the HV, but only if not already pending
@@ -1130,7 +1201,9 @@ static void hv_exc_entry(void)
         sysop("msr daifclr, 4");
 
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
+    u64 t_lock = mrs(CNTPCT_EL0);
     spin_lock(&bhl);
+    prof[smp_id()].lock_wait += mrs(CNTPCT_EL0) - t_lock;
     hv_wdt_breadcrumb('X');
     exc_entry_time = mrs(CNTPCT_EL0);
     /* disable PMU counters in the hypervisor */
@@ -1156,7 +1229,16 @@ static void hv_exc_exit(struct exc_info *ctx)
     msr(SP_EL1, ctx->sp[1]);
 }
 
+static void hv_exc_sync_impl(struct exc_info *ctx);
 void hv_exc_sync(struct exc_info *ctx)
+{
+    u64 t0 = mrs(CNTPCT_EL0);
+    prof_set(PROF_SYNC_FAST);
+    hv_exc_sync_impl(ctx);
+    prof_end(t0);
+}
+
+static void hv_exc_sync_impl(struct exc_info *ctx)
 {
     hv_wdt_breadcrumb('S');
     hv_get_context(ctx);
@@ -1207,12 +1289,18 @@ void hv_exc_sync(struct exc_info *ctx)
     hv_exc_entry();
 
     switch (ec) {
-        case ESR_EC_DABORT_LOWER:
+        case ESR_EC_DABORT_LOWER: {
             hv_wdt_breadcrumb('D');
+            u64 ipa = (mrs(sys_reg(3, 4, 6, 0, 4)) & 0xffffffffff0ULL) << 8 | (ctx->far & 0xfff); /* HPFAR_EL2 */
+            prof_set(ipa >= 0x5000000000ULL && ipa < 0x5200000000ULL ? PROF_DABORT_GIC /* GICD + GICR */
+                     : ipa >= 0xf0000000ULL && ipa < 0xf0010000ULL    ? PROF_DABORT_XHCI
+                                                                       : PROF_DABORT_OTHER);
             handled = hv_handle_dabort(ctx);
             break;
+        }
         case ESR_EC_MSR:
             hv_wdt_breadcrumb('M');
+            prof_set(PROF_SYNC_MSR);
             handled = hv_handle_msr(ctx, FIELD_GET(ESR_ISS, ctx->esr));
             break;
         case ESR_EC_IMPDEF:
@@ -1241,7 +1329,16 @@ void hv_exc_sync(struct exc_info *ctx)
     hv_wdt_breadcrumb('s');
 }
 
+static void hv_exc_irq_impl(struct exc_info *ctx);
 void hv_exc_irq(struct exc_info *ctx)
+{
+    u64 t0 = mrs(CNTPCT_EL0);
+    prof_set(PROF_IRQ);
+    hv_exc_irq_impl(ctx);
+    prof_end(t0);
+}
+
+static void hv_exc_irq_impl(struct exc_info *ctx)
 {
 #ifdef ENABLE_VGIC_MODULE
     u32 reason = aic_ack();
@@ -1337,7 +1434,16 @@ void hv_exc_irq(struct exc_info *ctx)
 #endif
 }
 
+static void hv_exc_fiq_impl(struct exc_info *ctx);
 void hv_exc_fiq(struct exc_info *ctx)
+{
+    u64 t0 = mrs(CNTPCT_EL0);
+    prof_set(PROF_FIQ_FAST);
+    hv_exc_fiq_impl(ctx);
+    prof_end(t0);
+}
+
+static void hv_exc_fiq_impl(struct exc_info *ctx)
 {
     bool tick = false;
 
@@ -1358,13 +1464,25 @@ void hv_exc_fiq(struct exc_info *ctx)
 
     if (smp_id() != interruptible_cpu && !(mrs(ISR_EL1) & 0x40) && hv_want_cpu == -1) {
         // Non-interruptible CPU and it was just a timer tick (or spurious), so just update FIQs
+        if (hv_standalone)
+            hv_standalone_note_cpu(smp_id(), mrs(ELR_EL2), mrs(SPSR_EL2), mrs(SP_EL1), mrs(SP_EL0),
+                                   ctx->regs[29], ctx->regs[30]);
         hv_update_fiq();
         hv_arm_tick(true);
         return;
     }
 
+    if (tick && hv_standalone && smp_id() == interruptible_cpu) {
+        /* The screen converter needs no hypervisor state: keep it outside the lock */
+        u64 t0 = mrs(CNTPCT_EL0);
+        hv_standalone_shadow_tick();
+        prof[smp_id()].ticks[PROF_SHADOW] += mrs(CNTPCT_EL0) - t0;
+        prof[smp_id()].count[PROF_SHADOW]++;
+    }
+
     // Slow (single threaded) path
     hv_wdt_breadcrumb('F');
+    prof_set(PROF_FIQ_SLOW);
     hv_get_context(ctx);
     hv_exc_entry();
 
@@ -1374,6 +1492,10 @@ void hv_exc_fiq(struct exc_info *ctx)
             hv_tick(ctx);
             hv_arm_tick(false);
         } else {
+            /* Slow path (a FIQ was pending): still record where this CPU's guest is */
+            if (hv_standalone)
+                hv_standalone_note_cpu(smp_id(), ctx->elr, ctx->spsr, mrs(SP_EL1), mrs(SP_EL0),
+                                       ctx->regs[29], ctx->regs[30]);
             hv_arm_tick(true);
         }
     }

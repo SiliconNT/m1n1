@@ -9,9 +9,22 @@
  * Emulated xHCI controller with one high-speed USB HID device (boot keyboard + boot mouse)
  * for the standalone hypervisor guest. Guest-visible MMIO window and interrupt:
  */
-#define HV_XHCI_BASE 0x5300000000ULL
+/*
+ * Run 37: Windows refuses to start an ACPI-enumerated device whose _CRS memory lies above 4 GB
+ * (QWordMemory at 0x5300000000 -> START fails with STATUS_INVALID_PARAMETER before the driver
+ * runs), while a Memory32Fixed window works and usbxhci goes on to enumerate our device. So the
+ * window lives below 4 GB, where this guest has neither RAM (0x10000000000+) nor MMIO
+ * (0x200000000+). The GSIV is one no device in the J314 device tree uses (the vGIC unmasks the
+ * same AIC IRQ).
+ */
+#define HV_XHCI_BASE 0xF0000000ULL
 #define HV_XHCI_SIZE 0x10000
-#define HV_XHCI_IRQ  999 /* GICv3 SPI INTID; vGIC unmasks the same AIC IRQ, so pick one no device uses */
+#define HV_XHCI_IRQ  201
+
+#define HV_XHCI_NWIN 1
+static const u64 hv_xhci_win_base[HV_XHCI_NWIN] = {HV_XHCI_BASE};
+static const u32 hv_xhci_win_irq[HV_XHCI_NWIN] = {HV_XHCI_IRQ};
+static const char *const hv_xhci_win_name[HV_XHCI_NWIN] = {"XHC0"};
 
 /* Interfaces of the emulated device */
 #define HV_USBHID_KBD   0

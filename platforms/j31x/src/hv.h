@@ -90,6 +90,10 @@ int hv_boot(void);
 void hv_standalone_exc(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type,
                        void *extra);
 void hv_standalone_tick(struct exc_info *ctx);
+void hv_standalone_note_cpu(int cpu, u64 pc, u64 spsr, u64 sp1, u64 sp0, u64 fp, u64 lr);
+void hv_standalone_dump_cpus(void);
+void hv_prof_dump(void);
+void hv_standalone_shadow_tick(void);
 void hv_set_time_stealing(bool enabled, bool reset);
 void hv_add_time(s64 time);
 
