@@ -4,6 +4,7 @@
 #include "../build/build_tag.h"
 
 #include "payload.h"
+#include "xnuboot.h"
 #include "adt.h"
 #include "assert.h"
 #include "chainload.h"
@@ -179,6 +180,7 @@ static char *chosen[MAX_CHOSEN_VARS];
 
 static bool enable_tso = false;
 static bool kbdtest = false;
+static char *selfboot_spec;
 
 static bool check_var(u8 **p)
 {
@@ -209,6 +211,8 @@ static bool check_var(u8 **p)
         mitigations_configure(val);
     } else if (IS_VAR("tso=")) {
         enable_tso = val[0] == '1';
+    } else if (IS_VAR("siliconnt=")) {
+        selfboot_spec = val;
     } else if (IS_VAR("hv=")) {
         /* handled by hv_boot_note_var() */
     } else if (IS_VAR("kbdtest=")) {
@@ -329,8 +333,20 @@ int payload_run(void)
     if (kbdtest)
         spihid_selftest();
 
-    if (hv_boot_requested())
-        return hv_boot();
+    if (hv_boot_requested()) {
+        if (selfboot_spec && strlen(selfboot_spec) != 36)
+            return -1;
+        return hv_boot(selfboot_spec);
+    }
+    if (selfboot_spec) {
+        u64 image[2];
+        int map = adt_path_offset(adt, "/chosen/memory-map");
+        if (in_el2() || map < 0 || ADT_GETPROP_ARRAY(adt, map, "SiliconNTFirmware", image) < 0 ||
+            image[0] < cur_boot_args.phys_base || image[0] >= cur_boot_args.top_of_kernel_data ||
+            image[1] > cur_boot_args.top_of_kernel_data - image[0])
+            return -1;
+        kernel = (void *)image[0];
+    }
 
     if (kernel && fdt) {
         cpufreq_init();

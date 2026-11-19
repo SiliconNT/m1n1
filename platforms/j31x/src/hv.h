@@ -86,7 +86,7 @@ void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type
 extern bool hv_standalone;
 void hv_boot_note_var(char *var, char *val);
 bool hv_boot_requested(void);
-int hv_boot(void);
+int hv_boot(const char *partition);
 void hv_standalone_exc(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type,
                        void *extra);
 void hv_standalone_tick(struct exc_info *ctx);

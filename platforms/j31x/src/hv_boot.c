@@ -29,6 +29,8 @@
 #include "pmgr.h"
 #include "smp.h"
 #include "soc.h"
+#include "nvme.h"
+#include "selfboot.h"
 #include "string.h"
 #include "uart_regs.h"
 #include "utils.h"
@@ -470,7 +472,22 @@ static void memmap_set(int memmap, const char *name, u64 addr, u64 size)
         printf("HV: failed to set /chosen/memory-map/%s\n", name);
 }
 
-int hv_boot(void)
+/* J31x WinPE uses a single FAT32 partition in an MBR disk image. */
+static int j31x_check_disk(const void *disk, u64 size)
+{
+    const u8 *p = disk;
+    if (size >= 1024 && !memcmp(p + 512, "EFI PART", 8))
+        return selfboot_check_disk(disk, size);
+    if (!size || size % SELFBOOT_DISK_PAGE || p[510] != 0x55 || p[511] != 0xaa)
+        return -1;
+    u32 first, sectors;
+    memcpy(&first, p + 454, 4);
+    memcpy(&sectors, p + 458, 4);
+    return (p[450] == 0x0c || p[450] == 0x0b) && first && sectors &&
+                   (u64)first + sectors <= size / 512 ? 0 : -1;
+}
+
+int hv_boot(const char *partition)
 {
     if (!in_el2()) {
         printf("HV: hv=1 but we are not in EL2 (already a guest?), ignoring\n");
@@ -547,6 +564,31 @@ int hv_boot(void)
     printf("HV: host heap top 0x%lx, guest RAM 0x%lx..0x%lx\n", heap_top, phys_base, mem_top);
     printf("HV: guest ADT 0x%lx, image 0x%lx (0x%lx bytes incl. SEPFW/bootargs), entry 0x%lx\n",
            adt_base, guest_base, image_size, entry);
+
+    struct selfboot_layout files = {0};
+    if (partition) {
+        /* Leave the EL1 trampoline, SEPFW, TrustCache and boot args intact. */
+        if (selfboot_layout_init(&files, ALIGN_UP(guest_base + image_size, SZ_16K),
+                                 &cur_boot_args) < 0)
+            return -1;
+        /* The board firmware copies boot args and its ADT to this fixed address. */
+        files.uefi_base = min(files.uefi_base, 0x10220000000ULL);
+        for (size_t i = 0; i < mcc_carveout_count; i++) {
+            u64 base = mcc_carveouts[i].base;
+            if (base <= files.image_base && files.image_base - base < mcc_carveouts[i].size)
+                return -1;
+            if (base > files.image_base && mcc_carveouts[i].size)
+                files.uefi_base = min(files.uefi_base, base);
+        }
+        if (files.image_base + SELFBOOT_BOOTARGS_SIZE >= files.uefi_base || !nvme_init())
+            return -1;
+        int ret = selfboot_read_files(&files, partition, j31x_check_disk);
+        nvme_shutdown();
+        if (ret < 0)
+            return -1;
+        dc_cvau_range((void *)files.image_base, files.image_size);
+        ic_ivau_range((void *)files.image_base, files.image_size);
+    }
 
     /* --- Hypervisor init (Python: HV.init()) --------------------------------------------- */
 
@@ -668,7 +710,17 @@ int hv_boot(void)
         memcpy((void *)(guest_base + pol_off), (void *)pol_addr, pol_len);
 
     /* Guest ADT: a copy with the memory map pointing at the guest's own copies */
-    memcpy((void *)adt_base, adt, cur_boot_args.devtree_size);
+    if (partition) {
+        files.adt_base = adt_base;
+        files.adt_size = adt_size;
+        files.bootargs = guest_base + bootargs_off;
+        if (selfboot_adt((void *)adt_base, cur_boot_args.devtree_size, &files) < 0 ||
+            selfboot_adt_add_range((void *)adt_base, "SiliconNTFirmware", files.image_base,
+                                   files.image_size) < 0)
+            return -1;
+    } else {
+        memcpy((void *)adt_base, adt, cur_boot_args.devtree_size);
+    }
     void *host_adt = adt;
     adt = (void *)adt_base; /* adt_setprop() only works on the global */
     memmap_set(memmap, "SEPFW", guest_base + sepfw_off, sepfw_len);
@@ -687,7 +739,7 @@ int hv_boot(void)
     tba->phys_base = phys_base;
     tba->virt_base = 0xfffffe0010000000ULL + (phys_base & (SZ_32M - 1));
     tba->devtree = (void *)(adt_base - phys_base + tba->virt_base);
-    tba->top_of_kernel_data = guest_base + image_size;
+    tba->top_of_kernel_data = partition ? files.top : guest_base + image_size;
     if (shadow_fb) {
         /* Start from what is on the screen now (m1n1 logo), converted to 8 bits per channel */
         for (u32 y = 0; y < fb_h; y++)
