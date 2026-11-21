@@ -228,10 +228,11 @@ print(f"Virtual UART at 0x{uart_base:x}")
 def aic_line(line):
     """For aictest: the SPI the table of m1n1 has for this AIC line, and where its software
     trigger is set and cleared, and its bit there. AIC as aic_init() of src/aic.c reads it:
-    on AIC2 and AIC3 every die has the configuration of each line, then the bitmaps of the
-    software trigger (set, clear), of the mask (set, clear) and the state of the lines; the
-    trigger is set at the die's stride for masking and cleared at the one for unmasking, as
-    aic_set_sw() has it."""
+    on AIC2 and AIC3 every die has the configuration of each line, from extint-baseaddress
+    of the device tree or else, on AIC2, from 0x2000; then the bitmaps of the software
+    trigger (set, clear), of the mask (set, clear) and the state of the lines. Set goes by the
+    die's stride for masking, clear by the one for unmasking, as aic_set_sw(), aic_mask() and
+    aic_unmask() have it. Where the line is masked and unmasked is printed too."""
     buf = u.malloc(0x4000)
     size = p.hv_aicmap(buf)
     if size < 8:
@@ -254,24 +255,32 @@ def aic_line(line):
             value = struct.unpack_from("<I", value)[0]
         return value
     if "aic,1" in node.compatible:
-        max_irq, sw_set, sw_clr, set_stride, clr_stride = 0x400, 0x4000, 0x4080, 0, 0
+        max_irq, set_stride, clr_stride = 0x400, 0, 0
+        sw_set, sw_clr, mask_set, mask_clr = 0x4000, 0x4080, 0x4100, 0x4180
     else:
         if "aic,2" in node.compatible:
-            config, maxnumirq = 0x2000, 0xc
+            config, maxnumirq = prop32("extint-baseaddress", 0x2000), 0xc
         else:
             config, maxnumirq = prop32("extint-baseaddress"), prop32("maxnumirq-offset")
+            if config is None or maxnumirq is None:
+                sys.exit("/arm-io/aic: an AIC3 without extint-baseaddress or maxnumirq-offset")
         max_irq = p.read32(base + maxnumirq) & 0xffff
         words = 4 * (max_irq // 32)
         sw_set = config + 4 * max_irq
         sw_clr = sw_set + words
+        mask_set = sw_clr + words
+        mask_clr = mask_set + words
         die_size = 4 * max_irq + 5 * words
         set_stride = prop32("intmaskset-stride", die_size)
         clr_stride = prop32("intmaskclear-stride", die_size)
     die, num = line // max_irq, line % max_irq
-    set_addr = base + sw_set + die * set_stride + 4 * (num // 32)
-    clr_addr = base + sw_clr + die * clr_stride + 4 * (num // 32)
+    word = 4 * (num // 32)
+    set_addr = base + sw_set + die * set_stride + word
+    clr_addr = base + sw_clr + die * clr_stride + word
     print(f"AIC line {line} (die {die}, line {num}) is SPI {spi}; its software trigger is set "
           f"at 0x{set_addr:x} and cleared at 0x{clr_addr:x}, bit {num % 32}")
+    print(f"  it is masked at 0x{base + mask_set + die * set_stride + word:x} and unmasked at "
+          f"0x{base + mask_clr + die * clr_stride + word:x}, the same bit")
     return spi, set_addr, clr_addr, 1 << (num % 32)
 
 if args.aic_line is not None:

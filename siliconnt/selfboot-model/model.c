@@ -9,7 +9,26 @@ int checks, failed;
 
 void *adt;
 
-#define PROP_SIZE(p) ((p)->size & 0x7fffffff)
+/*
+ * As rust/src/adt.rs has it. A property is stepped over by its length as it is, the top bit
+ * included (adt_next_property_offset(), ADTProperty::next_property()), and one with any of
+ * the bits 0x7ff00000 of its length set is refused (ADTProperty::check()). Where m1n1
+ * unwrap()s that, it panics: here the test stops. A property with the top bit of its length
+ * set can therefore only be where nothing has to be stepped over it.
+ */
+static bool prop_ok(int offset)
+{
+    return !(offset % 4) && !(ADT_PROP(adt, offset)->size & 0x7ff00000);
+}
+
+static const struct adt_property *prop_or_panic(int offset)
+{
+    if (!prop_ok(offset)) {
+        printf("model: m1n1 would panic: no property at offset 0x%x of the device tree\n", offset);
+        exit(3);
+    }
+    return ADT_PROP(adt, offset);
+}
 
 static const struct adt_node_hdr *node_at(int offset)
 {
@@ -31,20 +50,35 @@ int adt_first_property_offset(const void *dt, int offset)
     return offset + sizeof(struct adt_node_hdr);
 }
 
+/* The offset, cut to an int, as the C side gets it */
 int adt_next_property_offset(const void *dt, int offset)
 {
-    const struct adt_property *p = ADT_PROP(adt, offset);
-    return offset + sizeof(*p) + ((PROP_SIZE(p) + 3) & ~3);
+    const struct adt_property *p = prop_or_panic(offset);
+    return (int)(offset + sizeof(*p) + (((u64)p->size + 3) & ~3UL));
 }
 
+/*
+ * ADTNode::named_prop() over ADTPropertiesIterator: when a property is handed out, the one
+ * after it is looked at already; if that one is refused, no later one is found
+ */
 const struct adt_property *adt_get_property(const void *dt, int nodeoffset, const char *name)
 {
     int off = adt_first_property_offset(dt, nodeoffset);
+
+    if (!prop_ok(off))
+        return NULL;
     for (int i = adt_get_property_count(dt, nodeoffset); i; i--) {
         const struct adt_property *p = ADT_PROP(adt, off);
+        bool next_ok = true;
+
+        if (i > 1) {
+            off = adt_next_property_offset(dt, off);
+            next_ok = prop_ok(off);
+        }
         if (!strcmp(p->name, name))
             return p;
-        off = adt_next_property_offset(dt, off);
+        if (!next_ok)
+            return NULL;
     }
     return NULL;
 }
@@ -61,14 +95,22 @@ const void *adt_getprop(const void *dt, int nodeoffset, const char *name, u32 *l
     return p->value;
 }
 
-/* rust/src/adt.rs: the length, or an error if the property is not exactly as long as `out` */
+/*
+ * rust/src/adt.rs: the length, or an error if the property is not exactly as long as `out`.
+ * There the whole property is copied before its length is looked at (copy_raw()), past the
+ * end of `out` if it is longer: here the test stops.
+ */
 int adt_getprop_copy(const void *dt, int nodeoffset, const char *name, void *out, size_t len)
 {
     const struct adt_property *p = adt_get_property(dt, nodeoffset, name);
 
     if (!p)
         return -1;
-    if (PROP_SIZE(p) != len)
+    if (p->size > len) {
+        printf("model: m1n1 would write %u bytes of %s to where %zu go\n", p->size, name, len);
+        exit(3);
+    }
+    if (p->size != len)
         return -2;
     memcpy(out, p->value, len);
     return len;

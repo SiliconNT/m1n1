@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Host-side model tests for src/hv/hv_vgic.c and src/hv/hv_wfi.c (test.c) and for
+# Host-side model tests for src/hv/hv_vgic.c and src/hv/hv_wfi.c (test.c), for the masking
+# functions of src/aic.c (aic_test.c, with the stand-in headers of aic/) and for
 # src/hv/hv_psci.c (psci_test.c), src/hv/hv_pmu.c (pmu_test.c), the page tables of
 # src/hv/hv_vm.c (pt_test.c), src/hv/hv_xtrack.c (xtrack_test.c) and src/hv/hv_xinsn.c
 # (xinsn_test.c, test_xinsn.py). They compile the real files for the build machine against
@@ -13,6 +14,7 @@
 #               fail on each
 #   make xinsn  only the one for the instruction decoder of execution tracking
 #   make dbg    only the one for the debug registers, src/hv/hv_dbg.c (dbg_test.c)
+#   make aic    only the one for aic_mask(), aic_unmask() and aic_mask_all() of src/aic.c
 #   make psci   only the PSCI one, and test_hv_events.py: that the host has a handler for
 #               every event the hypervisor sends (needs the Python of the proxy client)
 #   make tsan   test.c under ThreadSanitizer, with fewer rounds
@@ -25,9 +27,9 @@ SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -pthread -I. -Ibuild
 ROUNDS ?= 200000
 
-.PHONY: all psci pmu pt xtrack xtrack-broken xinsn dbg tsan vgic-broken clean
+.PHONY: all psci pmu pt xtrack xtrack-broken xinsn dbg aic tsan vgic-broken clean
 
-all: build/model psci pmu pt xinsn xtrack xtrack-broken dbg vgic-broken
+all: build/model psci pmu pt xinsn xtrack xtrack-broken dbg aic vgic-broken
 	build/model $(ROUNDS)
 
 # The breakpoint and watchpoint registers of the guest, src/hv/hv_dbg.c
@@ -158,6 +160,18 @@ build/aic_regs.h: $(SRC)/aic_regs.h
 	@mkdir -p build
 	cp $< $@
 
+# src/aic.c against the stand-ins of aic/, which come first: it is copied, so that its
+# #include "..." lines do not find the real headers next to it
+aic: build/aic-model
+	build/aic-model
+
+build/aic.c: $(SRC)/aic.c
+	@mkdir -p build
+	cp $< $@
+
+build/aic-model: aic_test.c $(wildcard aic/*.h) types.h build/aic.c build/aic.h build/aic_regs.h
+	$(CC) -O2 -g -Wall -Werror -Wno-unused-parameter -Iaic -I. -Ibuild -o $@ aic_test.c build/aic.c
+
 # The table of AIC lines and SPIs, as the real hv.h has it; test.c makes one of its own
 build/hv_aicmap.h: $(SRC)/hv/hv.h
 	@mkdir -p build
@@ -181,12 +195,15 @@ build/model-tsan: $(MODEL_DEPS) build/hv_vgic.c
 # something (cmp), or the source has moved on.
 VGIC_BROKEN := unmask-on-enable mask-on-disable unmask-when-ended mask-when-ended-disabled \
 	forward-any-state wrong-spi no-die no-mask-all end-not-seen last-line-missed \
-	unmask-in-flight no-table-check
+	unmask-in-flight no-table-check late-is-stray stray-without-limit spurious-not-reset
 BREAK_VGIC_unmask-on-enable := /^            aic_unmask(vgic_aicmap.line\[k\]);$$/d
 BREAK_VGIC_mask-on-disable := /^            aic_mask(vgic_aicmap.line\[k\]);$$/d
 BREAK_VGIC_unmask-when-ended := /^        aic_unmask(vgic_aicmap.line\[k\]);$$/d
 BREAK_VGIC_mask-when-ended-disabled := s/if (vgic_load(vgic_dist.enable\[intid \/ 32\]) \& BIT(intid % 32)) {/if (1) {/
-BREAK_VGIC_forward-any-state := s/if (k < 0 || vgic_lines\[k\] != VGIC_LINE_WAITING)/if (k < 0)/
+BREAK_VGIC_forward-any-state := /if (vgic_lines\[k\] == VGIC_LINE_MASKED)/,+1d;s/if (vgic_lines\[k\] != VGIC_LINE_WAITING)/if (0)/
+BREAK_VGIC_late-is-stray := s/return VGIC_EVENT_LATE;/return VGIC_EVENT_STRAY;/
+BREAK_VGIC_stray-without-limit := s/if (VGIC_PERCPU(unmapped) >= VGIC_UNMAPPED_LIMIT)/if (0)/
+BREAK_VGIC_spurious-not-reset := /VGIC_PERCPU(spurious_run) = 0;/d
 BREAK_VGIC_wrong-spi := s/vgic_pend_spi(HV_AICMAP_FIRST_SPI + k, true);/vgic_pend_spi(HV_AICMAP_FIRST_SPI + k + 1, true);/
 BREAK_VGIC_no-die := s/FIELD_GET(AIC_EVENT_DIE, event) \* aic->max_irq +/0 * aic->max_irq +/
 BREAK_VGIC_no-mask-all := /^        aic_mask_all();$$/d

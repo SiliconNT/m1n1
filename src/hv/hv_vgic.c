@@ -46,9 +46,16 @@
 #include "smp.h"
 #include "utils.h"
 
-/* IRQs that arrive with neither an AIC event nor a maintenance interrupt, before giving up */
+/*
+ * IRQs in a row that arrive with neither an AIC event nor a maintenance interrupt, before
+ * giving up. One now and then is no fault: AIC may raise an IRQ for a line that the guest
+ * masks before the event register is read, which then reads 0.
+ */
 #define VGIC_SPURIOUS_LIMIT 16
-/* AIC events that are not forwarded, before giving up: more than there are AIC lines */
+/*
+ * AIC events that masking should have kept away, before giving up: more than there are AIC
+ * lines. Those of a line that was masked just before AIC reported it do not count.
+ */
 #define VGIC_UNMAPPED_LIMIT (2 * AIC_MAX_HW_NUM)
 
 #define VGIC_NR_SGIS   16
@@ -130,9 +137,11 @@
 struct hv_vgic_pcpu {
     u64 injected;
     u64 maintenance;
-    u64 forwarded; // AIC events whose SPI was made pending
-    u64 unmapped;  // ...and those that were not
-    u64 spurious;
+    u64 forwarded;    // AIC events whose SPI was made pending
+    u64 late;         // ...of a line of the table that the guest had just disabled
+    u64 unmapped;     // ...that masking should have kept away (VGIC_UNMAPPED_LIMIT)
+    u64 spurious;     // IRQs with neither an AIC event nor a maintenance interrupt
+    u64 spurious_run; // ...since the last one that did something (VGIC_SPURIOUS_LIMIT)
     u64 retracted;    // interrupts taken back out of a list register
     u64 sgi_writes;   // writes to ICC_SGI1R_EL1 by the guest on this core
     u64 sgi_deferred; // returns to the guest with SGIs left waiting for a list register
@@ -343,7 +352,8 @@ static void vgic_init_global(void)
         __atomic_store_n(&p->kick, 0, __ATOMIC_SEQ_CST);
         p->spi_left = false;
         p->injected = p->maintenance = p->unmapped = p->spurious = p->retracted = 0;
-        p->forwarded = p->sgi_writes = p->sgi_deferred = p->spi_deferred = 0;
+        p->forwarded = p->late = p->spurious_run = 0;
+        p->sgi_writes = p->sgi_deferred = p->spi_deferred = 0;
     }
 
     /*
@@ -894,28 +904,42 @@ static void vgic_lines_enable(u32 word, u32 bits, bool enable)
     }
 }
 
-/*
- * AIC reported a line, and masked it doing so. Returns whether its SPI was made pending: it
- * is a line of the table that the guest waits for.
- */
-static bool vgic_line_event(u32 event)
+/* What became of an AIC event */
+enum vgic_event {
+    VGIC_EVENT_FORWARDED, // a line of the table the guest waits for: its SPI is pending
+    VGIC_EVENT_LATE,      // a line of the table that the guest disabled just before AIC reported it
+    VGIC_EVENT_STRAY,     // anything else, which masking should have kept away
+};
+
+/* AIC reported a line, and masked it doing so */
+static enum vgic_event vgic_line_event(u32 event)
 {
     int k;
 
     if (FIELD_GET(AIC_EVENT_TYPE, event) != AIC_EVENT_TYPE_HW)
-        return false;
+        return VGIC_EVENT_STRAY;
     k = vgic_line_index(FIELD_GET(AIC_EVENT_DIE, event) * aic->max_irq +
                         FIELD_GET(AIC_EVENT_NUM, event));
-    if (k < 0 || vgic_lines[k] != VGIC_LINE_WAITING)
-        return false;
+    if (k < 0)
+        return VGIC_EVENT_STRAY;
+    /* Masked while it was on its way: it stays masked now, as it is to be */
+    if (vgic_lines[k] == VGIC_LINE_MASKED)
+        return VGIC_EVENT_LATE;
+    if (vgic_lines[k] != VGIC_LINE_WAITING)
+        return VGIC_EVENT_STRAY;
 
     vgic_lines[k] = VGIC_LINE_IN_FLIGHT;
     vgic_pend_spi(HV_AICMAP_FIRST_SPI + k, true);
-    VGIC_PERCPU(forwarded)++;
-    return true;
+    return VGIC_EVENT_FORWARDED;
 }
 
-/* The guest has ended an interrupt. If it was a line in flight, AIC may report it again. */
+/*
+ * The guest has ended an interrupt. If it was a line in flight, AIC may report it again.
+ *
+ * This is the only way out of "in flight". Whatever else comes to end an interrupt, should
+ * the Distributor ever emulate it (GICD_ICPENDR, GICD_ICACTIVER, which are ignored now), has
+ * to come through here for the line of the SPI too, or the line stays masked for good.
+ */
 static void vgic_line_ended(u32 intid)
 {
     int k = vgic_spi_line_index(intid);
@@ -1311,15 +1335,17 @@ void hv_vgic_report(void)
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
         struct hv_vgic_pcpu *p = &vgic_pcpu[cpu];
 
-        if (!p->injected && !p->sgi_writes && !p->maintenance)
+        if (!p->injected && !p->sgi_writes && !p->maintenance && !p->late && !p->unmapped &&
+            !p->spurious)
             continue;
 
         printf("HV: vGIC: CPU %d: %ld ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, "
                "%ld taken back, %ld returns with SGIs waiting, %ld with SPIs waiting, SGIs still "
-               "pending 0x%x, %ld AIC events forwarded, %ld not\n",
+               "pending 0x%x, AIC events: %ld forwarded, %ld late, %ld stray; %ld IRQs with "
+               "neither\n",
                cpu, p->sgi_writes, p->injected, p->maintenance, p->retracted, p->sgi_deferred,
                p->spi_deferred, __atomic_load_n(&p->sgi_pending, __ATOMIC_SEQ_CST), p->forwarded,
-               p->unmapped);
+               p->late, p->unmapped, p->spurious);
     }
 
     for (u32 k = 0; k < vgic_aicmap.count; k++)
@@ -1351,17 +1377,26 @@ bool hv_vgic_handle_irq(void)
 
         if (FIELD_GET(AIC_EVENT_TYPE, event)) {
             handled = true;
-            /*
-             * One the guest does not wait for stays masked, so it does not come again. If
-             * such events keep coming anyway, the masking did not work: stop.
-             */
-            if (!vgic_line_event(event)) {
-                if (vgic_should_log(++VGIC_PERCPU(unmapped)))
-                    printf("HV: vGIC: CPU %d: AIC event 0x%x is not forwarded, left masked "
-                           "(#%ld)\n",
-                           smp_id(), event, VGIC_PERCPU(unmapped));
-                if (VGIC_PERCPU(unmapped) >= VGIC_UNMAPPED_LIMIT)
-                    return false;
+            switch (vgic_line_event(event)) {
+                case VGIC_EVENT_FORWARDED:
+                    VGIC_PERCPU(forwarded)++;
+                    VGIC_PERCPU(spurious_run) = 0;
+                    break;
+                case VGIC_EVENT_LATE:
+                    VGIC_PERCPU(late)++;
+                    break;
+                case VGIC_EVENT_STRAY:
+                    /*
+                     * It stays masked, so it does not come again. If such events keep coming
+                     * anyway, the masking did not work: stop.
+                     */
+                    if (vgic_should_log(++VGIC_PERCPU(unmapped)))
+                        printf("HV: vGIC: CPU %d: AIC event 0x%x is not forwarded, left masked "
+                               "(#%ld)\n",
+                               smp_id(), event, VGIC_PERCPU(unmapped));
+                    if (VGIC_PERCPU(unmapped) >= VGIC_UNMAPPED_LIMIT)
+                        return false;
+                    break;
             }
         }
     }
@@ -1372,6 +1407,7 @@ bool hv_vgic_handle_irq(void)
         u64 eisr = mrs(SYS_ICH_EISR_EL2);
 
         handled = true;
+        VGIC_PERCPU(spurious_run) = 0;
 
         /* The guest ended these interrupts. Emptying the list register drops the request. */
         for (int i = 0; i < nr_lr; i++) {
@@ -1400,9 +1436,10 @@ bool hv_vgic_handle_irq(void)
     if (!handled) {
         u64 count = ++VGIC_PERCPU(spurious);
 
-        printf("HV: vGIC: CPU %d: IRQ without AIC event or maintenance interrupt (#%ld)\n",
-               smp_id(), count);
-        if (count >= VGIC_SPURIOUS_LIMIT)
+        if (vgic_should_log(count))
+            printf("HV: vGIC: CPU %d: IRQ without AIC event or maintenance interrupt (#%ld)\n",
+                   smp_id(), count);
+        if (++VGIC_PERCPU(spurious_run) >= VGIC_SPURIOUS_LIMIT)
             return false;
     }
 

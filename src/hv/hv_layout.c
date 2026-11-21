@@ -208,8 +208,10 @@ static u32 interrupt_parent(const u8 *phandles, u32 count, u32 index)
 /*
  * The values in "interrupts" of a node that go to AIC, the controller with this phandle:
  * one number of 32 bits each. Returns how many of them are not a line of this AIC; those
- * are left out. So are properties with the top bit of their length set, which nothing here
- * knows the meaning of, and a node with no whole phandle in "interrupt-parent".
+ * are left out. So is a node with no whole phandle in "interrupt-parent", and one where
+ * either property has the top bit of its length set. m1n1's device tree code cannot step
+ * over such a property anyway (rust/src/adt.rs takes the length as it is), so it can only
+ * be the last of the tree: the check only keeps what follows its value from being read.
  */
 static u32 aicmap_add(int node, u32 aic_phandle)
 {
@@ -237,18 +239,25 @@ static u32 aicmap_add(int node, u32 aic_phandle)
 
 int hv_aicmap(struct hv_aicmap *map)
 {
-    u32 phandle, count = 0, left_out = 0;
+    u32 phandle, len, count = 0, left_out = 0;
+    const void *value;
     int node;
 
     if (!aic) {
         printf("HV: vGIC: there is no AIC, so no SPIs for its lines\n");
         return -1;
     }
+    /*
+     * Not with ADT_GETPROP(), which copies all of a property before it looks at how long it
+     * is (adt_getprop_copy() of rust/src/adt.rs)
+     */
     node = adt_path_offset(adt, AIC_NODE);
-    if (node < 0 || ADT_GETPROP(adt, node, "AAPL,phandle", &phandle) < 0) {
+    value = node < 0 ? NULL : adt_getprop(adt, node, "AAPL,phandle", &len);
+    if (!value || len != sizeof(phandle)) {
         printf("HV: vGIC: no " AIC_NODE " with a phandle in the device tree\n");
         return -1;
     }
+    memcpy(&phandle, value, sizeof(phandle));
 
     memset(aicmap_lines, 0, sizeof(aicmap_lines));
     /* Every node, from the root: those still to come are counted by their parents */

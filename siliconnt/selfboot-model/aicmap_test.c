@@ -81,6 +81,9 @@ static void node(const char *name, u32 children, struct props pr)
     at = put_name(at, name);
     if (pr.phandle)
         at = put_prop(at, "AAPL,phandle", &pr.phandle, 4);
+    /* A placeholder goes last: nothing can be stepped over it (model.c) */
+    if (pr.flagged_parent && pr.irqs)
+        at = put_prop(at, "interrupts", pr.irqs, pr.irq_bytes);
     if (pr.parents || pr.parent) {
         struct adt_property *prop = (struct adt_property *)at;
 
@@ -91,7 +94,7 @@ static void node(const char *name, u32 children, struct props pr)
         if (pr.flagged_parent)
             prop->size |= 0x80000000;
     }
-    if (pr.irqs) {
+    if (pr.irqs && !pr.flagged_parent) {
         struct adt_property *prop = (struct adt_property *)at;
 
         at = put_prop(at, "interrupts", pr.irqs, pr.irq_bytes);
@@ -113,7 +116,7 @@ static void m4_tree(void)
     node("device-tree", 3, (struct props){0});
     /* Interrupts, but no interrupt-parent: not AIC's */
     node("orphan", 0, (struct props){IRQS(7)});
-    node("arm-io", 12, (struct props){0});
+    node("arm-io", 11, (struct props){0});
     node("aic", 0, (struct props){.phandle = AIC_PHANDLE});
     node("wdt", 0, ON_AIC(0, 1));
     /* As on the M4: a phandle for each value; the last two are another controller's */
@@ -135,8 +138,6 @@ static void m4_tree(void)
     node("dart-disp0", 0, ON_AIC(678));
     node("uart0", 0, ON_AIC(969));
     node("apcie", 0, ON_AIC(1505));
-    /* A property that is only a placeholder: the top bit of its length is set */
-    node("sep", 0, (struct props){.parent = AIC_PHANDLE, IRQS(77), .flagged = true});
     /* Six bytes: one whole value */
     node("odd", 0, (struct props){.parent = AIC_PHANDLE, IRQS(33, 34), .irq_bytes = 6});
     node("cpus", 1, (struct props){0});
@@ -307,7 +308,7 @@ static void test_what_is_not_aics(void)
     m4();
     begin();
     node("device-tree", 1, (struct props){0});
-    node("arm-io", 10, (struct props){0});
+    node("arm-io", 9, (struct props){0});
     node("aic", 0, (struct props){.phandle = AIC_PHANDLE});
     node("dev", 0, ON_AIC(10));
     /* AIC's first, then another's, which goes on for the values that follow */
@@ -320,14 +321,39 @@ static void test_what_is_not_aics(void)
     node("bad", 0, (struct props){PARENTS(AIC_PHANDLE, OTHER_PHANDLE), IRQS(5000, 21)});
     /* Less than one phandle: no interrupt-parent */
     node("half", 0, (struct props){PARENTS(AIC_PHANDLE), .parent_bytes = 2, IRQS(17)});
-    /* An interrupt-parent that is only a placeholder */
-    node("placeholder", 0, (struct props){.parent = AIC_PHANDLE, .flagged_parent = true, IRQS(18)});
     /* Another controller's */
     node("other", 0, (struct props){.parent = GPIO_PHANDLE, IRQS(19)});
     /* AIC's, without interrupts */
     node("quiet", 0, (struct props){.parent = AIC_PHANDLE});
     CHECK(table_is(make(), lines, COUNT(lines)));
     CHECK(says("5 AIC lines are SPIs 32 .. 36: AIC 10 .. 20; 1 values"));
+}
+
+/*
+ * Properties that are only placeholders, the top bit of their length set. m1n1's device tree
+ * code steps over a property by its length as it is (model.c), so such a property can only be
+ * the last one of the tree; there, its value is not to be read as lines.
+ */
+static void test_placeholders(void)
+{
+    static const u32 lines[] = {10};
+
+    m4();
+    begin();
+    node("device-tree", 1, (struct props){0});
+    node("arm-io", 3, (struct props){0});
+    node("aic", 0, (struct props){.phandle = AIC_PHANDLE});
+    node("dev", 0, ON_AIC(10));
+    node("sep", 0, (struct props){.parent = AIC_PHANDLE, IRQS(77), .flagged = true});
+    CHECK(table_is(make(), lines, COUNT(lines)));
+
+    begin();
+    node("device-tree", 1, (struct props){0});
+    node("arm-io", 3, (struct props){0});
+    node("aic", 0, (struct props){.phandle = AIC_PHANDLE});
+    node("dev", 0, ON_AIC(10));
+    node("placeholder", 0, (struct props){.parent = AIC_PHANDLE, .flagged_parent = true, IRQS(18)});
+    CHECK(table_is(make(), lines, COUNT(lines)));
 }
 
 static void test_no_table(void)
@@ -366,6 +392,7 @@ int main(void)
     test_two_dies();
     test_how_many();
     test_what_is_not_aics();
+    test_placeholders();
     test_no_table();
 
     printf("aicmap_test: %d checks, %d failed\n", checks, failed);
