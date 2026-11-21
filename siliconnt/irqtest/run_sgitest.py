@@ -18,6 +18,15 @@ build/xitest.bin (xitest.c) is a sixth guest that this script loads, also with -
 executes every load and store that src/hv/hv_xinsn.c takes apart, where the hypervisor has
 no part in it and where the hypervisor carries it out, and compares. It ends with SYSTEM_OFF.
 
+build/aictest.bin (aictest.c) is a seventh, for how the hypervisor forwards an AIC line as
+an SPI (src/hv/hv_vgic.c). It needs --aic-line N: the line it raises and lowers with the
+software trigger of AIC, as die * max_irq + line, which has to be one of the table of AIC
+lines and SPIs that m1n1 makes from its device tree (hv_aicmap(), src/hv/hv_layout.c), and
+one that no device of the machine raises meanwhile. The script asks m1n1 for the table
+(P_HV_AICMAP), looks the line up in it and tells the guest which SPI that is, and where in
+AIC the software trigger of the line is set and cleared, worked out from the device tree and
+the registers of AIC the way aic_init() of src/aic.c does. aictest ends with SYSTEM_OFF.
+
 pscitest takes an argument, --guest-arg: 0x100 makes it expect exactly the answers of the
 hypervisor's PSCI, and the low four bits choose the call it ends with (0 SYSTEM_OFF,
 1 SYSTEM_RESET, 2 hvc #1, 3 CPU_ON, 4 CPU_OFF). None of those calls comes back: the
@@ -56,6 +65,9 @@ parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "buil
                     help="the raw m1n1.bin that is supposed to be running on the target")
 parser.add_argument("--guest-arg", type=lambda s: int(s, 0), default=0, metavar="N",
                     help="what goes into the argument field of the image header (default 0)")
+parser.add_argument("--aic-line", type=lambda s: int(s, 0), metavar="N",
+                    help="for aictest: the AIC line it raises and lowers, as die * max_irq + "
+                         "line; one of the table of AIC lines and SPIs")
 parser.add_argument("--xtrack", action="store_true",
                     help="track execution: scan the memory of the guest before it runs "
                          "(for pmutest)")
@@ -78,6 +90,10 @@ START_VAL_OFF = START_REG_OFF + 8 * MAX_CPUS
 GICD_BASE_OFF = START_VAL_OFF + 8 * MAX_CPUS
 GICR_BASE_OFF = GICD_BASE_OFF + 8
 ARG_OFF = GICR_BASE_OFF + 8
+AIC_SET_OFF = ARG_OFF + 8
+AIC_CLR_OFF = AIC_SET_OFF + 8
+AIC_BIT_OFF = AIC_CLR_OFF + 8
+AIC_SPI_OFF = AIC_BIT_OFF + 8
 
 # Where the hypervisor puts the Distributor and the Redistributors: HV_VGIC_DIST_BASE and
 # HV_VGIC_REDIST_BASE in src/hv/hv.h
@@ -86,8 +102,8 @@ GICR_BASE = 0x51_0000_0000
 
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
-    sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest, pscitest, pmutest or xitest "
-             "image of this tree")
+    sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest, pscitest, pmutest, xitest "
+             "or aictest image of this tree")
 if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
     sys.exit(f"{args.payload}: UART base already filled in")
 secondary_entry_off = struct.unpack_from("<Q", image, SECONDARY_OFF)[0]
@@ -208,6 +224,59 @@ if u.mrs(ICH_MISR_EL2):
 
 uart_base = hv.adt["/arm-io/uart0"].get_reg(0)[0]
 print(f"Virtual UART at 0x{uart_base:x}")
+
+def aic_line(line):
+    """For aictest: the SPI the table of m1n1 has for this AIC line, and where its software
+    trigger is set and cleared, and its bit there. AIC as aic_init() of src/aic.c reads it:
+    on AIC2 and AIC3 every die has the configuration of each line, then the bitmaps of the
+    software trigger (set, clear), of the mask (set, clear) and the state of the lines; the
+    trigger is set at the die's stride for masking and cleared at the one for unmasking, as
+    aic_set_sw() has it."""
+    buf = u.malloc(0x4000)
+    size = p.hv_aicmap(buf)
+    if size < 8:
+        sys.exit(f"m1n1 wrote no table of AIC lines and SPIs (P_HV_AICMAP returned {size}): it "
+                 "has said why above")
+    table = iface.readmem(buf, size)
+    version, count = struct.unpack_from("<II", table)
+    lines = struct.unpack_from(f"<{count}I", table, 8)
+    print(f"AIC to GIC table: version {version}, {count} lines, AIC {lines[0] if lines else '-'} "
+          f".. {lines[-1] if lines else '-'}")
+    if line not in lines:
+        sys.exit(f"--aic-line {line}: not a line of the table")
+    spi = 32 + lines.index(line)
+
+    node = u.adt["/arm-io/aic"]
+    base = node.get_reg(0)[0]
+    def prop32(name, default=None):
+        value = node._properties.get(name, default)
+        if isinstance(value, bytes):
+            value = struct.unpack_from("<I", value)[0]
+        return value
+    if "aic,1" in node.compatible:
+        max_irq, sw_set, sw_clr, set_stride, clr_stride = 0x400, 0x4000, 0x4080, 0, 0
+    else:
+        if "aic,2" in node.compatible:
+            config, maxnumirq = 0x2000, 0xc
+        else:
+            config, maxnumirq = prop32("extint-baseaddress"), prop32("maxnumirq-offset")
+        max_irq = p.read32(base + maxnumirq) & 0xffff
+        words = 4 * (max_irq // 32)
+        sw_set = config + 4 * max_irq
+        sw_clr = sw_set + words
+        die_size = 4 * max_irq + 5 * words
+        set_stride = prop32("intmaskset-stride", die_size)
+        clr_stride = prop32("intmaskclear-stride", die_size)
+    die, num = line // max_irq, line % max_irq
+    set_addr = base + sw_set + die * set_stride + 4 * (num // 32)
+    clr_addr = base + sw_clr + die * clr_stride + 4 * (num // 32)
+    print(f"AIC line {line} (die {die}, line {num}) is SPI {spi}; its software trigger is set "
+          f"at 0x{set_addr:x} and cleared at 0x{clr_addr:x}, bit {num % 32}")
+    return spi, set_addr, clr_addr, 1 << (num % 32)
+
+if args.aic_line is not None:
+    spi, set_addr, clr_addr, bit = aic_line(args.aic_line)
+    struct.pack_into("<QQQQ", image, AIC_SET_OFF, set_addr, clr_addr, bit, spi)
 
 # The register a guest writes to start a CPU, as HV.map_essential() hooks it
 CPU_START_OFF = {0x8103: 0x54000, 0x6000: 0x54000, 0x6001: 0x54000, 0x6002: 0x54000,

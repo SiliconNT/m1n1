@@ -3,7 +3,7 @@
 /*
  * Entry points, exception vectors and the few things of sgitest, gictest and wfitest that
  * have to be exact instructions. The tests themselves are sgitest.c, gictest.c and wfitest.c.
- * pscitest.c uses the entry points, the vectors and the header.
+ * pscitest.c and aictest.c use the entry points, the vectors and the header.
  *
  * Raw image, position independent, MMU off, EL1h. The boot CPU enters at offset 0. Every
  * other CPU enters at the offset stored at SECONDARY_OFF, with its slot number in x0.
@@ -44,6 +44,18 @@ hdr_gicr_base:
     .globl  hdr_arg
 hdr_arg:
     .quad   0                       /* what the test makes of it; 0 unless the loader says */
+    .globl  hdr_aic_set
+hdr_aic_set:
+    .quad   0                       /* aictest: where the software trigger of its AIC line is set */
+    .globl  hdr_aic_clr
+hdr_aic_clr:
+    .quad   0                       /*          ...and cleared */
+    .globl  hdr_aic_bit
+hdr_aic_bit:
+    .quad   0                       /*          ...the bit of the line in those two */
+    .globl  hdr_aic_spi
+hdr_aic_spi:
+    .quad   0                       /*          ...and the SPI the line is for the guest */
 
     .macro  bad_vector num
     .balign 0x80

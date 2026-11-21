@@ -4,9 +4,11 @@
 # with src/hv/hv_xtrack.c and src/hv/hv_xinsn.c.
 #
 #   make               build/irqtest.bin, build/sgitest.bin, build/gictest.bin,
-#                      build/wfitest.bin, build/pscitest.bin, build/pmutest.bin and
-#                      build/xitest.bin, the raw images that run_irqtest.py and
-#                      run_sgitest.py load under the hypervisor
+#                      build/wfitest.bin, build/pscitest.bin, build/pmutest.bin,
+#                      build/xitest.bin and build/aictest.bin, the raw images that
+#                      run_irqtest.py and run_sgitest.py load under the hypervisor.
+#                      aictest needs AIC, which QEMU does not have: it only runs on the
+#                      machine (run_sgitest.py --aic-line)
 #   make qemu          run irqtest.bin on QEMU's virt machine (GICv3) to check the guest itself
 #   make qemu-sgi      the same for sgitest.bin, on one CPU
 #   make qemu-sgi-smp  ...and on QEMU_SMP_CPUS CPUs
@@ -49,7 +51,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 .PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken clean
 .SECONDARY:
 
-all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin
+all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin
 
 build/irqtest.o: irqtest.S
 	@mkdir -p build
@@ -71,14 +73,14 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o: build/%.o: %.c sgitest.h gic.h
+build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o build/aictest.o: build/%.o: %.c sgitest.h gic.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
-build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
+build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf build/aictest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
 	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/$*.o
 
-build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin: build/%.bin: build/%.elf
+build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/aictest.bin: build/%.bin: build/%.elf
 	$(OBJCOPY) -O binary $< $@
 
 # xitest: its instructions are assembled (LSE and RCPC among them), and nothing of it that is
