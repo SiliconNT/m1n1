@@ -849,9 +849,33 @@ if args.loader == "m1n1":
 # ---- --loader host: the hypervisor ---------------------------------------------------
 
 hv = HV(iface, p, u)
-# Boot CPU only: the secondary CPUs are neither started nor shown to the guest
+# Boot CPU only: with hv.smp False, HV.init() does not start the secondary CPUs. By the same
+# hv.smp, HV.setup_adt(), which it calls later, would take the nodes of the cores that do not
+# run out of /cpus of the guest's device tree. The firmware is to find every core of the
+# machine there, as it does when m1n1 does the loading (src/selfboot.c hands it m1n1's own
+# tree): /cpus is what it makes the MADT from. So for HV.setup_adt(), and for nothing else,
+# hv.smp says to leave the nodes.
 hv.smp = False
+hv_setup_adt = hv.setup_adt
+
+def setup_adt_with_every_cpu():
+    hv.smp = True
+    try:
+        hv_setup_adt()
+    finally:
+        hv.smp = False
+
+hv.setup_adt = setup_adt_with_every_cpu
 hv.init()
+
+guest_cpus = [cpu.name for cpu in hv.adt["cpus"]]
+m1n1_cpus = [cpu.name for cpu in u.adt["cpus"]]
+if guest_cpus != m1n1_cpus:
+    sys.exit(f"/cpus of the guest's device tree has {len(guest_cpus)} nodes after HV.init() "
+             f"({' '.join(guest_cpus)}), m1n1's own has {len(m1n1_cpus)}: the firmware would "
+             "not see the machine as it does when m1n1 loads it. The guest has not run.")
+print(f"/cpus of the guest's device tree: all {len(guest_cpus)} nodes of m1n1's own; "
+      "only the boot CPU runs")
 
 dump_state("after hypervisor init, before the firmware")
 

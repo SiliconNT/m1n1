@@ -76,10 +76,34 @@ class FakeNode:
 class FakeADT(dict):
     pass
 
+# The M4 has ten cores, and m1n1 starts on the one with index 6 (SiliconNT docs/findings/0017,
+# section 12)
+M4_CPUS = 10
+M4_BOOT_CPU = 6
+
+class FakeCpus:
+    """/cpus as HV.setup_adt() of proxyclient/m1n1/hv/__init__.py uses it: its children one
+    after the other, each with a name and a state, and a child deleted by its name."""
+    def __init__(self):
+        self.nodes = [FakeNode(name=f"cpu{i}", _path=f"/cpus/cpu{i}",
+                               state="running" if i == M4_BOOT_CPU else "waiting")
+                      for i in range(M4_CPUS)]
+    def __iter__(self):
+        return iter(self.nodes)
+    def __len__(self):
+        return len(self.nodes)
+    def __delitem__(self, name):
+        for node in self.nodes:
+            if node.name == name:
+                self.nodes.remove(node)
+                return
+        raise KeyError(name)
+
 def make_fakes(case):
     """Fresh stand-in modules for one run. case: dict of overrides."""
     m1n1_image = M1N1_BIN.read_bytes()
     rec = types.SimpleNamespace(loaded=None, bootargs_top=None, hv_start=None, stopped=None,
+                                secondaries_started=None, smp_at_start=None, guest_cpus=None,
                                 hv_inited=False, memory_map=None, context_printed=False,
                                 entered=None, sigints=[], writes=[], writes_at_entry=None,
                                 readbacks=[], printed=b"", kd={}, xtrack=None,
@@ -246,7 +270,7 @@ def make_fakes(case):
             arm_io = types.SimpleNamespace(ranges=[
                 types.SimpleNamespace(parent_addr=base, size=size) for base, size in ARM_IO])
             self.adt = FakeADT({"chosen": {"memory-map": memory_map}, "/arm-io": arm_io,
-                                "/arm-io/uart0": uart})
+                                "/arm-io/uart0": uart, "cpus": FakeCpus()})
             self.regs = {
                 sysreg.HCR_EL2: sysreg.HCR(IMO=1, FMO=1, VM=1, TWI=1).value,
                 sysreg.CNTHCTL_EL2: 4,
@@ -283,14 +307,29 @@ def make_fakes(case):
             self.p, self.u = p, u
             self.smp = True
             uart = types.SimpleNamespace(get_reg=lambda i: (M4["uart"], 0x4000))
-            self.adt = FakeADT({"/arm-io/uart0": uart, "chosen": {"memory-map": FakeNode()}})
+            # A tree of its own, as the real one has: load_adt(self.u.get_adt())
+            self.adt = FakeADT({"/arm-io/uart0": uart, "chosen": {"memory-map": FakeNode()},
+                                "cpus": FakeCpus()})
             rec.memory_map = self.adt["chosen"]["memory-map"]
         def init(self):
-            assert self.smp is False
+            # The two things the real one does by self.smp, in its order: whether it has the
+            # proxy start the secondary CPUs, and, in setup_adt(), which it calls as
+            # self.setup_adt() after that, what it leaves of /cpus. That the real one has no
+            # third use, and these two as they are here, is checked at the end of this file.
+            rec.secondaries_started = self.smp
             self.mem_top = self.u.ba.phys_base + self.u.ba.mem_size
             rec.hv_inited = True
+            self.setup_adt()
             # The first thing after the checks, long before the guest runs
             case.get("at_init", lambda rec: None)(rec)
+        def setup_adt(self):
+            if not self.smp:
+                for cpu in list(self.adt["cpus"]):
+                    if cpu.state != "running":
+                        del self.adt["cpus"][cpu.name]
+            # A setup_adt() that drops a node whatever self.smp is: not the real one of today
+            if case.get("hv_drops_cpu"):
+                del self.adt["cpus"][case["hv_drops_cpu"]]
         def _prepare_load(self):
             # as in proxyclient/m1n1/hv/__init__.py
             self.phys_base = guest_base = self.u.heap_top
@@ -306,6 +345,9 @@ def make_fakes(case):
             # The real one sends the proxy a byte on SIGINT, and the hypervisor comes back
             # with HV/USER_INTERRUPT. Here the signal is only noted.
             signal.signal(signal.SIGINT, lambda *a: rec.sigints.append(time.monotonic()))
+            # The real one builds the device tree of the guest from self.adt here
+            rec.smp_at_start = self.smp
+            rec.guest_cpus = [(cpu.name, cpu.state) for cpu in self.adt["cpus"]]
             self.p.hv_start(self.entry, self.guest_base + self.bootargs_off)
             # The "firmware" prints once it runs: opening a serial port drops what came before
             guest_prints(rec, b"Apple Silicon Project Mu Firmware (arm64/arm64e)\r\n"
@@ -1262,6 +1304,62 @@ with tempfile.TemporaryDirectory() as bc_tmp:
                          *image_args)
     check("--bugcheck, m1n1 loader: when m1n1 itself is in trouble, nothing more is asked of it",
           isinstance(code, str) and rec.guest_reads == [] and RECORDED not in out, f"{code!r}")
+
+# ---- /cpus of the device tree the host's loader hands the firmware ----
+
+# 52. every core of the machine is there, as when m1n1 loads; only the boot CPU runs
+ALL_CPUS = [(f"cpu{i}", "running" if i == M4_BOOT_CPU else "waiting") for i in range(M4_CPUS)]
+rec, out, code = run({}, "--seconds", "1", *image_args)
+check("host loader: the firmware gets every node of /cpus, each as m1n1 has it",
+      code == 0 and rec.guest_cpus == ALL_CPUS, f"{code!r} {rec.guest_cpus}")
+check("host loader: the secondary CPUs are not started",
+      rec.secondaries_started is False and rec.smp_at_start is False,
+      f"{rec.secondaries_started} {rec.smp_at_start}")
+check("host loader: it says how many nodes the guest gets",
+      f"/cpus of the guest's device tree: all {M4_CPUS} nodes" in out, out[-1500:])
+
+# 53. an HV.init() that leaves fewer nodes than m1n1 has: the guest is not entered
+rec, out, code = run({"hv_drops_cpu": "cpu3"}, "--seconds", "1", *image_args)
+check("host loader: a device tree with a core missing from /cpus stops the run",
+      isinstance(code, str) and f"has {M4_CPUS - 1} nodes after HV.init()" in code and
+      "cpu2 cpu4" in code and rec.hv_inited and rec.hv_start is None and rec.loaded is None,
+      f"{code!r} {rec.hv_start}")
+
+# 54. the real HV goes by self.smp where the stand-in above does, and nowhere else
+import ast
+
+def is_self(node, attr):
+    return (isinstance(node, ast.Attribute) and node.attr == attr and
+            isinstance(node.value, ast.Name) and node.value.id == "self")
+
+real_hv = next(node for node in ast.parse((PROXYCLIENT / "m1n1/hv/__init__.py").read_text()).body
+               if isinstance(node, ast.ClassDef) and node.name == "HV")
+methods = {fn.name: fn for fn in real_hv.body if isinstance(fn, ast.FunctionDef)}
+smp_reads = {name: [node for node in ast.walk(fn)
+                    if is_self(node, "smp") and isinstance(node.ctx, ast.Load)]
+             for name, fn in methods.items()}
+check("the real HV reads self.smp once in init(), once in setup_adt() and nowhere else",
+      {name: len(reads) for name, reads in smp_reads.items() if reads} ==
+      {"init": 1, "setup_adt": 1}, f"{ {n: len(r) for n, r in smp_reads.items() if r} }")
+
+starts = [node for node in ast.walk(methods["init"])
+          if isinstance(node, ast.If) and is_self(node.test, "smp")]
+calls = [node for node in ast.walk(methods["init"])
+         if isinstance(node, ast.Call) and is_self(node.func, "setup_adt")]
+check("in init() it is whether the secondary CPUs are started, before self.setup_adt() is called",
+      len(starts) == 1 and len(calls) == 1 and not starts[0].orelse and
+      [ast.unparse(stmt) for stmt in starts[0].body] == ["self.p.smp_start_secondaries()"] and
+      starts[0].end_lineno < calls[0].lineno,
+      f"{[ast.unparse(node) for node in starts]} {[node.lineno for node in calls]}")
+
+drops = [node for node in ast.walk(methods["setup_adt"])
+         if isinstance(node, ast.If) and isinstance(node.test, ast.UnaryOp) and
+         isinstance(node.test.op, ast.Not) and is_self(node.test.operand, "smp")]
+dropped = ast.unparse(drops[0]) if len(drops) == 1 else ""
+check("in setup_adt() it is whether the nodes of /cpus that are not running are deleted",
+      "for cpu in list(self.adt['cpus'])" in dropped and "if cpu.state != 'running'" in dropped
+      and "del self.adt['cpus'][cpu.name]" in dropped and not (drops and drops[0].orelse),
+      dropped)
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)
