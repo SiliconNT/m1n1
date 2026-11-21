@@ -38,6 +38,21 @@ static u32 entry_size(const struct hv_io_ranges *it)
     return 4 * (it->bus_cells + it->cpu_cells + it->size_cells);
 }
 
+/*
+ * How many cells a number has: a property of 4 bytes. Not with ADT_GETPROP(), which copies
+ * all of a property before it looks at how long it is (adt_getprop_copy() of rust/src/adt.rs).
+ */
+static int cell_count(int node, const char *name, u32 *count)
+{
+    u32 len;
+    const void *value = adt_getprop(adt, node, name, &len);
+
+    if (!value || len != sizeof(*count))
+        return -1;
+    memcpy(count, value, sizeof(*count));
+    return 0;
+}
+
 int hv_io_ranges(struct hv_io_ranges *it)
 {
     int node = adt_path_offset(adt, ARM_IO);
@@ -45,9 +60,9 @@ int hv_io_ranges(struct hv_io_ranges *it)
     u32 len;
 
     ranges = node < 0 ? NULL : adt_getprop(adt, node, "ranges", &len);
-    if (!ranges || ADT_GETPROP(adt, node, "#address-cells", &it->bus_cells) < 0 ||
-        ADT_GETPROP(adt, node, "#size-cells", &it->size_cells) < 0 ||
-        ADT_GETPROP(adt, 0, "#address-cells", &it->cpu_cells) < 0) {
+    if (!ranges || cell_count(node, "#address-cells", &it->bus_cells) < 0 ||
+        cell_count(node, "#size-cells", &it->size_cells) < 0 ||
+        cell_count(0, "#address-cells", &it->cpu_cells) < 0) {
         printf("HV: " ARM_IO " of the device tree has no ranges\n");
         return -1;
     }
@@ -57,9 +72,14 @@ int hv_io_ranges(struct hv_io_ranges *it)
                it->bus_cells, it->cpu_cells, it->size_cells);
         return -1;
     }
-    /* No entry at all, or part of one: then this is not what says where the devices are */
-    if (!len || len % entry_size(it)) {
-        printf("HV: the ranges of " ARM_IO " are %d bytes, which is not entries of %d\n", len,
+    /*
+     * Not one whole entry: then this is not what says where the devices are. Neither is it
+     * with the top bit of its length set, which adt_getprop() passes on and nothing here
+     * knows the meaning of. What follows the last whole entry is not looked at, as in
+     * mmu_map_mmio() of memory.c.
+     */
+    if (len < entry_size(it) || len & 0x80000000) {
+        printf("HV: the ranges of " ARM_IO " are 0x%x bytes, which is not entries of %d\n", len,
                entry_size(it));
         return -1;
     }

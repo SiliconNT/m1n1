@@ -36,6 +36,9 @@ static unsigned io_count;
 static u32 bus_cells, cpu_cells, size_cells;
 static bool with_arm_io, with_ranges, with_bus_cells, with_size_cells, with_cpu_cells;
 static u32 ranges_extra; /* bytes after the last entry */
+static bool ranges_flagged; /* the top bit of the length of "ranges" is set */
+/* How long the three properties that say how many cells a number has are: 4 bytes, really */
+static u32 bus_cells_len, cpu_cells_len, size_cells_len;
 
 static u8 tree[0x2000];
 
@@ -45,6 +48,15 @@ static u8 *put_cells(u8 *p, u64 value, u32 cells)
     memset(p, 0, 4 * cells);
     memcpy(p, &value, cells < 2 ? 4 * cells : 8);
     return p + 4 * cells;
+}
+
+/* A property that says how many cells: the number, and nothing in what follows it if it is
+ * made longer than it should be */
+static u8 *put_count(u8 *p, const char *name, u32 count, u32 len)
+{
+    u32 value[4] = {count, 0, 0, 0};
+
+    return put_prop(p, name, value, len);
 }
 
 static void make_tree(void)
@@ -65,7 +77,7 @@ static void make_tree(void)
     p = put_node(p, 2 + with_cpu_cells, 1 + with_arm_io);
     p = put_name(p, "device-tree");
     if (with_cpu_cells)
-        p = put_prop(p, "#address-cells", &cpu_cells, 4);
+        p = put_count(p, "#address-cells", cpu_cells, cpu_cells_len);
     p = put_prop(p, "#size-cells", &(u32){2}, 4);
 
     /* A node before the one that is looked for, with a "ranges" that is not the one */
@@ -77,11 +89,16 @@ static void make_tree(void)
         p = put_node(p, 1 + with_bus_cells + with_size_cells + with_ranges, 0);
         p = put_name(p, "arm-io");
         if (with_bus_cells)
-            p = put_prop(p, "#address-cells", &bus_cells, 4);
+            p = put_count(p, "#address-cells", bus_cells, bus_cells_len);
         if (with_size_cells)
-            p = put_prop(p, "#size-cells", &size_cells, 4);
-        if (with_ranges)
+            p = put_count(p, "#size-cells", size_cells, size_cells_len);
+        if (with_ranges) {
+            struct adt_property *prop = (struct adt_property *)p;
+
             p = put_prop(p, "ranges", ranges, r - ranges);
+            if (ranges_flagged)
+                prop->size |= 0x80000000;
+        }
     }
     adt = tree;
 }
@@ -97,7 +114,9 @@ static void reset(void)
     io_count = R21_MMIO_COUNT;
     bus_cells = cpu_cells = size_cells = 2;
     with_arm_io = with_ranges = with_bus_cells = with_size_cells = with_cpu_cells = true;
+    bus_cells_len = cpu_cells_len = size_cells_len = 4;
     ranges_extra = 0;
+    ranges_flagged = false;
     make_tree();
 
     r21_ba(&ba);
@@ -469,18 +488,61 @@ static void test_trees_that_do_not_say(void)
         *counts[i] = 3;
         refused();
     }
-    /* No entry; part of an entry after the last, and before the first */
+    /* A count of cells that is not a number of 32 bits, though it starts with one */
+    u32 *const lengths[] = {&bus_cells_len, &cpu_cells_len, &size_cells_len};
+
+    for (unsigned i = 0; i < COUNT(lengths); i++) {
+        reset();
+        *lengths[i] = 8;
+        refused();
+        reset();
+        *lengths[i] = 2;
+        refused();
+        reset();
+        *lengths[i] = 0;
+        refused();
+    }
+    /* No entry, and less than one */
     reset();
     io_count = 0;
     refused();
     for (u32 extra = 4; extra < 24; extra += 4) {
         reset();
-        ranges_extra = extra;
-        refused();
-        reset();
         io_count = 0;
         ranges_extra = extra;
         refused();
+    }
+    /* A length with its top bit set: nothing is read by it */
+    reset();
+    ranges_flagged = true;
+    refused();
+}
+
+/* As everything of m1n1 that reads "ranges" has it: part of an entry after the last whole
+ * one is not looked at */
+static void test_what_follows_the_last_entry(void)
+{
+    struct hv_io_ranges it;
+    u64 base, size;
+
+    for (u32 extra = 4; extra < 24; extra += 4) {
+        unsigned n = 0;
+
+        reset();
+        ranges_extra = extra;
+        make_tree();
+        CHECK_EQ(hv_io_ranges(&it), 0);
+        while (hv_io_ranges_next(&it, &base, &size))
+            n++;
+        CHECK_EQ(n, R21_MMIO_COUNT);
+        CHECK_EQ(base + size, r21_mmio[R21_MMIO_COUNT - 1][1]);
+        CHECK(ranges_free());
+        CHECK(says("27 ranges"));
+
+        /* ...and what is in the last whole one counts */
+        io[io_count - 1].cpu = HV_VGIC_REDIST_BASE;
+        make_tree();
+        CHECK(!ranges_free());
     }
 }
 
@@ -496,6 +558,7 @@ int main(void)
     test_ranges_that_wrap_around();
     test_cells_of_other_sizes();
     test_trees_that_do_not_say();
+    test_what_follows_the_last_entry();
 
     printf("layout_test: %d checks, %d failed\n", checks, failed);
     if (!failed)

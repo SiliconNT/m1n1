@@ -29,10 +29,15 @@ while IFS='@' read -r name file expr test; do
         gcc $CFLAGS -o "$work/t" run_test.c model.c build/selfboot.c build/selfboot_files.c \
             "$work/$file" "build/$other" 2>"$work/cc.log"
     fi || { echo "$name: does not compile"; cat "$work/cc.log"; bad=1; continue; }
-    if "$work/t" >"$work/out.log" 2>&1; then
+    # In a shell of its own, which is what says so if the test is killed for reading where
+    # nothing is: that is a way of failing too, and goes into the log
+    ("$work/t"; echo "exit status $?") >"$work/out.log" 2>&1
+    if grep -qx 'exit status 0' "$work/out.log"; then
         echo "$name: the test passes and must not"; bad=1
-    else
+    elif grep -q '^FAILED' "$work/out.log"; then
         echo "$name ($test): $(grep -c '^FAILED' "$work/out.log") failed, first: $(grep -m1 '^FAILED' "$work/out.log")"
+    else
+        echo "$name ($test): did not get as far as a failed check"
     fi
 done <<'EOF'
 range-end-inclusive@hv_layout.c@s/if (base > last_of(vgic_base, vgic_size) ||/if (base >= last_of(vgic_base, vgic_size) ||/@layout
@@ -40,8 +45,9 @@ range-start-inclusive@hv_layout.c@s/|| vgic_base > last_of(base, size))/|| vgic_
 bus-address@hv_layout.c@s/\*base = cells(it->next + 4 \* it->bus_cells, it->cpu_cells);/*base = cells(it->next, it->bus_cells);/@layout
 no-memory@hv_layout.c@/clear &= !in_the_way("memory"/d@layout
 one-redistributor@hv_layout.c@s/(MAX_CPUS \* HV_VGIC_REDIST_SIZE)/(HV_VGIC_REDIST_SIZE)/@layout
-no-entries-accepted@hv_layout.c@s/if (!len || len % entry_size(it))/if (len % entry_size(it))/@layout
-part-of-an-entry-accepted@hv_layout.c@s/if (!len || len % entry_size(it))/if (!len)/@layout
+less-than-an-entry-accepted@hv_layout.c@s/if (len < entry_size(it) || len & 0x80000000)/if (len \& 0x80000000)/@layout
+flagged-length-accepted@hv_layout.c@s/if (len < entry_size(it) || len & 0x80000000)/if (len < entry_size(it))/@layout
+cell-count-of-any-length@hv_layout.c@s/if (!value || len != sizeof(\*count))/if (!value)/@layout
 wrap-not-clamped@hv_layout.c@s/return last < base ? ~0UL : last;/return last;/@layout
 empty-range-counts@hv_layout.c@/^    if (!size)$/,/^        return false;$/d@layout
 cells-not-checked@hv_layout.c@s/if (!it->bus_cells || it->bus_cells > 2 ||/if (0 \&\& it->bus_cells > 2 ||/@layout
