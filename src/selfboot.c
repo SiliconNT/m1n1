@@ -247,31 +247,37 @@ int selfboot_adt(void *dest, u32 size, const struct selfboot_layout *l)
 int selfboot_adt_add_range(void *dest, const char *name, u64 base, u64 bytes)
 {
     int node = adt_path_offset(adt, MEMORY_MAP);
-    struct adt_property *ramdisk = NULL;
+    struct adt_property *entry = NULL;
     u64 range[2];
-    if (node < 0 || strlen(name) >= sizeof(ramdisk->name))
+
+    if (node < 0 || strlen(name) >= sizeof(entry->name)) {
+        printf("selfboot: " MEMORY_MAP " cannot have an entry %s\n", name);
         return -1;
+    }
+    /* Whether an entry is still spare is in the copy: an earlier call may have taken it */
     ADT_FOREACH_PROPERTY(adt, node, prop)
     {
         struct adt_property *candidate = copy_of(dest, prop);
-        if (strncmp(candidate->name, SPARE_ENTRY, strlen(SPARE_ENTRY)) || prop->size != sizeof(range))
+
+        if (strncmp(candidate->name, SPARE_ENTRY, strlen(SPARE_ENTRY)) ||
+            prop->size != sizeof(range))
             continue;
         memcpy(range, candidate->value, sizeof(range));
         if (range[0] || range[1])
             continue;
-        ramdisk = copy_of(dest, prop);
+        entry = candidate;
         break;
     }
-    if (!ramdisk) {
-        printf("selfboot: no spare entry in " MEMORY_MAP " for the boot disk\n");
+    if (!entry) {
+        printf("selfboot: no spare entry in " MEMORY_MAP " for %s\n", name);
         return -1;
     }
 
-    memset(ramdisk->name, 0, sizeof(ramdisk->name));
-    strcpy(ramdisk->name, name);
-    /* The size in bytes, not rounded: it is the size of the disk */
+    memset(entry->name, 0, sizeof(entry->name));
+    strcpy(entry->name, name);
+    /* The size in bytes, not rounded: of the boot disk it is the size of the disk */
     range[0] = base;
     range[1] = bytes;
-    memcpy(ramdisk->value, range, sizeof(range));
+    memcpy(entry->value, range, sizeof(range));
     return 0;
 }

@@ -1,9 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+
+/*
+ * See selfboot.h: the two files, read from the SSD to where they go in guest memory. Only in
+ * a build with CHAINLOADING, which is what has the code that reads a file.
+ */
+
 #include "../build/build_cfg.h"
+
 #include "selfboot.h"
 #include "utils.h"
 
 #ifdef CHAINLOADING
+
+/* rust/src/readfile.rs */
 int rust_read_file(const char *part_uuid, const char *path, void *dest, size_t max_size,
                    size_t *size);
 

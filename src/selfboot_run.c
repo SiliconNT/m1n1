@@ -44,7 +44,6 @@
 /* No host: not a port that usb_iodev_vuart_setup() of src/usb.c takes */
 #define NO_HOST IODEV_NUM
 
-/* rust/src/readfile.rs, in a build with CHAINLOADING */
 /* What follows hv_init() in HV.init(), as far as the M4 has it */
 static void selfboot_regs(void)
 {
