@@ -237,7 +237,7 @@ static void test_layout_needs_the_memory_map(void)
 
 static u8 image[0x10000];
 
-/* The header the firmware image starts with (MacBookProM4.fdf): entered at offset 0 */
+/* The header the firmware image starts with (SiliconNT.fdf): entered at offset 0 */
 static void make_image(u64 size)
 {
     memset(image, 0, sizeof(image));

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Load the SiliconNT UEFI firmware (MACBOOKPROM4_EFI.fd of the siliconnt-firmware
+"""Load the SiliconNT UEFI firmware (SILICONNT_EFI.fd of the siliconnt-firmware
 repository) and run it as the guest of the hypervisor, on the boot CPU only.
 
 The m1n1 on the target has to be built from this tree: the firmware needs the emulated GIC
@@ -99,7 +99,7 @@ sys.path.append(str(HERE))
 import bugcheck
 
 DEFAULT_IMAGE = (pathlib.Path.home() / "src" / "siliconnt-firmware" / "Build" /
-                 "MacBookProM4-AARCH64" / "DEBUG_CLANGPDB" / "FV" / "MACBOOKPROM4_EFI.fd")
+                 "SiliconNT-AARCH64" / "DEBUG_CLANGPDB" / "FV" / "SILICONNT_EFI.fd")
 
 parser = argparse.ArgumentParser(description="Run the SiliconNT UEFI firmware under the hypervisor")
 parser.add_argument("--seconds", type=int, default=120,
@@ -158,7 +158,7 @@ if args.loader == "m1n1" and args.xtrack == "off":
 PAGE = 0x4000
 
 # The firmware keeps the top of RAM for itself: PcdSystemMemoryUefiRegionSize in
-# Platform/MacBookProM4Pkg/MacBookProM4.dsc of siliconnt-firmware
+# Platform/SiliconNTPkg/SiliconNT.dsc of siliconnt-firmware
 UEFI_REGION_SIZE = 0x8000000
 # HV._prepare_load() starts the guest's own data this far above the start of guest RAM
 GUEST_GAP = 32 << 20
@@ -184,7 +184,7 @@ image = args.payload.read_bytes()
 
 def check_image(image):
     """The Linux arm64 image header the firmware's flash layout puts at offset 0
-    (MacBookProM4.fdf), and what the entry code relies on."""
+    (SiliconNT.fdf), and what the entry code relies on."""
     if len(image) < 0x40:
         sys.exit(f"{args.payload}: too short for an image header")
     code0, code1 = struct.unpack_from("<II", image, 0)

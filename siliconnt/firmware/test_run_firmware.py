@@ -17,6 +17,9 @@ HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT = HERE / "run_firmware.py"
 PROXYCLIENT = HERE.parents[1] / "proxyclient"
 M1N1_BIN = HERE.parents[1] / "build" / "m1n1.bin"
+# The image run_firmware.py loads when it is not given one, and this test then, too
+DEFAULT_IMAGE = (pathlib.Path.home() / "src/siliconnt-firmware/Build/SiliconNT-AARCH64/"
+                 "DEBUG_CLANGPDB/FV/SILICONNT_EFI.fd")
 sys.path.append(str(PROXYCLIENT))
 
 from m1n1.utils import align, align_up
@@ -457,8 +460,7 @@ image_args = sys.argv[1:2]
 if image_args:
     image_len = pathlib.Path(image_args[0]).stat().st_size
 else:
-    image_len = (pathlib.Path.home() / "src/siliconnt-firmware/Build/MacBookProM4-AARCH64/"
-                 "DEBUG_CLANGPDB/FV/MACBOOKPROM4_EFI.fd").stat().st_size
+    image_len = DEFAULT_IMAGE.stat().st_size
 
 # Expected places for the R9a numbers
 ADT_BASE = M4["heap_top"] + (32 << 20)
@@ -1018,9 +1020,7 @@ check("without --wait-debugger the guest is entered with no debugger, as before"
 
 # ---- --loader m1n1: m1n1 lays out guest memory and enters the firmware itself ----------
 
-image_data = (pathlib.Path(image_args[0]) if image_args else pathlib.Path.home() /
-              "src/siliconnt-firmware/Build/MacBookProM4-AARCH64/DEBUG_CLANGPDB/FV/"
-              "MACBOOKPROM4_EFI.fd").read_bytes()
+image_data = (pathlib.Path(image_args[0]) if image_args else DEFAULT_IMAGE).read_bytes()
 M1N1 = ("--loader", "m1n1", "--disk", disk_path)
 # Nothing of the host's own loader: no HV object, no boot arguments or device tree written,
 # no command to turn execution tracking on
@@ -1360,6 +1360,14 @@ check("in setup_adt() it is whether the nodes of /cpus that are not running are 
       "for cpu in list(self.adt['cpus'])" in dropped and "if cpu.state != 'running'" in dropped
       and "del self.adt['cpus'][cpu.name]" in dropped and not (drops and drops[0].orelse),
       dropped)
+
+# 55. given no image, the script loads the one this test takes for it: the name of the
+# firmware's platform package is in both, and they are to change together
+rec, out, code = run({}, "--check-only")
+check("without an image on the command line it is the one of the firmware's build as it is "
+      "named now",
+      code == 0 and f"Firmware image: {DEFAULT_IMAGE}\n" in out and
+      hashlib.sha256(DEFAULT_IMAGE.read_bytes()).hexdigest() in out, out[:600])
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)
