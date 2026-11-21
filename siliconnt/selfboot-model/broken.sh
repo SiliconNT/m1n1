@@ -13,7 +13,8 @@ CFLAGS="-O2 -g -Wall -Wno-error -I. -Ibuild"
 bad=0
 n=0
 
-# What is wrong @ the file @ the change, for sed @ the test that must fail: layout or run
+# What is wrong @ the file @ the change, for sed @ the test that must fail: layout, aicmap
+# or run
 while IFS='@' read -r name file expr test; do
     [ -z "$name" ] && continue
     n=$((n + 1))
@@ -24,6 +25,8 @@ while IFS='@' read -r name file expr test; do
     fi
     if [ "$test" = layout ]; then
         gcc $CFLAGS -o "$work/t" layout_test.c model.c "$work/hv_layout.c" 2>"$work/cc.log"
+    elif [ "$test" = aicmap ]; then
+        gcc $CFLAGS -o "$work/t" aicmap_test.c model.c "$work/hv_layout.c" 2>"$work/cc.log"
     else
         other=hv_layout.c; [ "$file" = hv_layout.c ] && other=selfboot_run.c
         gcc $CFLAGS -o "$work/t" run_test.c model.c build/selfboot.c build/selfboot_files.c \
@@ -56,6 +59,25 @@ stops-at-first-device@hv_layout.c@s/        clear &= !in_the_way("a range of " A
 selfboot-does-not-ask@selfboot_run.c@s/    if (!hv_vgic_ranges_free())/    if (0)/@run
 selfboot-maps-bus-address@hv_layout.c@s/\*base = cells(it->next + 4 \* it->bus_cells, it->cpu_cells);/*base = cells(it->next, it->bus_cells);/@run
 selfboot-asks-too-late@selfboot_run.c@s/    if (selfboot_map(l, host) < 0)/    if (selfboot_map(l, host) < 0 || !hv_vgic_ranges_free())/;0,/    if (!hv_vgic_ranges_free())/s//    if (0)/@run
+aic-die-inclusive@hv_layout.c@s/if (value \/ aic->max_irq >= aic->nr_die ||/if (value \/ aic->max_irq > aic->nr_die ||/@aicmap
+aic-line-inclusive@hv_layout.c@s/value % aic->max_irq >= aic->nr_irq) {/value % aic->max_irq > aic->nr_irq) {/@aicmap
+aicmap-not-cleared@hv_layout.c@/memset(aicmap_lines, 0, sizeof(aicmap_lines));/d@aicmap
+aicmap-988-refused@hv_layout.c@s/if (count > HV_AICMAP_MAX) {/if (count >= HV_AICMAP_MAX) {/@aicmap
+aicmap-only-the-root@hv_layout.c@/to_come += adt_get_child_count(adt, node);/d@aicmap
+aicmap-any-parent@hv_layout.c@s/off \/ sizeof(u32)) != aic_phandle)/off \/ sizeof(u32)) != aic_phandle \&\& 0)/@aicmap
+aicmap-first-parent-only@hv_layout.c@s/(index < count ? index : count - 1)/0/@aicmap
+aicmap-last-parent-only@hv_layout.c@s/(index < count ? index : count - 1)/(count - 1)/@aicmap
+aicmap-parents-go-round@hv_layout.c@s/(index < count ? index : count - 1)/(index % count)/@aicmap
+aicmap-half-a-parent@hv_layout.c@s/        parents_len < sizeof(u32))/        0)/@aicmap
+aicmap-placeholder-read@hv_layout.c@s/!parents || len \& 0x80000000 ||/!parents ||/@aicmap
+aicmap-placeholder-parent@hv_layout.c@s/ || parents_len \& 0x80000000 ||/ ||/@aicmap
+aicmap-part-of-a-value@hv_layout.c@s/off + sizeof(u32) <= len;/off < len;/@aicmap
+aicmap-size-without-header@hv_layout.c@s/return 2 \* sizeof(u32) + count \* sizeof(u32);/return count * sizeof(u32);/@aicmap
+aicmap-out-of-order@hv_layout.c@s/32 \* i + __builtin_ctz(bits)/32 * i + 31 - __builtin_clz(bits)/@aicmap
+aicmap-no-version@hv_layout.c@s/map->version = HV_AICMAP_VERSION;/map->version = 0;/@aicmap
+selfboot-table-size-untold@selfboot_run.c@/l->aicmap_size = aicmap_size;/d@run
+selfboot-table-refusal-ignored@selfboot_run.c@s/    if (aicmap_size < 0)/    if (0)/@run
+selfboot-table-not-written@selfboot_run.c@s/aicmap_size = hv_aicmap((struct hv_aicmap \*)l->aicmap);/aicmap_size = 8;/@run
 EOF
 [ $bad = 0 ] && echo "broken: all $n failed, as they must"
 exit $bad

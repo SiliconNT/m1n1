@@ -15,6 +15,13 @@
  *
  * WFE is the worst one the architecture allows: an interrupt that is masked does not end it,
  * only the event stream does. Every WFE here lasts one period of the event stream.
+ *
+ * AIC is played here too, behind the functions of src/aic.h that hv_vgic.c calls: lines that
+ * a device holds high or not, a mask for each, and an event register that reports the lowest
+ * line that is high and unmasked and masks it doing so (Linux, aic_irq_eoi()). A line that is
+ * high and unmasked is a physical IRQ, on whichever core looks first. The table of AIC lines
+ * and SPIs is one of this file's (hv_aicmap(), which hv_layout.c makes from the device tree
+ * and siliconnt/selfboot-model tests).
  */
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -26,6 +33,7 @@
 #include <unistd.h>
 
 #include "aic.h"
+#include "aic_regs.h"
 #include "cpu_regs.h"
 #include "hv.h"
 #include "smp.h"
@@ -34,13 +42,15 @@
 #define NR_SGIS   16
 #define NR_INTIDS 1020
 
+extern spinlock_t bhl;
+
 struct core {
     u64 lr[16];
     u64 mpidr;
     atomic_int ipi; /* the Apple IPI: stays pending until acknowledged */
     bool masked;
-    u32 pmr;    /* ICC_PMR_EL1: only priorities below this are taken */
-    bool timer; /* the output of the guest's virtual timer */
+    u32 pmr;        /* ICC_PMR_EL1: only priorities below this are taken */
+    bool timer;     /* the output of the guest's virtual timer */
     bool timer_fiq; /* ...raises a FIQ when high: VM_TMR_FIQ_ENA_EL2, see hv_update_fiq() */
     atomic_uint count[NR_INTIDS];
     /* IPIs taken, to see the path was used */
@@ -52,13 +62,101 @@ static int nr_lr = 8;
 static u32 alive = 0x3ff; /* the cores that run m1n1 */
 static __thread int cur;
 
-struct aic *aic = NULL;
 bool hv_started_cpus[MAX_CPUS];
 int boot_cpu_idx = 6;
 
+/* ---- AIC: two dies of 2048 lines, 4096 apart, as die * max_irq + line ---- */
+
+#define AIC_LINES (2 * 4096)
+
+static struct aic model_aic = {
+    .version = 3,
+    .nr_die = 2,
+    .max_die = 2,
+    .nr_irq = 2048,
+    .max_irq = 4096,
+};
+struct aic *aic = &model_aic;
+
+/* What the device holds the line at, and whether AIC masks it. Changed with bhl held. */
+static bool line_high[AIC_LINES];
+static bool line_masked[AIC_LINES];
+/* Lines that are high and unmasked: a physical IRQ is pending */
+static atomic_int lines_ready;
+static int mask_all_calls, unmask_calls;
+
+static void line_set(u32 line, bool high, bool masked)
+{
+    bool was = line_high[line] && !line_masked[line];
+
+    if (line >= AIC_LINES || line % 4096 >= 2048) {
+        printf("CHECK FAILED: AIC has no line %u\n", line);
+        exit(1);
+    }
+    line_high[line] = high;
+    line_masked[line] = masked;
+    if (was != (high && !masked))
+        atomic_fetch_add(&lines_ready, high && !masked ? 1 : -1);
+}
+
+/* The device raises or lowers its line */
+static void line_raise(u32 line, bool high)
+{
+    pthread_mutex_lock(&bhl);
+    line_set(line, high, line_masked[line]);
+    pthread_mutex_unlock(&bhl);
+}
+
 uint32_t aic_ack(void)
 {
+    if (!atomic_load(&lines_ready))
+        return 0;
+    for (u32 line = 0; line < AIC_LINES; line++) {
+        if (line_high[line] && !line_masked[line]) {
+            line_set(line, true, true);
+            return FIELD_PREP(AIC_EVENT_DIE, line / 4096) |
+                   FIELD_PREP(AIC_EVENT_TYPE, AIC_EVENT_TYPE_HW) |
+                   FIELD_PREP(AIC_EVENT_NUM, line % 4096);
+        }
+    }
     return 0;
+}
+
+void aic_mask(int irq)
+{
+    line_set(irq, line_high[irq], true);
+}
+
+void aic_unmask(int irq)
+{
+    unmask_calls++;
+    line_set(irq, line_high[irq], false);
+}
+
+void aic_mask_all(void)
+{
+    mask_all_calls++;
+    for (u32 line = 0; line < AIC_LINES; line++)
+        if (line % 4096 < 2048)
+            line_set(line, line_high[line], true);
+}
+
+/* The table: 3, 40, 1505 and line 7 of the second die are SPIs 32 to 35 */
+#define LINE_A 3
+#define LINE_B 40
+#define LINE_C 1505
+#define LINE_D (4096 + 7)
+static const u32 table_lines[] = {LINE_A, LINE_B, LINE_C, LINE_D};
+static bool aicmap_fails;
+
+int hv_aicmap(struct hv_aicmap *map)
+{
+    if (aicmap_fails)
+        return -1;
+    map->version = HV_AICMAP_VERSION;
+    map->count = sizeof(table_lines) / sizeof(table_lines[0]);
+    memcpy(map->line, table_lines, sizeof(table_lines));
+    return 8 + sizeof(table_lines);
 }
 
 int smp_id(void)
@@ -86,7 +184,8 @@ static u64 eisr(struct core *c)
     u64 v = 0;
 
     for (int i = 0; i < nr_lr; i++)
-        if (!FIELD_GET(ICH_LR_STATE, c->lr[i]) && !(c->lr[i] & ICH_LR_HW) && (c->lr[i] & ICH_LR_EOI))
+        if (!FIELD_GET(ICH_LR_STATE, c->lr[i]) && !(c->lr[i] & ICH_LR_HW) &&
+            (c->lr[i] & ICH_LR_EOI))
             v |= BIT(i);
     return v;
 }
@@ -98,8 +197,8 @@ static u64 isr(struct core *c)
 
     if (atomic_load(&c->ipi) || (c->timer && c->timer_fiq))
         v |= ISR_F;
-    if (eisr(c))
-        v |= ISR_I; /* the maintenance interrupt */
+    if (eisr(c) || atomic_load(&lines_ready))
+        v |= ISR_I; /* the maintenance interrupt, or AIC */
     return v;
 }
 
@@ -225,7 +324,10 @@ int hv_map_hook(u64 from, hv_hook_t *hook, u64 size)
     return 0;
 }
 
-/* The big hypervisor lock: held around the MMIO hooks, not on the other paths used here */
+/*
+ * The big hypervisor lock: held around the MMIO hooks and hv_vgic_handle_irq(), as hv_exc.c
+ * holds it there, not on the other paths used here
+ */
 spinlock_t bhl = PTHREAD_MUTEX_INITIALIZER;
 
 /* hv_update_fiq(), on the current core. The timer's FIQ is off for as long as its output is high */
@@ -258,10 +360,12 @@ static bool physical_interrupt(void)
         hv_exit();
         return true;
     }
-    if (eisr(c)) {
+    if (eisr(c) || atomic_load(&lines_ready)) {
         /* hv_exc_irq: hv_vgic_handle_irq, then hv_exc_exit -> hv_update_fiq */
         c->irqs++;
+        pthread_mutex_lock(&bhl);
         CHECK(hv_vgic_handle_irq());
+        pthread_mutex_unlock(&bhl);
         hv_exit();
         return true;
     }
@@ -326,7 +430,7 @@ static inline u64 rd64(u64 addr)
 #define wr64(a, v) wr(a, v, 3)
 
 #define GICD(off)      (HV_VGIC_DIST_BASE + (off))
-#define GICR(cpu, off) (HV_VGIC_REDIST_BASE + (u64)(cpu)*HV_VGIC_REDIST_SIZE + (off))
+#define GICR(cpu, off) (HV_VGIC_REDIST_BASE + (u64)(cpu) * HV_VGIC_REDIST_SIZE + (off))
 
 /* Offsets, Arm IHI 0069H.b 12.8 and 12.10; the Redistributor ones include SGI_base */
 #define GICD_CTLR       0x0000
@@ -392,11 +496,15 @@ static void guest_eoi(u32 intid)
     CHECK(!"EOI of an interrupt that is not active");
 }
 
+/* What the guest does about an interrupt it has taken, before it ends it; NULL: nothing */
+static void (*guest_handler)(u32 intid);
+
 /* Take one virtual interrupt if the guest can. Returns the INTID or 1023. */
 static u32 guest_irq(void)
 {
     struct core *c = &cores[cur];
     u32 intid;
+    int self = cur;
 
     if (c->masked)
         return 1023;
@@ -405,6 +513,10 @@ static u32 guest_irq(void)
         return 1023;
     CHECK(intid < NR_INTIDS);
     atomic_fetch_add(&c->count[intid], 1);
+    if (guest_handler) {
+        guest_handler(intid);
+        cur = self;
+    }
     guest_eoi(intid);
     return intid;
 }
@@ -560,14 +672,15 @@ static void sgi_tests(void)
     expect_counts("target list, all 16 bits, E cluster", 7, 0, 1, 0, 1);
 
     cur = 6;
-    guest_send(sgi_list(cores[6].mpidr, 0xffff, 8, 0)); /* CPU 8 exists but the guest is not on it */
+    guest_send(
+        sgi_list(cores[6].mpidr, 0xffff, 8, 0)); /* CPU 8 exists but the guest is not on it */
     expect_counts("target list, all 16 bits, P cluster", 8, 1, 0, 1, 0);
 
     cur = 6;
     guest_send(sgi_list(cores[6].mpidr, 0, 9, 0));
-    guest_send(sgi_list(cores[6].mpidr, 0x3, 9, 1));           /* RS = 1: Aff0 16 and 17 */
-    guest_send(sgi_list(cores[6].mpidr ^ 0x4000, 0x3, 9, 0));  /* no such Aff1 */
-    guest_send(sgi_list(cores[6].mpidr ^ 0x400000, 0x3, 9, 0)); /* no such Aff2 */
+    guest_send(sgi_list(cores[6].mpidr, 0x3, 9, 1));               /* RS = 1: Aff0 16 and 17 */
+    guest_send(sgi_list(cores[6].mpidr ^ 0x4000, 0x3, 9, 0));      /* no such Aff1 */
+    guest_send(sgi_list(cores[6].mpidr ^ 0x400000, 0x3, 9, 0));    /* no such Aff2 */
     guest_send(sgi_list(cores[6].mpidr | (1UL << 32), 0x3, 9, 0)); /* no such Aff3 */
     expect_counts("targets that do not exist", 9, 0, 0, 0, 0);
 
@@ -974,7 +1087,8 @@ static void dist_tests(void)
     cur = 6;
     windows_enable_spi(40, 0x60, 6, true);
     CHECK(rd64(GICD(GICD_IROUTER + 8 * 40)) == aff_of(6));
-    CHECK(rd32(GICD(GICD_IROUTER + 8 * 40)) == aff_of(6) && rd32(GICD(GICD_IROUTER + 8 * 40 + 4)) == 0);
+    CHECK(rd32(GICD(GICD_IROUTER + 8 * 40)) == aff_of(6) &&
+          rd32(GICD(GICD_IROUTER + 8 * 40 + 4)) == 0);
     CHECK(rd32(GICD(GICD_ISENABLER + 4)) == BIT(8) && rd32(GICD(GICD_ICENABLER + 4)) == BIT(8));
     CHECK(rd32(GICD(GICD_ICFGR + 4 * 2)) == (2U << 16));
     windows_request_spi(40);
@@ -1175,7 +1289,8 @@ static void dist_tests(void)
     wr(GICD(GICD_ISENABLER + 4), 0xffff, 1);
     CHECK(rd32(GICD(GICD_ISENABLER + 4)) == 0);
     wr(GICD(GICD_IPRIORITYR + 60), 0xbbaa, 1);
-    CHECK(rd32(GICD(GICD_IPRIORITYR + 60)) == 0xbbaa && rd(GICD(GICD_IPRIORITYR + 60), 1) == 0xbbaa);
+    CHECK(rd32(GICD(GICD_IPRIORITYR + 60)) == 0xbbaa &&
+          rd(GICD(GICD_IPRIORITYR + 60), 1) == 0xbbaa);
     /* Set-pending of the Redistributor is not something Windows writes: ignored */
     wr32(GICR(6, GICR_ISENABLER0), ~0U);
     wr32(GICR(6, GICR_ISPENDR0), ~0U);
@@ -1188,10 +1303,10 @@ static void dist_tests(void)
      * (HalpGicdReadableRanges, HalpGicrReadableRanges, findings/0004 sections 6 and 7). Every
      * read has to be answered; so does a write anywhere in the frames.
      */
-    static const u32 gicd_ranges[][2] = {{0x0, 0x10},       {0x80, 0xf00},     {0xf10, 0xf30},
-                                         {0x1000, 0x3700},  {0x6100, 0xa000},  {0xffd0, 0x10000}};
-    static const u32 gicr_ranges[][2] = {{0x0, 0x20},       {0x70, 0x80},      {0xc0, 0xc8},
-                                         {0xffd0, 0x10000}, {0x10080, 0x10e00}};
+    static const u32 gicd_ranges[][2] = {{0x0, 0x10},      {0x80, 0xf00},    {0xf10, 0xf30},
+                                         {0x1000, 0x3700}, {0x6100, 0xa000}, {0xffd0, 0x10000}};
+    static const u32 gicr_ranges[][2] = {
+        {0x0, 0x20}, {0x70, 0x80}, {0xc0, 0xc8}, {0xffd0, 0x10000}, {0x10080, 0x10e00}};
     for (unsigned r = 0; r < sizeof(gicd_ranges) / sizeof(gicd_ranges[0]); r++)
         for (u32 off = gicd_ranges[r][0]; off < gicd_ranges[r][1]; off += 4)
             rd32(GICD(off));
@@ -1234,12 +1349,243 @@ static void dist_tests(void)
     printf("ok   frames when only some cores run m1n1\n");
 }
 
+/* ---- AIC lines, forwarded as SPIs ---- */
+
+/*
+ * The device behind a line, and the guest's handler for its SPI: it lowers the line once the
+ * guest has handled it `times` times. It may disable the SPI, and enable it again, while it
+ * handles it. It notes whether AIC had the line unmasked while the guest had it.
+ */
+static struct {
+    u32 spi, line;
+    int times, seen;
+    bool disable, enable_again;
+    bool unmasked_in_flight;
+} dev;
+
+static void device_handler(u32 intid)
+{
+    u64 word = 4 * (intid / 32);
+
+    if (intid != dev.spi)
+        return;
+    dev.seen++;
+    dev.unmasked_in_flight |= !line_masked[dev.line];
+    if (dev.disable)
+        wr32(GICD(GICD_ICENABLER + word), BIT(intid % 32));
+    if (dev.enable_again)
+        wr32(GICD(GICD_ISENABLER + word), BIT(intid % 32));
+    dev.unmasked_in_flight |= !line_masked[dev.line];
+    if (dev.seen >= dev.times)
+        line_raise(dev.line, false);
+}
+
+static void device(u32 spi, u32 line, int times)
+{
+    memset(&dev, 0, sizeof(dev));
+    dev.spi = spi;
+    dev.line = line;
+    dev.times = times;
+}
+
+/* The hypervisor starts with every line unmasked by whoever came before, none of them high */
+static void aic_reset(bool table)
+{
+    memset(line_high, 0, sizeof(line_high));
+    memset(line_masked, 0, sizeof(line_masked));
+    atomic_store(&lines_ready, 0);
+    mask_all_calls = unmask_calls = 0;
+    aicmap_fails = !table;
+    reset(8);
+    guest_handler = device_handler;
+    memset(&dev, 0, sizeof(dev));
+}
+
+/* What hv_vgic_report() says of the AIC events of one core: forwarded, and not */
+static void aic_counts(int cpu, long *forwarded, long *not)
+{
+    char line[512], key[32];
+    FILE *f = tmpfile();
+    int saved;
+
+    *forwarded = *not = 0;
+    CHECK(f);
+    fflush(stdout);
+    saved = dup(STDOUT_FILENO);
+    CHECK(saved >= 0 && dup2(fileno(f), STDOUT_FILENO) >= 0);
+    hv_vgic_report();
+    fflush(stdout);
+    CHECK(dup2(saved, STDOUT_FILENO) >= 0);
+    close(saved);
+
+    snprintf(key, sizeof(key), "HV: vGIC: CPU %d: ", cpu);
+    rewind(f);
+    while (fgets(line, sizeof(line), f)) {
+        char *at = strstr(line, "SGIs still pending 0x");
+
+        if (!strncmp(line, key, strlen(key)) && at)
+            CHECK(sscanf(at, "SGIs still pending 0x%*x, %ld AIC events forwarded, %ld not",
+                         forwarded, not) == 2);
+    }
+    fclose(f);
+}
+
+static void aic_tests(void)
+{
+    long forwarded, not, before;
+    int unmasked;
+
+    /* Every line is masked when the hypervisor starts, by the boot core, once */
+    aic_reset(true);
+    CHECK(hv_vgic_has_aicmap());
+    CHECK(mask_all_calls == 1);
+    for (u32 line = 0; line < AIC_LINES; line++)
+        CHECK(line_masked[line] || line % 4096 >= 2048);
+    CHECK(unmask_calls == 0);
+
+    /* A line that is raised while the guest has not enabled its SPI does not arrive */
+    line_raise(LINE_A, true);
+    expect_counts("AIC: a raised line whose SPI is not enabled does not arrive", 32, 0, 0, 0, 0);
+    CHECK(line_masked[LINE_A]);
+
+    /* Enabled: the line is unmasked, AIC reports it, the guest takes SPI 32 of the table */
+    device(32, LINE_A, 1);
+    cur = 6;
+    windows_enable_spi(32, 0x80, 6, false);
+    expect_counts("AIC: line 3 arrives as SPI 32 once the SPI is enabled", 32, 1, 0, 0, 0);
+    CHECK(!dev.unmasked_in_flight);
+    CHECK(!line_masked[LINE_A]);
+    aic_counts(6, &forwarded, &not);
+    CHECK(forwarded == 1 && not == 0);
+
+    /* Still high when the guest ends it: it arrives again; once low, no more */
+    device(32, LINE_A, 3);
+    line_raise(LINE_A, true);
+    expect_counts("AIC: a line still high at the end arrives again, until it is low", 32, 4, 0, 0,
+                  0);
+    CHECK(!dev.unmasked_in_flight);
+    CHECK(!line_masked[LINE_A]);
+
+    /* Disabled while the line waits: masked; raised then, it does not arrive; enabled, it does */
+    cur = 6;
+    wr32(GICD(GICD_ICENABLER + 4), BIT(0));
+    CHECK(line_masked[LINE_A]);
+    device(32, LINE_A, 1);
+    line_raise(LINE_A, true);
+    expect_counts("AIC: disabled, the line is masked and does not arrive", 32, 4, 0, 0, 0);
+    cur = 6;
+    wr32(GICD(GICD_ISENABLER + 4), BIT(0));
+    expect_counts("AIC: enabled again, the line that is high arrives", 32, 5, 0, 0, 0);
+    CHECK(!line_masked[LINE_A]);
+
+    /*
+     * Disabled by the guest while it handles it: once ended, it stays masked, though high, and
+     * AIC does not report it again: it is forwarded once, and nothing is pending
+     */
+    aic_counts(6, &before, &not);
+    device(32, LINE_A, 100);
+    dev.disable = true;
+    line_raise(LINE_A, true);
+    expect_counts("AIC: disabled while the guest has it, it stays masked after the end", 32, 6, 0,
+                  0, 0);
+    CHECK(line_masked[LINE_A] && line_high[LINE_A]);
+    aic_counts(6, &forwarded, &not);
+    CHECK(forwarded == before + 1);
+    cur = 6;
+    CHECK(!spi_pending(32));
+    device(32, LINE_A, 1);
+    cur = 6;
+    wr32(GICD(GICD_ISENABLER + 4), BIT(0));
+    expect_counts("AIC: ...and arrives when enabled again", 32, 7, 0, 0, 0);
+
+    /* Disabled and enabled again while the guest has it: masked until the end, then again */
+    device(32, LINE_A, 2);
+    dev.disable = dev.enable_again = true;
+    line_raise(LINE_A, true);
+    expect_counts("AIC: off and on while the guest has it: masked until the end", 32, 9, 0, 0, 0);
+    CHECK(!dev.unmasked_in_flight);
+    CHECK(!line_masked[LINE_A]);
+
+    /* Routed to another core: the core that reads the event makes it pending there */
+    device(33, LINE_B, 1);
+    cur = 6;
+    windows_enable_spi(33, 0x80, 0, false);
+    line_raise(LINE_B, true);
+    expect_counts("AIC: line 40 arrives as SPI 33 on the core it is routed to", 33, 0, 1, 0, 0);
+    CHECK(!line_masked[LINE_B]);
+
+    /* The second die: die 1, line 7 of the event register is line 4096 + 7, SPI 35 */
+    device(35, LINE_D, 1);
+    cur = 6;
+    windows_enable_spi(35, 0x80, 7, false);
+    line_raise(LINE_D, true);
+    expect_counts("AIC: line 7 of the second die arrives as SPI 35", 35, 0, 0, 1, 0);
+
+    /* Group 1 off: the line is in flight and masked, the SPI waits; on again, it arrives */
+    cur = 6;
+    wr32(GICD(GICD_CTLR), 0);
+    device(34, LINE_C, 1);
+    windows_enable_spi(34, 0x80, 6, false);
+    line_raise(LINE_C, true);
+    expect_counts("AIC: with Group 1 off the SPI waits", 34, 0, 0, 0, 0);
+    CHECK(line_masked[LINE_C]);
+    cur = 6;
+    CHECK(spi_pending(34));
+    wr32(GICD(GICD_CTLR), 2);
+    expect_counts("AIC: ...and arrives once it is on", 34, 1, 0, 0, 0);
+    CHECK(!line_masked[LINE_C]);
+
+    /*
+     * An event the guest does not wait for is not forwarded, and the line stays masked: one
+     * that is in no table, and one of the table whose SPI is disabled (AIC had queued it, say)
+     */
+    aic_counts(6, &forwarded, &not);
+    CHECK(not == 0);
+    pthread_mutex_lock(&bhl);
+    line_set(99, true, false);
+    pthread_mutex_unlock(&bhl);
+    cur = 6;
+    wr32(GICD(GICD_ICENABLER + 4), BIT(1));
+    pthread_mutex_lock(&bhl);
+    line_set(LINE_B, true, false);
+    pthread_mutex_unlock(&bhl);
+    settle(6);
+    CHECK(line_masked[99] && line_masked[LINE_B]);
+    aic_counts(6, &forwarded, &not);
+    CHECK(not == 2);
+    expect_counts("AIC: events the guest does not wait for are not forwarded", 33, 0, 1, 0, 0);
+    line_raise(99, false);
+    line_raise(LINE_B, false);
+
+    /* SPIs that are no line of the table: enabling them unmasks nothing */
+    unmasked = unmask_calls;
+    cur = 6;
+    windows_enable_spi(36, 0x80, 6, false);
+    windows_enable_spi(1019, 0x80, 6, false);
+    CHECK(unmask_calls == unmasked);
+
+    /* No table: the hypervisor says so, every line is still masked, none is ever unmasked */
+    aic_reset(false);
+    CHECK(!hv_vgic_has_aicmap());
+    CHECK(mask_all_calls == 1);
+    device(32, LINE_A, 1);
+    cur = 6;
+    windows_enable_spi(32, 0x80, 6, false);
+    line_raise(LINE_A, true);
+    expect_counts("AIC: without a table no line is forwarded", 32, 0, 0, 0, 0);
+    CHECK(unmask_calls == 0 && line_masked[LINE_A]);
+    line_raise(LINE_A, false);
+
+    guest_handler = NULL;
+    aicmap_fails = false;
+}
+
 /* ---- stress: every core sends to every core, one thread per core ---- */
 
 static int rounds;
 static atomic_int failed;
 static u64 sent[MAX_CPUS][MAX_CPUS][NR_SGIS]; /* [sender slot][target][intid] */
-static u64 spis_sent[MAX_CPUS];                /* [sender], all SPIs */
+static u64 spis_sent[MAX_CPUS];               /* [sender], all SPIs */
 static bool with_spis;
 
 static double seconds(void)
@@ -1444,9 +1790,11 @@ static struct vgic_counts report_counts(int cpu)
     rewind(f);
     while (fgets(line, sizeof(line), f))
         if (!strncmp(line, key, strlen(key)))
-            CHECK(sscanf(line + strlen(key),
-                         "%*d ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, %ld taken back",
-                         &n.injected, &n.maintenance, &n.taken_back) == 3);
+            CHECK(
+                sscanf(
+                    line + strlen(key),
+                    "%*d ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, %ld taken back",
+                    &n.injected, &n.maintenance, &n.taken_back) == 3);
     fclose(f);
     return n;
 }
@@ -1572,7 +1920,8 @@ static void level_timer_tests(void)
 
 /* ---- WFI ---- */
 
-/* The guest on the current core executes WFI: trap, hv_handle_wfx, hv_exc_exit. Returns the WFEs. */
+/* The guest on the current core executes WFI: trap, hv_handle_wfx, hv_exc_exit. Returns the WFEs.
+ */
 static u64 guest_wfi(void)
 {
     u64 before = wfe_count;
@@ -1732,7 +2081,8 @@ static void wfi_tests(void)
     during_wfe(4, cpu0_enables_timer_of_6);
     CHECK(guest_wfi() == 4);
     take_timer(6);
-    printf("ok   WFI: timer high with its PPI disabled: waits until another core enables the PPI\n");
+    printf(
+        "ok   WFI: timer high with its PPI disabled: waits until another core enables the PPI\n");
 
     wfi_reset(8);
     cur = 6;
@@ -1939,8 +2289,8 @@ static void wfi_stress(int lrs, long hops)
             for (int s = 0; s < NR_STARTED; s++)
                 want += ring_sent[started[s]][started[t]][i];
             if (taken(started[t], i) != want) {
-                printf("FAIL WFI stress: cpu %d took SGI %d %u times, %lu were sent\n",
-                       started[t], i, taken(started[t], i), want);
+                printf("FAIL WFI stress: cpu %d took SGI %d %u times, %lu were sent\n", started[t],
+                       i, taken(started[t], i), want);
                 exit(1);
             }
         }
@@ -1957,8 +2307,15 @@ int main(int argc, char **argv)
     int n = argc > 1 ? atoi(argv[1]) : 200000;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
+    /* "aic": only the tests of how AIC lines are forwarded (make vgic-broken) */
+    if (argc > 1 && !strcmp(argv[1], "aic")) {
+        aic_tests();
+        printf("ALL OK\n");
+        return 0;
+    }
     sgi_tests();
     dist_tests();
+    aic_tests();
     level_timer_tests();
     wfi_tests();
     stress(8, n, false);

@@ -14,6 +14,7 @@
  */
 #include <unistd.h>
 
+#include "aic.h"
 #include "hv.h"
 #include "memory.h"
 #include "model.h"
@@ -21,6 +22,8 @@
 #include "utils.h"
 
 u64 ram_base, mem_size_actual;
+/* hv_layout.c has the table of AIC lines too, which aicmap_test.c tests */
+struct aic *aic;
 
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -35,7 +38,7 @@ static struct io io[R21_MMIO_COUNT + 2];
 static unsigned io_count;
 static u32 bus_cells, cpu_cells, size_cells;
 static bool with_arm_io, with_ranges, with_bus_cells, with_size_cells, with_cpu_cells;
-static u32 ranges_extra; /* bytes after the last entry */
+static u32 ranges_extra;    /* bytes after the last entry */
 static bool ranges_flagged; /* the top bit of the length of "ranges" is set */
 /* How long the three properties that say how many cells a number has are: 4 bytes, really */
 static u32 bus_cells_len, cpu_cells_len, size_cells_len;
@@ -244,17 +247,17 @@ static void test_a_device_in_the_way(void)
             u64 base, end;
             bool hit;
         } cases[] = {
-            {g->base - 0x4000, g->base, false},      /* ends where the range starts */
-            {g->base - 0x4000, g->base + 1, true},   /* one byte into it */
-            {g->base - 1, g->base, false},           /* the byte before it */
-            {g->base, g->base + 1, true},            /* its first byte */
-            {g->base + 0x4000, g->base + 0x8000, true}, /* inside */
-            {g->base, g->end, true},                 /* all of it */
+            {g->base - 0x4000, g->base, false},                /* ends where the range starts */
+            {g->base - 0x4000, g->base + 1, true},             /* one byte into it */
+            {g->base - 1, g->base, false},                     /* the byte before it */
+            {g->base, g->base + 1, true},                      /* its first byte */
+            {g->base + 0x4000, g->base + 0x8000, true},        /* inside */
+            {g->base, g->end, true},                           /* all of it */
             {g->base - 0x10000000, g->end + 0x10000000, true}, /* around it */
-            {g->end - 1, g->end, true},              /* its last byte */
-            {g->end - 1, g->end + 0x4000, true},     /* from its last byte on */
-            {g->end, g->end + 0x4000, false},        /* starts where it ends */
-            {g->end, g->end + 1, false},             /* the byte after it */
+            {g->end - 1, g->end, true},                        /* its last byte */
+            {g->end - 1, g->end + 0x4000, true},               /* from its last byte on */
+            {g->end, g->end + 0x4000, false},                  /* starts where it ends */
+            {g->end, g->end + 1, false},                       /* the byte after it */
         };
 
         for (unsigned c = 0; c < COUNT(cases); c++) {

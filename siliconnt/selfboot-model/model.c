@@ -5,7 +5,7 @@
 
 int checks, failed;
 
-/* ---- the device tree functions of src/adt.h that selfboot.c and selfboot_run.c call ------ */
+/* ---- the device tree functions of src/adt.h that the files under test call -------------- */
 
 void *adt;
 
@@ -19,6 +19,11 @@ static const struct adt_node_hdr *node_at(int offset)
 int adt_get_property_count(const void *dt, int offset)
 {
     return node_at(offset)->property_count;
+}
+
+int adt_get_child_count(const void *dt, int offset)
+{
+    return node_at(offset)->child_count;
 }
 
 int adt_first_property_offset(const void *dt, int offset)

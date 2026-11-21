@@ -18,9 +18,15 @@
  * meant to differ from that run and are checked as they are meant: MDCR_EL2 has no TDE and
  * MDSCR_EL1 is 0; the registers the host kept to itself (PMGR, CPU start, RVBAR) are mapped
  * as the devices they are; execution tracking is turned on after the memory is mapped.
+ *
+ * The table of AIC lines and SPIs is made by the real hv_aicmap() of hv_layout.c, which has
+ * its own test in aicmap_test.c. What is checked here is where it goes, that the firmware is
+ * told so, and that it is what the host's loader gets from the same function (P_HV_AICMAP of
+ * src/proxy.c calls nothing else): both loaders hand the firmware the same bytes.
  */
 #include <sys/mman.h>
 
+#include "aic.h"
 #include "cpu_regs.h"
 #include "hv.h"
 #include "iodev.h"
@@ -48,6 +54,11 @@
 
 #define UART_BASE 0x3ad200000UL /* "Virtual UART at 0x3ad200000" */
 #define UART_IRQ  0x3c9
+/* The phandle of AIC on the M4, and the lines of a device of the tree besides the UART */
+#define AIC_PHANDLE 0xd5
+#define DEV_IRQS    {1505, 5, UART_IRQ, 0x70305452}
+/* ...which make this table: the lines in order, each once, without what is no line */
+static const u32 table_lines[] = {5, UART_IRQ, 1505};
 /* hv_map_vuart() of src/hv/hv_vuart.c takes the first 4 KB of the UART */
 #define VUART_SIZE 0x1000UL
 
@@ -68,6 +79,9 @@
 
 struct boot_args cur_boot_args;
 u64 ram_base, mem_size_actual;
+/* The AIC of the M4: one die of 2048 lines, room for two of 4096 */
+struct aic *aic;
+static struct aic m4_aic;
 size_t mcc_carveout_count;
 struct mcc_carveout mcc_carveouts[4];
 
@@ -79,6 +93,9 @@ static u32 arm_io_cells;
 static bool with_ranges;
 /* A device the M4 does not have: where it is and its size, none if that is 0 */
 static u64 one_more_device[2];
+/* Whether /arm-io has an AIC; a device with this many lines more, 0 to n - 1 */
+static bool with_aic;
+static u32 many_lines;
 
 /* The ranges of /arm-io are those of R21 (r21_mmio of model.c) */
 static void make_tree(void)
@@ -119,16 +136,36 @@ static void make_tree(void)
     p = put_range(p, "SEPFW", 0x10005a6c000, 0x5d0000);
     p = put_range(p, "TrustCache", 0x10006138000, 0x74000);
 
-    p = put_node(p, with_ranges ? 4 : 3, 1);
+    p = put_node(p, with_ranges ? 4 : 3, 2 + with_aic + !!many_lines);
     p = put_name(p, "arm-io");
     p = put_prop(p, "#address-cells", &arm_io_cells, 4);
     p = put_prop(p, "#size-cells", &(u32){2}, 4);
     if (with_ranges)
         p = put_prop(p, "ranges", ranges, n_ranges * sizeof(ranges[0]));
-    p = put_node(p, 3, 0);
+    if (with_aic) {
+        p = put_node(p, 2, 0);
+        p = put_name(p, "aic");
+        p = put_prop(p, "AAPL,phandle", &(u32){AIC_PHANDLE}, 4);
+    }
+    p = put_node(p, 4, 0);
     p = put_name(p, "uart0");
     p = put_prop(p, "reg", uart_reg, sizeof(uart_reg));
+    p = put_prop(p, "interrupt-parent", &(u32){AIC_PHANDLE}, 4);
     p = put_prop(p, "interrupts", &(u32){UART_IRQ}, 4);
+    p = put_node(p, 3, 0);
+    p = put_name(p, "dev");
+    p = put_prop(p, "interrupt-parent", &(u32){AIC_PHANDLE}, 4);
+    p = put_prop(p, "interrupts", (u32[])DEV_IRQS, sizeof((u32[])DEV_IRQS));
+    if (many_lines) {
+        static u32 lines[2048];
+
+        for (u32 i = 0; i < many_lines; i++)
+            lines[i] = i;
+        p = put_node(p, 3, 0);
+        p = put_name(p, "many");
+        p = put_prop(p, "interrupt-parent", &(u32){AIC_PHANDLE}, 4);
+        p = put_prop(p, "interrupts", lines, 4 * many_lines);
+    }
 
     adt = tree;
     memcpy(tree_before, tree, sizeof(tree));
@@ -152,7 +189,7 @@ static void map_window(u64 base)
 
 /* Where things go above a start of guest RAM, worked out here a second time */
 struct where {
-    u64 phys_base, adt, image, bootargs, disk, top;
+    u64 phys_base, adt, image, bootargs, aicmap, disk, top;
 };
 
 static struct where where(u64 phys_base)
@@ -162,7 +199,8 @@ static struct where where(u64 phys_base)
     w.adt = phys_base + (32UL << 20);
     w.image = (w.adt + ADT_SIZE + 0x1fffff) & ~0x1fffffUL;
     w.bootargs = w.image + IMAGE_SIZE;
-    w.disk = (w.bootargs + 0x4000 + 0x1fffff) & ~0x1fffffUL;
+    w.aicmap = w.bootargs + 0x4000;
+    w.disk = (w.aicmap + 0x4000 + 0x1fffff) & ~0x1fffffUL;
     w.top = (w.disk + DISK_SIZE + 0x3fff) & ~0x3fffUL;
     return w;
 }
@@ -437,7 +475,17 @@ static void reset(void)
     arm_io_cells = 2;
     with_ranges = true;
     one_more_device[0] = one_more_device[1] = 0;
+    with_aic = true;
+    many_lines = 0;
     make_tree();
+
+    memset(&m4_aic, 0, sizeof(m4_aic));
+    m4_aic.version = 3;
+    m4_aic.nr_die = 1;
+    m4_aic.max_die = 2;
+    m4_aic.nr_irq = 2048;
+    m4_aic.max_irq = 4096;
+    aic = &m4_aic;
     make_files();
 
     memset((void *)SELF_PHYS_BASE, FILL, WINDOW);
@@ -595,10 +643,34 @@ static void check_memory(const struct where *w)
     CHECK_EQ((u64)ba->devtree - ba->virt_base + ba->phys_base, w->adt);
     CHECK(all_bytes(w->bootargs + sizeof(*ba), w->bootargs + 0x4000, 0));
 
-    /* The device tree: m1n1's, with three entries of /chosen/memory-map changed */
+    /* The table: version 1, the count, the lines; what P_HV_AICMAP writes, byte for byte */
+    const u32 *table = (const u32 *)w->aicmap;
+    u32 table_size = 8 + sizeof(table_lines);
+    static struct hv_aicmap of_the_host;
+
+    CHECK_EQ(table[0], 1);
+    CHECK_EQ(table[1], COUNT(table_lines));
+    CHECK(!memcmp(table + 2, table_lines, sizeof(table_lines)));
+    memset(&of_the_host, 0, sizeof(of_the_host));
+    CHECK_EQ(hv_aicmap(&of_the_host), table_size);
+    CHECK(!memcmp(table, &of_the_host, table_size));
+
+    /* The device tree: m1n1's, with four entries of /chosen/memory-map changed */
     CHECK(guest_range_is(w, "DeviceTree", w->adt, ADT_SIZE));
     CHECK(guest_range_is(w, "BootArgs", w->bootargs, 0x4000));
     CHECK(guest_range_is(w, "RAMDisk", w->disk, DISK_SIZE));
+    CHECK(guest_range_is(w, "AICToGIC", w->aicmap, table_size));
+    /*
+     * What the firmware checks of the entry before it reads the table (AppleGetAicToGic() of
+     * AppleDTLib.c, siliconnt-firmware aic-to-gic 8b3fe9d): the size is that of the table,
+     * 8 + 4 * its count; the address is the start of a 4 KB page; all of it lies in the
+     * memory the boot arguments describe; the lines go up strictly
+     */
+    CHECK_EQ(table_size, 8 + 4 * table[1]);
+    CHECK_EQ(w->aicmap % 0x1000, 0);
+    CHECK(w->aicmap >= ba->phys_base && w->aicmap + table_size <= ba->phys_base + ba->mem_size);
+    for (u32 i = 1; i < table[1] && i < 988; i++)
+        CHECK(table[2 + i] > table[2 + i - 1]);
     CHECK(guest_range_is(w, "SEPFW", 0x10005a6c000, 0x5d0000));
     CHECK(!memcmp((void *)w->adt, tree, 0x40));
     CHECK(!memcmp(tree, tree_before, sizeof(tree)));
@@ -607,7 +679,7 @@ static void check_memory(const struct where *w)
      * gaps, not what follows the disk */
     CHECK(all_bytes(w->phys_base, w->adt, FILL));
     CHECK(all_bytes(w->adt + ADT_SIZE, w->image, FILL));
-    CHECK(all_bytes(w->bootargs + 0x4000, w->disk, FILL));
+    CHECK(all_bytes(w->aicmap + table_size, w->disk, FILL));
     CHECK(all_bytes(w->disk + DISK_SIZE, w->phys_base + WINDOW, FILL));
 }
 
@@ -743,6 +815,8 @@ static void check_not_entered(int ret)
     CHECK_EQ(stray, 0);
 }
 
+static void put_files(const struct where *w);
+
 /* ---- m1n1 loads by itself ------------------------------------------------------------------ */
 
 static void test_from_the_ssd(void)
@@ -768,11 +842,11 @@ static void test_from_the_ssd(void)
     CHECK(first(EV_NVME_SHUTDOWN) < first(EV_HV_INIT));
 
     /* The image first, straight to where it goes, with all the room there is for it: up to
-     * one page, for the boot arguments, below the firmware's work area */
+     * two pages, for the boot arguments and the table, below the firmware's work area */
     read = &events[first(EV_READ_FILE)];
     CHECK_EQ(read->a, 0);
     CHECK_EQ(read->b, w.image);
-    CHECK_EQ(read->c, R21_MEM_TOP - 0x8000000 - w.image - 0x4000);
+    CHECK_EQ(read->c, R21_MEM_TOP - 0x8000000 - w.image - 0x8000);
     read = &events[last(EV_READ_FILE)];
     CHECK_EQ(read->a, 1);
     CHECK_EQ(read->b, w.disk);
@@ -848,6 +922,52 @@ static void test_a_machine_that_will_not_do(void)
     arm_io_cells = 3;
     make_tree();
     check_not_started(selfboot_run(PART_UUID));
+}
+
+/*
+ * No table of AIC lines and SPIs: more lines than SPIs, no AIC, no node of AIC. The firmware
+ * is not entered, and that is found out before anything is set up for the guest, while
+ * m1n1 still has the screen to say so.
+ */
+static void check_no_table(const struct where *w, int ret)
+{
+    check_not_started(ret);
+    CHECK(all_bytes(w->phys_base, w->image, FILL));
+    CHECK(all_bytes(w->bootargs, w->disk, FILL));
+}
+
+static void test_no_table(void)
+{
+    struct where self = where(SELF_PHYS_BASE), host = where(R21_PHYS_BASE);
+
+    /* Lines 0 to 986, and 1505 of the other device, are as many as there are SPIs */
+    reset();
+    many_lines = 987;
+    make_tree();
+    CHECK_EQ(selfboot_run(PART_UUID), 0);
+    CHECK_EQ(((const u32 *)self.aicmap)[1], 988);
+    CHECK(guest_range_is(&self, "AICToGIC", self.aicmap, 8 + 4 * 988));
+
+    /* One more */
+    reset();
+    many_lines = 988;
+    make_tree();
+    check_no_table(&self, selfboot_run(PART_UUID));
+
+    reset();
+    put_files(&host);
+    many_lines = 988;
+    make_tree();
+    check_no_table(&host, selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
+
+    reset();
+    aic = NULL;
+    check_no_table(&self, selfboot_run(PART_UUID));
+
+    reset();
+    with_aic = false;
+    make_tree();
+    check_no_table(&self, selfboot_run(PART_UUID));
 }
 
 static void test_mappings_that_fail(void)
@@ -987,6 +1107,7 @@ int main(void)
     test_no_files();
     test_files_that_are_not_what_they_should_be();
     test_a_machine_that_will_not_do();
+    test_no_table();
     test_mappings_that_fail();
     test_loaded_by_a_host();
     test_loaded_refuses();

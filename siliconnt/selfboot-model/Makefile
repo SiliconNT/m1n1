@@ -6,25 +6,28 @@
 # (run_test.c): reading the two files, setting up the hypervisor and entering the firmware;
 # and for src/hv/hv_layout.c (layout_test.c, and run_test.c has it under selfboot_run.c):
 # where the device tree says the devices of the machine are, and whether the machine has
-# something where the guest finds its GIC.
+# something where the guest finds its GIC; and the table of AIC lines and SPIs it makes from
+# the device tree (aicmap_test.c, and run_test.c, which checks that both loaders hand the
+# firmware the same one).
 # The real files, compiled for the build machine against stand-in headers, with device trees
 # that the tests make.
 #
 #   make        build them and run them; then check_adt.py reads the device tree test.c wrote
 #               with the parser of the proxy client (needs the Python of the proxy client)
 #   make run    only the one for src/selfboot_run.c
-#   make layout only the one for src/hv/hv_layout.c
-#   make broken the last two against src/hv/hv_layout.c and src/selfboot_run.c with one thing
-#               wrong in them at a time: they must fail on each (broken.sh)
+#   make layout only the one for the ranges of src/hv/hv_layout.c
+#   make aicmap only the one for the table of AIC lines and SPIs of src/hv/hv_layout.c
+#   make broken the last three against src/hv/hv_layout.c and src/selfboot_run.c with one
+#               thing wrong in them at a time: they must fail on each (broken.sh)
 
 CC := gcc
 PYTHON ?= $(HOME)/src/m1n1-venv/bin/python
 SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -I. -Ibuild
 
-.PHONY: all run layout broken clean
+.PHONY: all run layout aicmap broken clean
 
-all: build/model run layout broken
+all: build/model run layout aicmap broken
 	build/model build/adt-out.bin
 	$(PYTHON) check_adt.py build/adt-out.bin
 
@@ -34,7 +37,10 @@ run: build/run-model
 layout: build/layout-model
 	build/layout-model
 
-broken: build/layout-model build/run-model
+aicmap: build/aicmap-model
+	build/aicmap-model
+
+broken: build/layout-model build/aicmap-model build/run-model
 	bash broken.sh
 
 # Copies, so that their #include "..." lines find the stand-ins in this directory
@@ -85,8 +91,18 @@ build/hv_layout.c: $(SRC)/hv/hv_layout.c
 # What the stand-in hv.h of this directory has of the real one, as it is there
 build/hv_layout.h: $(SRC)/hv/hv.h
 	@mkdir -p build
-	grep -E '^#define HV_VGIC_(DIST|REDIST)_(BASE|SIZE) ' $< > $@
+	grep -E '^#define HV_(VGIC_(DIST|REDIST)_(BASE|SIZE)|AICMAP_[A-Z_]+) ' $< > $@
 	sed -n '/^struct hv_io_ranges {/,/^};/p' $< >> $@
+	sed -n '/^struct hv_aicmap {/,/^};/p' $< >> $@
+
+# AIC as hv_layout.c knows it: the structure aic_init() fills in, the limits
+build/aic.h: $(SRC)/aic.h
+	@mkdir -p build
+	cp $< $@
+
+build/aic_regs.h: $(SRC)/aic_regs.h
+	@mkdir -p build
+	cp $< $@
 
 # The stand-in for smp.h: how many cores m1n1 has room for
 build/smp.h: $(SRC)/smp_asm.h
@@ -94,9 +110,13 @@ build/smp.h: $(SRC)/smp_asm.h
 	grep '^#define MAX_CPUS ' $< > $@
 
 LAYOUT_COPIES := build/hv_layout.c build/hv_layout.h build/smp.h build/adt.h build/xnuboot.h
+LAYOUT_COPIES += build/aic.h build/aic_regs.h
 
 build/layout-model: layout_test.c model.c $(wildcard *.h) $(LAYOUT_COPIES)
 	$(CC) $(CFLAGS) -o $@ layout_test.c model.c build/hv_layout.c
+
+build/aicmap-model: aicmap_test.c model.c $(wildcard *.h) $(LAYOUT_COPIES)
+	$(CC) $(CFLAGS) -o $@ aicmap_test.c model.c build/hv_layout.c
 
 RUN_COPIES := build/selfboot_files.c build/selfboot.c build/selfboot_run.c build/selfboot.h build/adt.h build/xnuboot.h
 RUN_COPIES += build/mcc.h build/arm_cpu_regs.h build/build_cfg.h $(LAYOUT_COPIES)

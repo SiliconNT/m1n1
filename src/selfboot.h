@@ -12,9 +12,11 @@
  * firmware is handed, the way siliconnt/firmware/run_firmware.py does it on the host:
  *
  *   phys_base             start of guest RAM
- *   phys_base + 32 MB     Apple device tree, with the boot disk in /chosen/memory-map
+ *   phys_base + 32 MB     Apple device tree, with the table and the boot disk in
+ *                         /chosen/memory-map
  *   next 2 MB boundary    the firmware image, entered at its first byte
  *   after the image       Apple boot arguments, one 16 KB page
+ *   next page             the table of AIC lines and SPIs (hv_aicmap()), one 16 KB page
  *   next 2 MB boundary    the boot disk image
  *   ...
  *   mem_top - 128 MB      the firmware's own work area
@@ -29,6 +31,7 @@
 /* A multiple of every alignment the modules of the image ask for */
 #define SELFBOOT_IMAGE_ALIGN   0x200000UL
 #define SELFBOOT_BOOTARGS_SIZE SELFBOOT_PAGE
+#define SELFBOOT_AICMAP_SIZE   SELFBOOT_PAGE
 #define SELFBOOT_DISK_ALIGN    0x200000UL
 /* The firmware's pages: it reserves exactly the pages the disk lies in */
 #define SELFBOOT_DISK_PAGE 0x1000UL
@@ -43,6 +46,8 @@ struct selfboot_layout {
     u64 image_base;
     u64 image_size;
     u64 bootargs;
+    u64 aicmap;
+    u64 aicmap_size; /* the bytes of the table in it: 0 until it is written */
     u64 disk_base;
     u64 disk_size;
     u64 top; /* top_of_kernel_data: where what was put here ends */
@@ -59,7 +64,7 @@ int selfboot_layout_init(struct selfboot_layout *l, u64 phys_base, const struct 
 
 /* The most bytes the firmware image may have: the size of the buffer to read it into */
 u64 selfboot_image_room(const struct selfboot_layout *l);
-/* The image, read to image_base, has this size: sets bootargs and disk_base */
+/* The image, read to image_base, has this size: sets bootargs, aicmap and disk_base */
 int selfboot_layout_image(struct selfboot_layout *l, u64 size);
 
 /* The same for the boot disk: valid after selfboot_layout_image() */
@@ -77,12 +82,13 @@ void selfboot_boot_args(struct boot_args *out, const struct boot_args *cur,
 
 /*
  * The device tree of the guest, written to `dest` (adt_base): a copy of m1n1's, `size` bytes,
- * with DeviceTree, BootArgs and RAMDisk in /chosen/memory-map. m1n1's own is not changed.
+ * with DeviceTree, BootArgs, RAMDisk and AICToGIC in /chosen/memory-map. m1n1's own is not
+ * changed. The table is to be written by then: aicmap_size is what AICToGIC says.
  */
 int selfboot_adt(void *dest, u32 size, const struct selfboot_layout *l);
 /*
  * One more entry of /chosen/memory-map in that copy: one of the spare entries iBoot leaves
- * gets the name and the range. selfboot_adt() adds RAMDisk with it.
+ * gets the name and the range. selfboot_adt() adds RAMDisk and AICToGIC with it.
  */
 int selfboot_adt_add_range(void *dest, const char *name, u64 base, u64 bytes);
 

@@ -201,6 +201,40 @@ void aic_set_sw(int irq, bool active)
                 MASK_BIT(irq));
 }
 
+/*
+ * irq is die * max_irq + line, as for aic_set_sw(). The same fields on every version: the
+ * offsets come from aic_init(), as in aic_irq_mask() and aic_irq_unmask() of Linux
+ * (drivers/irqchip/irq-apple-aic.c).
+ */
+void aic_mask(int irq)
+{
+    u32 die = irq / aic->max_irq;
+    irq = irq % aic->max_irq;
+    write32(aic->base + aic->regs.mask_set + die * aic->intmaskset_stride + MASK_REG(irq),
+            MASK_BIT(irq));
+}
+
+void aic_unmask(int irq)
+{
+    u32 die = irq / aic->max_irq;
+    irq = irq % aic->max_irq;
+    write32(aic->base + aic->regs.mask_clr + die * aic->intmaskclear_stride + MASK_REG(irq),
+            MASK_BIT(irq));
+}
+
+/* Every line of every die masked, and no software trigger left set, as Linux starts out */
+void aic_mask_all(void)
+{
+    for (u32 die = 0; die < aic->nr_die; die++) {
+        for (u32 i = 0; i < DIV_ROUND_UP(aic->nr_irq, 32); i++) {
+            write32(aic->base + aic->regs.mask_set + die * aic->intmaskset_stride + 4 * i,
+                    0xffffffff);
+            write32(aic->base + aic->regs.sw_clr + die * aic->intmaskclear_stride + 4 * i,
+                    0xffffffff);
+        }
+    }
+}
+
 void aic_write(u32 reg, u32 val)
 {
     write32(aic->base + reg, val);

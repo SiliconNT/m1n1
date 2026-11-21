@@ -25,8 +25,10 @@ EXPECTED = {
     "DeviceTree": (0x1001a9a8000, 0x84000),
     "BootArgs": (0x1001ca00000, 0x4000),
     "RAMDisk": (0x1001cc00000, 0x28200000),
+    # The page after the boot arguments: version, count and 391 lines
+    "AICToGIC": (0x1001ca04000, 8 + 4 * 391),
     "MemoryMapReserved-0": None,
-    "MemoryMapReserved-1": (0, 0),
+    "MemoryMapReserved-1": None,
     "MemoryMapReserved-2": (0, 0),
     "SEPFW": (0x10005a6c000, 0x5d0000),
 }

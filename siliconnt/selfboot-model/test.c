@@ -94,12 +94,15 @@ static void test_layout_of_r21(void)
     CHECK_EQ(l.adt_size, 0x84000);
     CHECK_EQ(l.image_base, 0x1001ac00000);
     CHECK_EQ(l.uefi_base, 0x103d3610000);
-    /* The image may reach to one page, for the boot arguments, below the work area */
-    CHECK_EQ(selfboot_image_room(&l), 0x103d3610000 - 0x1001ac00000 - 0x4000);
+    /* The image may reach to two pages, for the boot arguments and the table, below the
+     * work area */
+    CHECK_EQ(selfboot_image_room(&l), 0x103d3610000 - 0x1001ac00000 - 0x8000);
 
     CHECK_EQ(selfboot_layout_image(&l, R21_IMAGE), 0);
     CHECK_EQ(l.image_size, R21_IMAGE);
     CHECK_EQ(l.bootargs, 0x1001ca00000);
+    CHECK_EQ(l.aicmap, 0x1001ca04000);
+    CHECK_EQ(l.aicmap_size, 0);
     CHECK_EQ(l.disk_base, 0x1001cc00000);
     CHECK_EQ(selfboot_disk_room(&l), 0x103d3610000 - 0x1001cc00000);
 
@@ -128,9 +131,16 @@ static void test_layout_rounds(void)
     CHECK_EQ(l.image_base, 0x1001a200000);
 
     /* An image that ends one page below a 2 MB boundary: the boot arguments fill it up, the
-     * disk starts at the boundary */
+     * table is the first page of the next 2 MB, and the disk starts at the one after */
     CHECK_EQ(selfboot_layout_image(&l, 0x200000 - 0x4000), 0);
     CHECK_EQ(l.bootargs, 0x1001a3fc000);
+    CHECK_EQ(l.aicmap, 0x1001a400000);
+    CHECK_EQ(l.disk_base, 0x1001a600000);
+    /* Two pages below: the boot arguments and the table fill them up, the disk starts at the
+     * boundary */
+    CHECK_EQ(selfboot_layout_image(&l, 0x200000 - 0x8000), 0);
+    CHECK_EQ(l.bootargs, 0x1001a3f8000);
+    CHECK_EQ(l.aicmap, 0x1001a3fc000);
     CHECK_EQ(l.disk_base, 0x1001a400000);
     /* A disk that is whole 4 KB pages, not whole 16 KB pages */
     CHECK_EQ(selfboot_layout_disk(&l, 0x5000), 0);
@@ -149,7 +159,8 @@ static void test_layout_refuses_what_does_not_fit(void)
     room = selfboot_image_room(&l);
     CHECK_EQ(selfboot_layout_image(&l, room + 0x4000), -1);
     CHECK_EQ(selfboot_layout_image(&l, room), 0);
-    CHECK_EQ(l.bootargs + SELFBOOT_BOOTARGS_SIZE, l.uefi_base);
+    CHECK_EQ(l.bootargs + SELFBOOT_BOOTARGS_SIZE, l.aicmap);
+    CHECK_EQ(l.aicmap + SELFBOOT_AICMAP_SIZE, l.uefi_base);
     /* Nothing is left for a disk then */
     CHECK_EQ(selfboot_disk_room(&l), 0);
     CHECK_EQ(selfboot_layout_disk(&l, 0x1000), -1);
@@ -241,8 +252,8 @@ static u8 image[0x10000];
 static void make_image(u64 size)
 {
     memset(image, 0, sizeof(image));
-    memcpy(image, &(u32){0x10000001}, 4);      /* adr x1, . */
-    memcpy(image + 4, &(u32){0x14001fff}, 4);  /* b . + 0x7ffc: to offset 0x8000 */
+    memcpy(image, &(u32){0x10000001}, 4);     /* adr x1, . */
+    memcpy(image + 4, &(u32){0x14001fff}, 4); /* b . + 0x7ffc: to offset 0x8000 */
     memcpy(image + 0x10, &size, 8);
     memcpy(image + 0x38, "ARM\x64", 4);
 }
@@ -314,6 +325,8 @@ static struct selfboot_layout r21_layout(void)
     selfboot_layout_init(&l, R21_PHYS_BASE, &ba);
     selfboot_layout_image(&l, R21_IMAGE);
     selfboot_layout_disk(&l, R21_DISK);
+    /* What the table of the M4 takes: 391 lines (SiliconNT docs/findings/0058) */
+    l.aicmap_size = 8 + 4 * 391;
     return l;
 }
 
@@ -384,9 +397,11 @@ static void test_adt(const char *out_path)
     CHECK(guest_range_is("BootArgs", 0x1001ca00000, 0x4000));
     /* The size of the disk in bytes */
     CHECK(guest_range_is("RAMDisk", 0x1001cc00000, R21_DISK));
-    /* The first spare entry became RAMDisk; the others are as they were */
+    /* The page after the boot arguments, with the size of the table in bytes */
+    CHECK(guest_range_is("AICToGIC", 0x1001ca04000, 8 + 4 * 391));
+    /* The first spare entry became RAMDisk, the second AICToGIC; the third is as it was */
     CHECK(!guest_prop("MemoryMapReserved-0"));
-    CHECK(guest_range_is("MemoryMapReserved-1", 0, 0));
+    CHECK(!guest_prop("MemoryMapReserved-1"));
     CHECK(guest_range_is("MemoryMapReserved-2", 0, 0));
     CHECK(guest_range_is("SEPFW", 0x10005a6c000, 0x5d0000));
     CHECK(guest_range_is("AuxKC", NOTHING, NOTHING));
@@ -418,12 +433,31 @@ static void test_adt_takes_a_spare_entry_that_is_free(void)
     CHECK_EQ(selfboot_adt(guest_tree + 32, tree_size, &l), 0);
     CHECK(guest_range_is("MemoryMapReserved-0", 0x10006000000, 0x4000));
     CHECK(guest_range_is("RAMDisk", 0x1001cc00000, R21_DISK));
+    CHECK(guest_range_is("AICToGIC", 0x1001ca04000, 8 + 4 * 391));
     CHECK(!guest_prop("MemoryMapReserved-1"));
-    CHECK(guest_range_is("MemoryMapReserved-2", 0, 0));
-    CHECK_EQ(selfboot_adt_add_range(guest_tree + 32, "SiliconNTFirmware", l.image_base,
-                                    l.image_size), 0);
+    CHECK(!guest_prop("MemoryMapReserved-2"));
+    /* None is left now: one more is refused, and nothing is changed */
+    CHECK_EQ(
+        selfboot_adt_add_range(guest_tree + 32, "SiliconNTFirmware", l.image_base, l.image_size),
+        -1);
+    CHECK(!guest_prop("SiliconNTFirmware"));
+    CHECK(guest_range_is("RAMDisk", 0x1001cc00000, R21_DISK));
+    CHECK(guest_range_is("AICToGIC", 0x1001ca04000, 8 + 4 * 391));
+
+    /* With four spare entries, the one left over takes it */
+    spare_entries = 4;
+    make_tree();
+    node = adt_path_offset(adt, "/chosen/memory-map");
+    spare = (void *)adt_get_property(adt, node, "MemoryMapReserved-0");
+    memcpy(spare->value, taken, sizeof(taken));
+    CHECK_EQ(selfboot_adt(guest_tree + 32, tree_size, &l), 0);
+    CHECK_EQ(
+        selfboot_adt_add_range(guest_tree + 32, "SiliconNTFirmware", l.image_base, l.image_size),
+        0);
     CHECK(guest_range_is("SiliconNTFirmware", l.image_base, l.image_size));
     CHECK(guest_range_is("RAMDisk", 0x1001cc00000, R21_DISK));
+    CHECK(guest_range_is("AICToGIC", 0x1001ca04000, 8 + 4 * 391));
+    default_tree();
 }
 
 static void test_adt_refuses_a_tree_without_what_it_needs(void)
@@ -432,6 +466,12 @@ static void test_adt_refuses_a_tree_without_what_it_needs(void)
 
     default_tree();
     spare_entries = 0;
+    make_tree();
+    CHECK_EQ(selfboot_adt(guest_tree + 32, tree_size, &l), -1);
+
+    /* Room for RAMDisk, and none for AICToGIC */
+    default_tree();
+    spare_entries = 1;
     make_tree();
     CHECK_EQ(selfboot_adt(guest_tree + 32, tree_size, &l), -1);
 

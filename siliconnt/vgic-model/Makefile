@@ -16,6 +16,8 @@
 #   make psci   only the PSCI one, and test_hv_events.py: that the host has a handler for
 #               every event the hypervisor sends (needs the Python of the proxy client)
 #   make tsan   test.c under ThreadSanitizer, with fewer rounds
+#   make vgic-broken  test.c against hv_vgic.c with one thing wrong in how it forwards AIC
+#               lines at a time: it must fail on each
 
 CC := gcc
 PYTHON ?= $(HOME)/src/m1n1-venv/bin/python
@@ -23,9 +25,9 @@ SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -pthread -I. -Ibuild
 ROUNDS ?= 200000
 
-.PHONY: all psci pmu pt xtrack xtrack-broken xinsn dbg tsan clean
+.PHONY: all psci pmu pt xtrack xtrack-broken xinsn dbg tsan vgic-broken clean
 
-all: build/model psci pmu pt xinsn xtrack xtrack-broken dbg
+all: build/model psci pmu pt xinsn xtrack xtrack-broken dbg vgic-broken
 	build/model $(ROUNDS)
 
 # The breakpoint and watchpoint registers of the guest, src/hv/hv_dbg.c
@@ -146,14 +148,70 @@ build/arm_cpu_regs.h: $(SRC)/arm_cpu_regs.h
 	@mkdir -p build
 	cp $< $@
 
+# AIC as hv_vgic.c knows it: the structure aic_init() fills in, the event register. test.c
+# has an AIC of its own behind the functions.
+build/aic.h: $(SRC)/aic.h
+	@mkdir -p build
+	cp $< $@
+
+build/aic_regs.h: $(SRC)/aic_regs.h
+	@mkdir -p build
+	cp $< $@
+
+# The table of AIC lines and SPIs, as the real hv.h has it; test.c makes one of its own
+build/hv_aicmap.h: $(SRC)/hv/hv.h
+	@mkdir -p build
+	grep -E '^#define HV_AICMAP_[A-Z_]+ ' $< > $@
+	sed -n '/^struct hv_aicmap {/,/^};/p' $< >> $@
+
+MODEL_DEPS := test.c $(wildcard *.h) build/hv_wfi.c build/arm_cpu_regs.h build/aic.h \
+	build/aic_regs.h build/hv_aicmap.h
+
 build/psci-model: psci_test.c $(wildcard *.h) build/hv_psci.c
 	$(CC) $(CFLAGS) -o $@ psci_test.c build/hv_psci.c
 
-build/model: test.c $(wildcard *.h) build/hv_vgic.c build/hv_wfi.c build/arm_cpu_regs.h
+build/model: $(MODEL_DEPS) build/hv_vgic.c
 	$(CC) $(CFLAGS) -o $@ test.c build/hv_vgic.c build/hv_wfi.c
 
-build/model-tsan: test.c $(wildcard *.h) build/hv_vgic.c build/hv_wfi.c build/arm_cpu_regs.h
+build/model-tsan: $(MODEL_DEPS) build/hv_vgic.c
 	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o $@ test.c build/hv_vgic.c build/hv_wfi.c
+
+# hv_vgic.c with one thing wrong in how it forwards AIC lines, at a time. test.c must fail on
+# each, in its AIC tests (build/model aic runs only those). Every change must change
+# something (cmp), or the source has moved on.
+VGIC_BROKEN := unmask-on-enable mask-on-disable unmask-when-ended mask-when-ended-disabled \
+	forward-any-state wrong-spi no-die no-mask-all end-not-seen last-line-missed \
+	unmask-in-flight no-table-check
+BREAK_VGIC_unmask-on-enable := /^            aic_unmask(vgic_aicmap.line\[k\]);$$/d
+BREAK_VGIC_mask-on-disable := /^            aic_mask(vgic_aicmap.line\[k\]);$$/d
+BREAK_VGIC_unmask-when-ended := /^        aic_unmask(vgic_aicmap.line\[k\]);$$/d
+BREAK_VGIC_mask-when-ended-disabled := s/if (vgic_load(vgic_dist.enable\[intid \/ 32\]) \& BIT(intid % 32)) {/if (1) {/
+BREAK_VGIC_forward-any-state := s/if (k < 0 || vgic_lines\[k\] != VGIC_LINE_WAITING)/if (k < 0)/
+BREAK_VGIC_wrong-spi := s/vgic_pend_spi(HV_AICMAP_FIRST_SPI + k, true);/vgic_pend_spi(HV_AICMAP_FIRST_SPI + k + 1, true);/
+BREAK_VGIC_no-die := s/FIELD_GET(AIC_EVENT_DIE, event) \* aic->max_irq +/0 * aic->max_irq +/
+BREAK_VGIC_no-mask-all := /^        aic_mask_all();$$/d
+BREAK_VGIC_end-not-seen := /vgic_line_ended(FIELD_GET(ICH_LR_VINTID, vgic_read_lr(i)));/d
+BREAK_VGIC_last-line-missed := s/u32 lo = 0, hi = vgic_aicmap.count;/u32 lo = 0, hi = vgic_aicmap.count - 1;/
+BREAK_VGIC_unmask-in-flight := s/if (enable \&\& vgic_lines\[k\] == VGIC_LINE_MASKED) {/if (enable) {/
+BREAK_VGIC_no-table-check := s/    vgic_aicmap_ok = hv_aicmap(\&vgic_aicmap) >= 0;/    vgic_aicmap_ok = true; hv_aicmap(\&vgic_aicmap);/
+
+build/hv_vgic-broken-%.c: build/hv_vgic.c Makefile
+	sed -e '$(BREAK_VGIC_$*)' $< > $@
+	! cmp -s $< $@
+
+build/model-broken-%: $(MODEL_DEPS) build/hv_vgic-broken-%.c
+	$(CC) $(CFLAGS) -Wno-error -o $@ test.c build/hv_vgic-broken-$*.c build/hv_wfi.c
+
+vgic-broken: $(VGIC_BROKEN:%=build/model-broken-%)
+	@for n in $(VGIC_BROKEN); do \
+		if timeout 60 build/model-broken-$$n aic > build/model-broken-$$n.log 2>&1; then \
+			echo "vgic-broken-$$n: the test passes and must not"; exit 1; \
+		fi; \
+		grep -q -m1 '^FAIL\|^CHECK FAILED' build/model-broken-$$n.log || \
+			{ echo "vgic-broken-$$n: ended without a failed check"; exit 1; }; \
+	done
+	@$(foreach n,$(VGIC_BROKEN),echo "vgic-broken: $(n): $$(grep -m1 '^FAIL\|^CHECK FAILED' build/model-broken-$(n).log)";)
+	@echo "vgic-broken: all $(words $(VGIC_BROKEN)) failed, as they must"
 
 clean:
 	rm -rf build

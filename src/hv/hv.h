@@ -102,6 +102,27 @@ bool hv_io_ranges_next(struct hv_io_ranges *it, u64 *base, u64 *size);
  * of which of the two. hv_start() does not enter a guest unless this is true.
  */
 bool hv_vgic_ranges_free(void);
+/*
+ * The AIC lines a guest can have, and the SPI each of them is: every value in "interrupts" of
+ * a node of the device tree that goes to AIC by "interrupt-parent", as die * max_irq + line,
+ * that is a line this AIC has; in ascending order, each once. The k-th is SPI
+ * HV_AICMAP_FIRST_SPI + k.
+ * The firmware is handed the same table, version 1: the version, the count, the lines, each
+ * 32 bits (SiliconNT docs/DESIGN.md: the vGIC of the EL2 layer, and the firmware).
+ */
+#define HV_AICMAP_VERSION   1
+#define HV_AICMAP_FIRST_SPI 32
+#define HV_AICMAP_MAX       988 // SPIs 32-1019
+struct hv_aicmap {
+    u32 version;
+    u32 count;
+    u32 line[HV_AICMAP_MAX];
+};
+/*
+ * Writes the table to map. Returns its size in bytes, or -1 after printing why there is none:
+ * no AIC, or more lines than a guest has SPIs, with how many there are.
+ */
+int hv_aicmap(struct hv_aicmap *map);
 
 /* AIC events through tracing the MMIO event address */
 bool hv_trace_irq(u32 type, u32 num, u32 count, u32 flags);
@@ -120,6 +141,8 @@ bool hv_aic_hook(void);
 #define HV_VGIC_REDIST_BASE 0x5100000000UL
 #define HV_VGIC_REDIST_SIZE 0x20000UL
 void hv_vgic_init(void);
+/* Whether hv_vgic_init() has the table of hv_aicmap(): hv_start() does not enter a guest unless */
+bool hv_vgic_has_aicmap(void);
 void hv_vgic_ppi_level(u32 intid, bool high);
 bool hv_vgic_handle_irq(void);
 void hv_vgic_send_sgi(u64 val);

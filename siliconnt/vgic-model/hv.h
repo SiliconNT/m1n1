@@ -47,6 +47,11 @@ typedef enum _hv_entry_type {
 typedef bool(hv_hook_t)(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width);
 int hv_map_hook(u64 from, hv_hook_t *hook, u64 size);
 
+/* From the real header, by the Makefile: the table of AIC lines and SPIs */
+#include "hv_aicmap.h"
+int hv_aicmap(struct hv_aicmap *map);
+bool hv_vgic_has_aicmap(void);
+
 #define HV_VGIC_INTID_VTIMER 27
 #define HV_VGIC_DIST_BASE    0x5000000000UL
 #define HV_VGIC_DIST_SIZE    0x10000UL

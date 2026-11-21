@@ -246,6 +246,12 @@ void hv_start(void *entry, u64 regs[4])
         return;
     }
 
+    /* hv_init() has said why: no AIC, or more lines than SPIs */
+    if (!hv_vgic_has_aicmap()) {
+        printf("HV: the AIC lines have no SPIs for the guest; can't start the hypervisor\n");
+        return;
+    }
+
     if (!hv_cpu_power_init()) {
         printf("HV: CPU power protection hooks failed; can't start the hypervisor\n");
         return;

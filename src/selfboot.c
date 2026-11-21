@@ -22,6 +22,7 @@
 /* The spare entries iBoot leaves in /chosen/memory-map, base and size 0 */
 #define SPARE_ENTRY "MemoryMapReserved-"
 #define RAMDISK     "RAMDisk"
+#define AICTOGIC    "AICToGIC"
 
 /* Without base + size, which need not fit in 64 bits */
 static bool overlaps(u64 base, u64 size, u64 start, u64 end)
@@ -45,9 +46,10 @@ int selfboot_layout_init(struct selfboot_layout *l, u64 phys_base, const struct 
     l->image_base = ALIGN_UP(l->adt_base + l->adt_size, SELFBOOT_IMAGE_ALIGN);
 
     if (l->mem_top < SELFBOOT_UEFI_REGION || l->phys_base > l->mem_top - SELFBOOT_UEFI_REGION ||
-        l->image_base + SELFBOOT_BOOTARGS_SIZE > l->mem_top - SELFBOOT_UEFI_REGION) {
+        l->image_base + SELFBOOT_BOOTARGS_SIZE + SELFBOOT_AICMAP_SIZE >
+            l->mem_top - SELFBOOT_UEFI_REGION) {
         printf("selfboot: guest RAM 0x%lx .. 0x%lx has no room for the device tree, the "
-               "boot arguments and the firmware's work area\n",
+               "boot arguments, the table and the firmware's work area\n",
                l->phys_base, l->mem_top);
         return -1;
     }
@@ -90,7 +92,7 @@ int selfboot_layout_init(struct selfboot_layout *l, u64 phys_base, const struct 
 
 u64 selfboot_image_room(const struct selfboot_layout *l)
 {
-    return l->uefi_base - l->image_base - SELFBOOT_BOOTARGS_SIZE;
+    return l->uefi_base - l->image_base - SELFBOOT_BOOTARGS_SIZE - SELFBOOT_AICMAP_SIZE;
 }
 
 int selfboot_layout_image(struct selfboot_layout *l, u64 size)
@@ -103,7 +105,8 @@ int selfboot_layout_image(struct selfboot_layout *l, u64 size)
     }
     l->image_size = size;
     l->bootargs = l->image_base + ALIGN_UP(size, SELFBOOT_PAGE);
-    l->disk_base = ALIGN_UP(l->bootargs + SELFBOOT_BOOTARGS_SIZE, SELFBOOT_DISK_ALIGN);
+    l->aicmap = l->bootargs + SELFBOOT_BOOTARGS_SIZE;
+    l->disk_base = ALIGN_UP(l->aicmap + SELFBOOT_AICMAP_SIZE, SELFBOOT_DISK_ALIGN);
     return 0;
 }
 
@@ -241,7 +244,10 @@ int selfboot_adt(void *dest, u32 size, const struct selfboot_layout *l)
         set_range(dest, node, "BootArgs", l->bootargs, SELFBOOT_BOOTARGS_SIZE) < 0)
         return -1;
 
-    return selfboot_adt_add_range(dest, RAMDISK, l->disk_base, l->disk_size);
+    /* The size of each in bytes, not rounded: of the table, what the firmware is to read */
+    if (selfboot_adt_add_range(dest, RAMDISK, l->disk_base, l->disk_size) < 0)
+        return -1;
+    return selfboot_adt_add_range(dest, AICTOGIC, l->aicmap, l->aicmap_size);
 }
 
 int selfboot_adt_add_range(void *dest, const char *name, u64 base, u64 bytes)

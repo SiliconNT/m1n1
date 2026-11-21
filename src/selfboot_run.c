@@ -139,6 +139,7 @@ static void print_layout(const struct selfboot_layout *l)
     printf("  firmware image     0x%lx .. 0x%lx\n", l->image_base, l->image_base + l->image_size);
     printf("  boot arguments     0x%lx .. 0x%lx\n", l->bootargs,
            l->bootargs + SELFBOOT_BOOTARGS_SIZE);
+    printf("  AIC to GIC table   0x%lx .. 0x%lx\n", l->aicmap, l->aicmap + SELFBOOT_AICMAP_SIZE);
     printf("  boot disk          0x%lx .. 0x%lx\n", l->disk_base, l->disk_base + l->disk_size);
     printf("  firmware work area 0x%lx .. 0x%lx\n", l->uefi_base, l->mem_top);
 }
@@ -147,9 +148,10 @@ static void print_layout(const struct selfboot_layout *l)
  * The two files are in guest memory and the layout is complete. host: the port a host talks
  * to m1n1 over, or NO_HOST.
  */
-static int selfboot_enter(const struct selfboot_layout *l, iodev_id_t host)
+static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
 {
     u64 regs[4] = {l->bootargs, 0, 0, 0};
+    int aicmap_size;
 
     print_layout(l);
 
@@ -166,6 +168,15 @@ static int selfboot_enter(const struct selfboot_layout *l, iodev_id_t host)
      */
     if (!hv_vgic_ranges_free())
         return -1;
+
+    /*
+     * The table of AIC lines and SPIs: P_HV_AICMAP, in load_firmware(). hv_init() makes the
+     * same for the hypervisor from the same device tree.
+     */
+    aicmap_size = hv_aicmap((struct hv_aicmap *)l->aicmap);
+    if (aicmap_size < 0)
+        return -1;
+    l->aicmap_size = aicmap_size;
 
     /* The device tree and the boot arguments: load_firmware() and HV.start() */
     if (selfboot_adt((void *)l->adt_base, cur_boot_args.devtree_size, l) < 0)

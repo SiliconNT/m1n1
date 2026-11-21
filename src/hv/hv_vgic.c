@@ -27,6 +27,15 @@
  * stays pending here. Whoever changes that for another core calls it into EL2 with the same
  * IPI, and the core looks again at what it can deliver.
  *
+ * AIC lines: each line of the table of hv_aicmap() is an SPI, the k-th SPI 32 + k. Every line
+ * of AIC is masked when the hypervisor starts; a line of the table is unmasked while the guest
+ * has its SPI enabled. Reading the AIC event register masks the line it reports (Linux,
+ * drivers/irqchip/irq-apple-aic.c, aic_irq_eoi()); the line then stays masked until the guest
+ * has ended the SPI, and is unmasked again only if the SPI is still enabled. A device that
+ * still holds its line high is reported again: that is a level-sensitive interrupt. What a
+ * line is doing is one of three states (enum vgic_line), changed with the big hypervisor lock
+ * held: the MMIO hooks and the IRQ exception take it (hv_exc.c).
+ *
  * Register layouts: Arm IHI 0069H.b, sections 12.2.22, 12.4, 12.9 and 12.11.
  */
 
@@ -39,7 +48,7 @@
 
 /* IRQs that arrive with neither an AIC event nor a maintenance interrupt, before giving up */
 #define VGIC_SPURIOUS_LIMIT 16
-/* AIC events without a GIC interrupt, before giving up: more than there are AIC lines */
+/* AIC events that are not forwarded, before giving up: more than there are AIC lines */
 #define VGIC_UNMAPPED_LIMIT (2 * AIC_MAX_HW_NUM)
 
 #define VGIC_NR_SGIS   16
@@ -121,7 +130,8 @@
 struct hv_vgic_pcpu {
     u64 injected;
     u64 maintenance;
-    u64 unmapped;
+    u64 forwarded; // AIC events whose SPI was made pending
+    u64 unmapped;  // ...and those that were not
     u64 spurious;
     u64 retracted;    // interrupts taken back out of a list register
     u64 sgi_writes;   // writes to ICC_SGI1R_EL1 by the guest on this core
@@ -142,10 +152,10 @@ static struct hv_vgic_pcpu vgic_pcpu[MAX_CPUS];
 
 /* SPIs. The first word of each array, and the first 32 bytes, belong to SGIs and PPIs. */
 static struct {
-    u32 ctlr;                   // GICD_CTLR: the group enables
-    u32 enable[VGIC_NR_WORDS];  // GICD_ISENABLER<n>
-    u32 pending[VGIC_NR_WORDS]; // pending and in no list register. Atomic: any core, no lock.
-    u32 cfg[2 * VGIC_NR_WORDS]; // GICD_ICFGR<n>
+    u32 ctlr;                       // GICD_CTLR: the group enables
+    u32 enable[VGIC_NR_WORDS];      // GICD_ISENABLER<n>
+    u32 pending[VGIC_NR_WORDS];     // pending and in no list register. Atomic: any core, no lock.
+    u32 cfg[2 * VGIC_NR_WORDS];     // GICD_ICFGR<n>
     u32 router[32 * VGIC_NR_WORDS]; // GICD_IROUTER<n>, the lower half; the upper half is RES0
     u8 priority[32 * VGIC_NR_WORDS];
 } vgic_dist;
@@ -160,6 +170,19 @@ static bool vgic_group0_reported;
 
 static int vgic_nr_frames; // Redistributors: one per core index up to the last that runs m1n1
 static int vgic_boot_cpu;
+
+/* The AIC lines that are SPIs, from hv_aicmap(); none if there was no table */
+static struct hv_aicmap vgic_aicmap;
+static bool vgic_aicmap_ok;
+
+/* What an AIC line of the table is doing */
+enum vgic_line {
+    VGIC_LINE_MASKED,    // masked in AIC: the guest does not have its SPI enabled
+    VGIC_LINE_WAITING,   // unmasked in AIC, for the device to raise it
+    VGIC_LINE_IN_FLIGHT, // AIC reported it and masked it; the guest has not ended its SPI yet
+};
+/* Of the k-th line of the table. Only changed with the big hypervisor lock held. */
+static u8 vgic_lines[HV_AICMAP_MAX];
 
 extern bool hv_started_cpus[MAX_CPUS];
 
@@ -320,8 +343,21 @@ static void vgic_init_global(void)
         __atomic_store_n(&p->kick, 0, __ATOMIC_SEQ_CST);
         p->spi_left = false;
         p->injected = p->maintenance = p->unmapped = p->spurious = p->retracted = 0;
-        p->sgi_writes = p->sgi_deferred = p->spi_deferred = 0;
+        p->forwarded = p->sgi_writes = p->sgi_deferred = p->spi_deferred = 0;
     }
+
+    /*
+     * Whatever iBoot and m1n1 left unmasked in AIC is masked, and the software triggers are
+     * cleared, before the guest can enable anything. The virtual UART sets the trigger of its
+     * line from then on (hv_map_vuart() comes after hv_init(), in both loaders).
+     */
+    vgic_aicmap_ok = hv_aicmap(&vgic_aicmap) >= 0;
+    if (!vgic_aicmap_ok)
+        vgic_aicmap.count = 0;
+    for (u32 k = 0; k < HV_AICMAP_MAX; k++)
+        vgic_lines[k] = VGIC_LINE_MASKED;
+    if (aic)
+        aic_mask_all();
 
     if (hv_map_hook(HV_VGIC_DIST_BASE, vgic_dist_hook, HV_VGIC_DIST_SIZE) < 0 ||
         hv_map_hook(HV_VGIC_REDIST_BASE, vgic_redist_hook, vgic_nr_frames * HV_VGIC_REDIST_SIZE) <
@@ -330,6 +366,11 @@ static void vgic_init_global(void)
 
     printf("HV: vGIC: Distributor at 0x%lx, %d Redistributors from 0x%lx\n", HV_VGIC_DIST_BASE,
            vgic_nr_frames, HV_VGIC_REDIST_BASE);
+}
+
+bool hv_vgic_has_aicmap(void)
+{
+    return vgic_aicmap_ok;
 }
 
 /* Bring up the virtual CPU interface of the core this runs on, with nothing pending */
@@ -805,6 +846,90 @@ bool hv_vgic_irq_waiting(void)
     return __atomic_load_n(&VGIC_PERCPU(kick), __ATOMIC_SEQ_CST);
 }
 
+/* ---- AIC lines ---- */
+
+/* The index in the table of an AIC line (die * max_irq + line), -1 if it is not there */
+static int vgic_line_index(u32 line)
+{
+    u32 lo = 0, hi = vgic_aicmap.count;
+
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2;
+
+        if (vgic_aicmap.line[mid] == line)
+            return mid;
+        if (vgic_aicmap.line[mid] < line)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return -1;
+}
+
+/* ...of the line an SPI is, -1 if it is none */
+static int vgic_spi_line_index(u32 intid)
+{
+    if (intid < HV_AICMAP_FIRST_SPI || intid - HV_AICMAP_FIRST_SPI >= vgic_aicmap.count)
+        return -1;
+    return intid - HV_AICMAP_FIRST_SPI;
+}
+
+/* The guest has enabled or disabled the SPIs `bits` of one word: their lines follow in AIC */
+static void vgic_lines_enable(u32 word, u32 bits, bool enable)
+{
+    while (bits) {
+        int k = vgic_spi_line_index(32 * word + __builtin_ctz(bits));
+
+        bits &= bits - 1;
+        if (k < 0)
+            continue;
+        if (enable && vgic_lines[k] == VGIC_LINE_MASKED) {
+            vgic_lines[k] = VGIC_LINE_WAITING;
+            aic_unmask(vgic_aicmap.line[k]);
+        } else if (!enable && vgic_lines[k] == VGIC_LINE_WAITING) {
+            vgic_lines[k] = VGIC_LINE_MASKED;
+            aic_mask(vgic_aicmap.line[k]);
+        }
+        /* One in flight stays masked: its end decides (vgic_line_ended()) */
+    }
+}
+
+/*
+ * AIC reported a line, and masked it doing so. Returns whether its SPI was made pending: it
+ * is a line of the table that the guest waits for.
+ */
+static bool vgic_line_event(u32 event)
+{
+    int k;
+
+    if (FIELD_GET(AIC_EVENT_TYPE, event) != AIC_EVENT_TYPE_HW)
+        return false;
+    k = vgic_line_index(FIELD_GET(AIC_EVENT_DIE, event) * aic->max_irq +
+                        FIELD_GET(AIC_EVENT_NUM, event));
+    if (k < 0 || vgic_lines[k] != VGIC_LINE_WAITING)
+        return false;
+
+    vgic_lines[k] = VGIC_LINE_IN_FLIGHT;
+    vgic_pend_spi(HV_AICMAP_FIRST_SPI + k, true);
+    VGIC_PERCPU(forwarded)++;
+    return true;
+}
+
+/* The guest has ended an interrupt. If it was a line in flight, AIC may report it again. */
+static void vgic_line_ended(u32 intid)
+{
+    int k = vgic_spi_line_index(intid);
+
+    if (k < 0 || vgic_lines[k] != VGIC_LINE_IN_FLIGHT)
+        return;
+    if (vgic_load(vgic_dist.enable[intid / 32]) & BIT(intid % 32)) {
+        vgic_lines[k] = VGIC_LINE_WAITING;
+        aic_unmask(vgic_aicmap.line[k]);
+    } else {
+        vgic_lines[k] = VGIC_LINE_MASKED;
+    }
+}
+
 /* ---- The Distributor and the Redistributors as the guest sees them ---- */
 
 /* The interrupts that exist in one word of the Distributor's bitmaps */
@@ -948,6 +1073,7 @@ static void vgic_dist_write(u32 off, u32 val)
         if (!val)
             return;
         vgic_store(vgic_dist.enable[word], old | val);
+        vgic_lines_enable(word, val, true);
         /* Somebody may have to deliver one that has been waiting for this */
         vgic_kick_all();
         return;
@@ -959,6 +1085,7 @@ static void vgic_dist_write(u32 off, u32 val)
         if (!val)
             return;
         vgic_store(vgic_dist.enable[word], old & ~val);
+        vgic_lines_enable(word, val, false);
         /* Any core may have one of them in a list register */
         vgic_kick_all();
         return;
@@ -1105,7 +1232,8 @@ static void vgic_redist_write(int cpu, u32 off, u32 val)
         return;
     }
 
-    /* Among them GICR_WAKER and GICR_CTLR, and the set-pending register, which Windows only reads */
+    /* Among them GICR_WAKER and GICR_CTLR, and the set-pending register, which Windows only reads
+     */
     vgic_report_unhandled(cpu, off, true, 2);
 }
 
@@ -1132,7 +1260,8 @@ static bool vgic_mmio(int frame, u32 off, u64 *val, bool write, int width)
         u64 v = frame < 0 ? vgic_dist_read(base) : vgic_redist_read(frame, base);
 
         if (width == 3)
-            v |= (u64)(frame < 0 ? vgic_dist_read(off + 4) : vgic_redist_read(frame, off + 4)) << 32;
+            v |= (u64)(frame < 0 ? vgic_dist_read(off + 4) : vgic_redist_read(frame, off + 4))
+                 << 32;
         else
             v = (v >> (8 * (off & 3))) & MASK(8 * bytes);
         *val = v;
@@ -1187,10 +1316,17 @@ void hv_vgic_report(void)
 
         printf("HV: vGIC: CPU %d: %ld ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, "
                "%ld taken back, %ld returns with SGIs waiting, %ld with SPIs waiting, SGIs still "
-               "pending 0x%x\n",
+               "pending 0x%x, %ld AIC events forwarded, %ld not\n",
                cpu, p->sgi_writes, p->injected, p->maintenance, p->retracted, p->sgi_deferred,
-               p->spi_deferred, __atomic_load_n(&p->sgi_pending, __ATOMIC_SEQ_CST));
+               p->spi_deferred, __atomic_load_n(&p->sgi_pending, __ATOMIC_SEQ_CST), p->forwarded,
+               p->unmapped);
     }
+
+    for (u32 k = 0; k < vgic_aicmap.count; k++)
+        if (vgic_lines[k] != VGIC_LINE_MASKED)
+            printf("HV: vGIC: AIC line %u (SPI %u) is %s\n", vgic_aicmap.line[k],
+                   HV_AICMAP_FIRST_SPI + k,
+                   vgic_lines[k] == VGIC_LINE_WAITING ? "unmasked" : "in flight");
 
     if (vgic_unhandled_writes || vgic_unhandled_reads)
         printf("HV: vGIC: accesses to registers that are not emulated: %ld writes, %ld reads\n",
@@ -1214,16 +1350,19 @@ bool hv_vgic_handle_irq(void)
         u32 event = aic_ack();
 
         if (FIELD_GET(AIC_EVENT_TYPE, event)) {
-            /*
-             * No AIC line is forwarded to the guest yet, so every line stays masked once it
-             * has fired. If they keep coming anyway, the masking did not work: stop.
-             */
             handled = true;
-            if (vgic_should_log(++VGIC_PERCPU(unmapped)))
-                printf("HV: vGIC: CPU %d: AIC event 0x%x has no GIC interrupt, left masked (#%ld)\n",
-                       smp_id(), event, VGIC_PERCPU(unmapped));
-            if (VGIC_PERCPU(unmapped) >= VGIC_UNMAPPED_LIMIT)
-                return false;
+            /*
+             * One the guest does not wait for stays masked, so it does not come again. If
+             * such events keep coming anyway, the masking did not work: stop.
+             */
+            if (!vgic_line_event(event)) {
+                if (vgic_should_log(++VGIC_PERCPU(unmapped)))
+                    printf("HV: vGIC: CPU %d: AIC event 0x%x is not forwarded, left masked "
+                           "(#%ld)\n",
+                           smp_id(), event, VGIC_PERCPU(unmapped));
+                if (VGIC_PERCPU(unmapped) >= VGIC_UNMAPPED_LIMIT)
+                    return false;
+            }
         }
     }
 
@@ -1235,9 +1374,12 @@ bool hv_vgic_handle_irq(void)
         handled = true;
 
         /* The guest ended these interrupts. Emptying the list register drops the request. */
-        for (int i = 0; i < nr_lr; i++)
-            if (eisr & BIT(i))
+        for (int i = 0; i < nr_lr; i++) {
+            if (eisr & BIT(i)) {
+                vgic_line_ended(FIELD_GET(ICH_LR_VINTID, vgic_read_lr(i)));
                 vgic_write_lr(i, 0);
+            }
+        }
         sysop("isb");
 
         if (vgic_should_log(++VGIC_PERCPU(maintenance)))

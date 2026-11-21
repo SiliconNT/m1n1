@@ -11,17 +11,23 @@
  * two ranges that are the same on every machine (hv.h). That takes a machine that has
  * nothing of its own there, and hv_vgic_ranges_free() finds out whether this one is.
  *
+ * Which SPI of that GIC each line of AIC is, is read from the device tree too: hv_aicmap().
+ * hv_vgic.c forwards the lines by it, and the firmware is handed the same table.
+ *
  * Tested on the build machine by siliconnt/selfboot-model (layout_test.c, run_test.c).
  */
 
 #include "hv.h"
 #include "adt.h"
+#include "aic.h"
+#include "aic_regs.h"
 #include "memory.h"
 #include "smp.h"
 #include "string.h"
 #include "utils.h"
 
-#define ARM_IO "/arm-io"
+#define ARM_IO   "/arm-io"
+#define AIC_NODE "/arm-io/aic"
 
 /* A number of one or two cells of a property */
 static u64 cells(const u8 *p, u32 count)
@@ -162,4 +168,120 @@ bool hv_vgic_ranges_free(void)
                "where the guest finds the GIC\n",
                count, ram_base, ram_base + mem_size_actual);
     return clear;
+}
+
+/* ---- AIC lines and SPIs ---- */
+
+/* One bit for each die * max_irq + line that AIC can have */
+static u32 aicmap_lines[AIC_MAX_DIES * AIC_MAX_HW_NUM / 32];
+
+/*
+ * The nodes of the device tree follow one another, each with its properties and then its
+ * children: what follows the properties of a node is the next node.
+ */
+static int node_after_properties(int node)
+{
+    int off = adt_first_property_offset(adt, node);
+
+    for (int i = adt_get_property_count(adt, node); i; i--)
+        off = adt_next_property_offset(adt, off);
+    return off;
+}
+
+/*
+ * The phandle of the controller the index-th value of "interrupts" goes to, of `count`
+ * phandles in "interrupt-parent". Either there is one, for all the values, or there are
+ * several: the k-th is for the k-th value, and the last one for every value after that.
+ * The M4's device tree has both shapes: clpc lists five phandles for its five values, three
+ * of them AIC's and two of another controller; the SPMI controllers list three, their own,
+ * AIC's and their own again, for 21 values. That is all this rests on, the data of the M4's
+ * device tree: no document and no source says so (SiliconNT docs/findings/0060).
+ */
+static u32 interrupt_parent(const u8 *phandles, u32 count, u32 index)
+{
+    u32 phandle;
+
+    memcpy(&phandle, phandles + sizeof(u32) * (index < count ? index : count - 1), sizeof(phandle));
+    return phandle;
+}
+
+/*
+ * The values in "interrupts" of a node that go to AIC, the controller with this phandle:
+ * one number of 32 bits each. Returns how many of them are not a line of this AIC; those
+ * are left out. So are properties with the top bit of their length set, which nothing here
+ * knows the meaning of, and a node with no whole phandle in "interrupt-parent".
+ */
+static u32 aicmap_add(int node, u32 aic_phandle)
+{
+    u32 len, parents_len, left_out = 0;
+    const u8 *values = adt_getprop(adt, node, "interrupts", &len);
+    const u8 *parents = adt_getprop(adt, node, "interrupt-parent", &parents_len);
+
+    if (!values || !parents || len & 0x80000000 || parents_len & 0x80000000 ||
+        parents_len < sizeof(u32))
+        return 0;
+    for (u32 off = 0; off + sizeof(u32) <= len; off += sizeof(u32)) {
+        u32 value;
+
+        if (interrupt_parent(parents, parents_len / sizeof(u32), off / sizeof(u32)) != aic_phandle)
+            continue;
+        memcpy(&value, values + off, sizeof(value));
+        if (value / aic->max_irq >= aic->nr_die || value % aic->max_irq >= aic->nr_irq) {
+            left_out++;
+            continue;
+        }
+        aicmap_lines[value / 32] |= BIT(value % 32);
+    }
+    return left_out;
+}
+
+int hv_aicmap(struct hv_aicmap *map)
+{
+    u32 phandle, count = 0, left_out = 0;
+    int node;
+
+    if (!aic) {
+        printf("HV: vGIC: there is no AIC, so no SPIs for its lines\n");
+        return -1;
+    }
+    node = adt_path_offset(adt, AIC_NODE);
+    if (node < 0 || ADT_GETPROP(adt, node, "AAPL,phandle", &phandle) < 0) {
+        printf("HV: vGIC: no " AIC_NODE " with a phandle in the device tree\n");
+        return -1;
+    }
+
+    memset(aicmap_lines, 0, sizeof(aicmap_lines));
+    /* Every node, from the root: those still to come are counted by their parents */
+    node = 0;
+    for (u32 to_come = 1; to_come; to_come--) {
+        to_come += adt_get_child_count(adt, node);
+        left_out += aicmap_add(node, phandle);
+        node = node_after_properties(node);
+    }
+
+    for (u32 i = 0; i < sizeof(aicmap_lines) / sizeof(aicmap_lines[0]); i++)
+        count += __builtin_popcount(aicmap_lines[i]);
+    if (count > HV_AICMAP_MAX) {
+        printf("HV: vGIC: the device tree has %u AIC lines, more than the %d SPIs a guest can "
+               "have\n",
+               count, HV_AICMAP_MAX);
+        return -1;
+    }
+
+    map->version = HV_AICMAP_VERSION;
+    map->count = 0;
+    for (u32 i = 0; i < sizeof(aicmap_lines) / sizeof(aicmap_lines[0]); i++)
+        for (u32 bits = aicmap_lines[i]; bits; bits &= bits - 1)
+            map->line[map->count++] = 32 * i + __builtin_ctz(bits);
+
+    if (count)
+        printf("HV: vGIC: %u AIC lines are SPIs %d .. %u: AIC %u .. %u; %u values of "
+               "\"interrupts\" are not lines of this AIC\n",
+               count, HV_AICMAP_FIRST_SPI, HV_AICMAP_FIRST_SPI + count - 1, map->line[0],
+               map->line[count - 1], left_out);
+    else
+        printf("HV: vGIC: no AIC lines in the device tree; %u values of \"interrupts\" are not "
+               "lines of this AIC\n",
+               left_out);
+    return 2 * sizeof(u32) + count * sizeof(u32);
 }
