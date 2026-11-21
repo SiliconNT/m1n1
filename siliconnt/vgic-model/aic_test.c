@@ -15,6 +15,11 @@
  *     is not a multiple of 32.
  *
  * The offsets expected are written out, not worked out again the way aic.c works them out.
+ *
+ * And aic_init() over a device tree and registers of AIC made here, for each version: what it
+ * makes of them, and where it then reads and writes the global configuration
+ * (aic_read_config(), aic_write_config()): at aicglbcfg-offset of the device tree, else at
+ * 0x14 on AIC2 and AIC3 (Linux: AIC2_CONFIG); AIC1 has none.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -40,9 +45,26 @@ void write32(u64 addr, u32 val)
     writes[nr_writes++].val = val;
 }
 
+/* The registers there are to read; reading another is a failure */
+static struct {
+    u64 addr;
+    u32 val;
+} regs[8];
+static int nr_regs, nr_reads;
+
+static void reg(u64 addr, u32 val)
+{
+    regs[nr_regs].addr = addr;
+    regs[nr_regs++].val = val;
+}
+
 u32 read32(u64 addr)
 {
-    printf("CHECK FAILED: read32(0x%lx): the functions under test read nothing\n", addr);
+    nr_reads++;
+    for (int i = 0; i < nr_regs; i++)
+        if (regs[i].addr == addr)
+            return regs[i].val;
+    printf("CHECK FAILED: read32(0x%lx), which is not to be read\n", addr);
     exit(1);
 }
 
@@ -52,32 +74,70 @@ u32 mask32(u64 addr, u32 clear, u32 set)
     exit(1);
 }
 
-/* aic_init() is not called here: what it reads, it does not get */
+/* ---- the device tree aic_init() reads: /arm-io/aic, its compatible and properties ---- */
+
 void *adt;
+static const char *compatible;
+static struct {
+    const char *name;
+    u64 val;
+    u32 len;
+} props[16];
+static int nr_props;
+
+static void prop(const char *name, u64 val, u32 len)
+{
+    props[nr_props].name = name;
+    props[nr_props].val = val;
+    props[nr_props++].len = len;
+}
 
 int adt_path_offset_trace(const void *dt, const char *path, int *offsets)
 {
-    exit(2);
+    if (strcmp(path, "/arm-io/aic"))
+        exit(2);
+    offsets[0] = 1;
+    offsets[1] = 2;
+    offsets[2] = 0;
+    return 2;
 }
 
 bool adt_is_compatible(const void *dt, int nodeoffset, const char *compat)
 {
-    exit(2);
+    return !strcmp(compat, compatible);
 }
 
-int adt_get_reg(const void *dt, int *path, const char *prop, int idx, u64 *addr, u64 *size)
+#define BASE 0x281000000UL /* made up */
+
+int adt_get_reg(const void *dt, int *path, const char *name, int idx, u64 *addr, u64 *size)
 {
-    exit(2);
+    *addr = BASE;
+    return 0;
 }
 
 const void *adt_getprop(const void *dt, int nodeoffset, const char *name, u32 *lenp)
 {
-    exit(2);
+    /* aic-ext-intr-cfg: the M4 has none */
+    return NULL;
 }
 
 int adt_getprop_copy(const void *dt, int nodeoffset, const char *name, void *out, size_t len)
 {
-    exit(2);
+    for (int i = 0; i < nr_props; i++) {
+        if (strcmp(props[i].name, name))
+            continue;
+        if (props[i].len != len)
+            return -2;
+        memcpy(out, &props[i].val, len);
+        return len;
+    }
+    return -1;
+}
+
+static void tree(const char *compat)
+{
+    compatible = compat;
+    nr_props = nr_regs = 0;
 }
 
 /* ---- checks ---- */
@@ -141,8 +201,6 @@ static void check_mask_all(u64 mask_set, u64 sw_clr, u32 stride, u32 dies, u32 w
     }
     CHECK(all);
 }
-
-#define BASE 0x281000000UL /* made up */
 
 static void test_aic3_of_the_m4(void)
 {
@@ -240,11 +298,88 @@ static void test_aic1(void)
     check_mask_all(BASE + 0x4100, BASE + 0x4080, 0, 1, 29);
 }
 
+/* The global configuration of the AIC aic_init() has made, which holds `val` */
+static void check_config(u64 at, u32 val)
+{
+    u32 got = 0;
+
+    reg(at, val);
+    nr_reads = 0;
+    CHECK(aic_read_config(&got) && got == val && nr_reads == 1);
+    nr_writes = 0;
+    aic_write_config(val | 1);
+    CHECK(wrote_once(at, val | 1));
+    nr_writes = 0;
+    aic_write_config(val);
+    CHECK(wrote_once(at, val));
+}
+
+static void test_init_and_config(void)
+{
+    u32 got = 0x12345678;
+
+    /* The M4's: AIC3, its properties as in its device tree, its registers as m1n1 read them */
+    tree("aic,3");
+    prop("aic-iack-offset", 0x40000, 8);
+    prop("cap0-offset", 4, 4);
+    prop("maxnumirq-offset", 0xc, 4);
+    prop("extint-baseaddress", 0x10000, 4);
+    prop("extintrcfg-stride", 0x4a00, 4);
+    prop("intmaskset-stride", 0x4a00, 4);
+    prop("intmaskclear-stride", 0x4a00, 4);
+    prop("aicglbcfg-offset", 0x14, 4);
+    reg(BASE + 4, 0x00000800);   /* 2048 lines, one die */
+    reg(BASE + 0xc, 0x02001000); /* 4096 lines, two dies */
+    aic_init();
+    CHECK(aic && aic->version == 3 && aic->nr_irq == 2048 && aic->nr_die == 1);
+    CHECK(aic && aic->regs.sw_clr == 0x14200 && aic->regs.mask_set == 0x14400 &&
+          aic->regs.mask_clr == 0x14600);
+    CHECK(aic && aic->glbcfg_offset == 0x14);
+    /* What R33 read there: only bit 0 changes */
+    check_config(BASE + 0x14, 0xe0000000);
+
+    /* aicglbcfg-offset is taken where the device tree has it */
+    tree("aic,3");
+    prop("aic-iack-offset", 0x40000, 8);
+    prop("cap0-offset", 4, 4);
+    prop("maxnumirq-offset", 0xc, 4);
+    prop("extint-baseaddress", 0x10000, 4);
+    prop("aicglbcfg-offset", 0x20, 4);
+    reg(BASE + 4, 0x00000800);
+    reg(BASE + 0xc, 0x02001000);
+    aic_init();
+    CHECK(aic && aic->glbcfg_offset == 0x20);
+    check_config(BASE + 0x20, 0x10000000);
+
+    /* AIC2 of two dies, without aicglbcfg-offset or extint-baseaddress: 0x14 and 0x2000 */
+    tree("aic,2");
+    prop("aic-iack-offset", 0x10000, 8);
+    reg(BASE + 4, 0x010003e8);   /* 1000 lines, last die 1 */
+    reg(BASE + 0xc, 0x02000400); /* 1024 lines, two dies */
+    aic_init();
+    CHECK(aic && aic->version == 2 && aic->nr_irq == 1000 && aic->nr_die == 2);
+    CHECK(aic && aic->regs.config == 0x2000 && aic->regs.mask_set == 0x3100 &&
+          aic->intmaskset_stride == 0x1280);
+    CHECK(aic && aic->glbcfg_offset == 0x14);
+    check_config(BASE + 0x14, 0xe0000000);
+
+    /* AIC1: no global configuration, nothing read or written for it */
+    tree("aic,1");
+    reg(BASE + 4, 900);
+    aic_init();
+    CHECK(aic && aic->version == 1 && aic->nr_irq == 900);
+    nr_reads = nr_writes = 0;
+    CHECK(aic && !aic_read_config(&got) && got == 0x12345678);
+    aic_write_config(1);
+    CHECK(nr_reads == 0 && nr_writes == 0);
+}
+
 int main(void)
 {
     test_aic3_of_the_m4();
     test_aic2_of_two_dies();
     test_aic1();
+    test_init_and_config();
 
     printf("aic_test: %d checks, %d failed\n", checks, failures);
     if (failures)

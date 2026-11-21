@@ -306,6 +306,7 @@ void hv_start(void *entry, u64 regs[4])
     hv_want_cpu = -1;
     hv_cpus_in_guest = BIT(smp_id());
 
+    hv_vgic_start();
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
@@ -338,6 +339,7 @@ void hv_start(void *entry, u64 regs[4])
 
     printf("HV: All CPUs exited\n");
     hv_vgic_report();
+    hv_vgic_stop();
     hv_wfi_report();
     hv_psci_report();
     hv_pmu_report();

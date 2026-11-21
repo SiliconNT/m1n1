@@ -232,7 +232,10 @@ def aic_line(line):
     of the device tree or else, on AIC2, from 0x2000; then the bitmaps of the software
     trigger (set, clear), of the mask (set, clear) and the state of the lines. Set goes by the
     die's stride for masking, clear by the one for unmasking, as aic_set_sw(), aic_mask() and
-    aic_unmask() have it. Where the line is masked and unmasked is printed too."""
+    aic_unmask() have it. Where the line is masked and unmasked is printed too. Also
+    returns where AIC's global configuration is (aicglbcfg-offset of the device tree, else
+    0x14 on AIC2 and AIC3, as aic_init() has it; None on AIC1), which the hypervisor enables
+    while the guest runs (hv_vgic_start())."""
     buf = u.malloc(0x4000)
     size = p.hv_aicmap(buf)
     if size < 8:
@@ -255,7 +258,7 @@ def aic_line(line):
             value = struct.unpack_from("<I", value)[0]
         return value
     if "aic,1" in node.compatible:
-        max_irq, set_stride, clr_stride = 0x400, 0, 0
+        max_irq, set_stride, clr_stride, config_addr = 0x400, 0, 0, None
         sw_set, sw_clr, mask_set, mask_clr = 0x4000, 0x4080, 0x4100, 0x4180
     else:
         if "aic,2" in node.compatible:
@@ -273,6 +276,7 @@ def aic_line(line):
         die_size = 4 * max_irq + 5 * words
         set_stride = prop32("intmaskset-stride", die_size)
         clr_stride = prop32("intmaskclear-stride", die_size)
+        config_addr = base + prop32("aicglbcfg-offset", 0x14)
     die, num = line // max_irq, line % max_irq
     word = 4 * (num // 32)
     set_addr = base + sw_set + die * set_stride + word
@@ -281,10 +285,19 @@ def aic_line(line):
           f"at 0x{set_addr:x} and cleared at 0x{clr_addr:x}, bit {num % 32}")
     print(f"  it is masked at 0x{base + mask_set + die * set_stride + word:x} and unmasked at "
           f"0x{base + mask_clr + die * clr_stride + word:x}, the same bit")
-    return spi, set_addr, clr_addr, 1 << (num % 32)
+    return spi, set_addr, clr_addr, 1 << (num % 32), config_addr
+
+aic_config_addr = None
+
+def print_aic_config(when):
+    """AIC's global configuration, read only; bit 0 enables AIC"""
+    if aic_config_addr is not None:
+        value = p.read32(aic_config_addr)
+        print(f"AIC global configuration {when}: 0x{value:08x} at 0x{aic_config_addr:x} "
+              f"(enable bit {value & 1})")
 
 if args.aic_line is not None:
-    spi, set_addr, clr_addr, bit = aic_line(args.aic_line)
+    spi, set_addr, clr_addr, bit, aic_config_addr = aic_line(args.aic_line)
     struct.pack_into("<QQQQ", image, AIC_SET_OFF, set_addr, clr_addr, bit, spi)
 
 # The register a guest writes to start a CPU, as HV.map_essential() hooks it
@@ -367,7 +380,9 @@ def enter_guest_timed(*hv_start_args):
 
 p.hv_start = enter_guest_timed
 
+print_aic_config("before the guest")
 hv.start()
+print_aic_config("after the guest")
 
 print("Hypervisor exited.")
 if args.secondary:

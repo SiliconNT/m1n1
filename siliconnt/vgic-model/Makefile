@@ -195,7 +195,8 @@ build/model-tsan: $(MODEL_DEPS) build/hv_vgic.c
 # something (cmp), or the source has moved on.
 VGIC_BROKEN := unmask-on-enable mask-on-disable unmask-when-ended mask-when-ended-disabled \
 	forward-any-state wrong-spi no-die no-mask-all end-not-seen last-line-missed \
-	unmask-in-flight no-table-check late-is-stray stray-without-limit spurious-not-reset
+	unmask-in-flight no-table-check late-is-stray stray-without-limit spurious-not-reset \
+	not-enabled enabled-before-masking not-restored not-masked-after
 BREAK_VGIC_unmask-on-enable := /^            aic_unmask(vgic_aicmap.line\[k\]);$$/d
 BREAK_VGIC_mask-on-disable := /^            aic_mask(vgic_aicmap.line\[k\]);$$/d
 BREAK_VGIC_unmask-when-ended := /^        aic_unmask(vgic_aicmap.line\[k\]);$$/d
@@ -204,6 +205,10 @@ BREAK_VGIC_forward-any-state := /if (vgic_lines\[k\] == VGIC_LINE_MASKED)/,+1d;s
 BREAK_VGIC_late-is-stray := s/return VGIC_EVENT_LATE;/return VGIC_EVENT_STRAY;/
 BREAK_VGIC_stray-without-limit := s/if (VGIC_PERCPU(unmapped) >= VGIC_UNMAPPED_LIMIT)/if (0)/
 BREAK_VGIC_spurious-not-reset := /VGIC_PERCPU(spurious_run) = 0;/d
+BREAK_VGIC_not-enabled := s/aic_write_config(vgic_aic_config | AIC2_CONFIG_ENABLE);/;/
+BREAK_VGIC_enabled-before-masking := /aic_mask_all(); \/\/ before it is enabled/d;s/aic_write_config(vgic_aic_config | AIC2_CONFIG_ENABLE);/&\n    aic_mask_all();/
+BREAK_VGIC_not-restored := s/aic_write_config(vgic_aic_config);/;/
+BREAK_VGIC_not-masked-after := /aic_mask_all(); \/\/ as it was before/d
 BREAK_VGIC_wrong-spi := s/vgic_pend_spi(HV_AICMAP_FIRST_SPI + k, true);/vgic_pend_spi(HV_AICMAP_FIRST_SPI + k + 1, true);/
 BREAK_VGIC_no-die := s/FIELD_GET(AIC_EVENT_DIE, event) \* aic->max_irq +/0 * aic->max_irq +/
 BREAK_VGIC_no-mask-all := /^        aic_mask_all();$$/d

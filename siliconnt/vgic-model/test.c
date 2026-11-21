@@ -81,9 +81,39 @@ struct aic *aic = &model_aic;
 /* What the device holds the line at, and whether AIC masks it. Changed with bhl held. */
 static bool line_high[AIC_LINES];
 static bool line_masked[AIC_LINES];
-/* Lines that are high and unmasked: a physical IRQ is pending */
+/* Lines that are high and unmasked */
 static atomic_int lines_ready;
 static int mask_all_calls, unmask_calls;
+
+/*
+ * The global configuration, as the M4 had it under m1n1 (R33): bit 0, the enable, is 0.
+ * Until it is 1, AIC reports nothing, which is what R33 saw (not known for certain).
+ */
+#define AIC_CONFIG_M4 0xe0000000U
+static u32 aic_config = AIC_CONFIG_M4;
+static atomic_bool aic_on;
+
+/* What was done to AIC as a whole, in order */
+enum aic_op { OP_MASK_ALL, OP_CONFIG_READ, OP_CONFIG_WRITE };
+static struct {
+    enum aic_op op;
+    u32 val;
+} aic_ops[64];
+static int nr_aic_ops;
+
+static void aic_op(enum aic_op op, u32 val)
+{
+    if (nr_aic_ops < (int)(sizeof(aic_ops) / sizeof(aic_ops[0]))) {
+        aic_ops[nr_aic_ops].op = op;
+        aic_ops[nr_aic_ops++].val = val;
+    }
+}
+
+/* A physical IRQ is pending */
+static bool aic_irq(void)
+{
+    return atomic_load(&aic_on) && atomic_load(&lines_ready);
+}
 
 static void line_set(u32 line, bool high, bool masked)
 {
@@ -109,7 +139,7 @@ static void line_raise(u32 line, bool high)
 
 uint32_t aic_ack(void)
 {
-    if (!atomic_load(&lines_ready))
+    if (!aic_irq())
         return 0;
     for (u32 line = 0; line < AIC_LINES; line++) {
         if (line_high[line] && !line_masked[line]) {
@@ -136,9 +166,24 @@ void aic_unmask(int irq)
 void aic_mask_all(void)
 {
     mask_all_calls++;
+    aic_op(OP_MASK_ALL, 0);
     for (u32 line = 0; line < AIC_LINES; line++)
         if (line % 4096 < 2048)
             line_set(line, line_high[line], true);
+}
+
+bool aic_read_config(u32 *val)
+{
+    aic_op(OP_CONFIG_READ, aic_config);
+    *val = aic_config;
+    return true;
+}
+
+void aic_write_config(u32 val)
+{
+    aic_op(OP_CONFIG_WRITE, val);
+    aic_config = val;
+    atomic_store(&aic_on, val & AIC2_CONFIG_ENABLE);
 }
 
 /* The table: 3, 40, 1505 and line 7 of the second die are SPIs 32 to 35 */
@@ -197,7 +242,7 @@ static u64 isr(struct core *c)
 
     if (atomic_load(&c->ipi) || (c->timer && c->timer_fiq))
         v |= ISR_F;
-    if (eisr(c) || atomic_load(&lines_ready))
+    if (eisr(c) || aic_irq())
         v |= ISR_I; /* the maintenance interrupt, or AIC */
     return v;
 }
@@ -360,7 +405,7 @@ static bool physical_interrupt(void)
         hv_exit();
         return true;
     }
-    if (eisr(c) || atomic_load(&lines_ready)) {
+    if (eisr(c) || aic_irq()) {
         /* hv_exc_irq: hv_vgic_handle_irq, then hv_exc_exit -> hv_update_fiq */
         c->irqs++;
         pthread_mutex_lock(&bhl);
@@ -1398,14 +1443,29 @@ static void device(u32 spi, u32 line, int times)
 }
 
 /* The hypervisor starts with every line unmasked by whoever came before, none of them high */
+/* AIC as hv_init() left it, before hv_start() enabled it */
+static int mask_all_at_init;
+
+/*
+ * The hypervisor starts with every line unmasked by whoever came before, none of them high,
+ * and AIC not enabled; and the guest is entered (hv_start(): hv_vgic_start()), unless there
+ * is no table, without which hv_start() does not enter it
+ */
 static void aic_reset(bool table, int lrs)
 {
     memset(line_high, 0, sizeof(line_high));
     memset(line_masked, 0, sizeof(line_masked));
     atomic_store(&lines_ready, 0);
     mask_all_calls = unmask_calls = 0;
+    aic_config = AIC_CONFIG_M4;
+    atomic_store(&aic_on, false);
+    nr_aic_ops = 0;
     aicmap_fails = !table;
     reset(lrs);
+    mask_all_at_init = mask_all_calls;
+    cur = 6;
+    if (table)
+        hv_vgic_start();
     guest_handler = device_handler;
     memset(&dev, 0, sizeof(dev));
 }
@@ -1450,10 +1510,10 @@ static void aic_tests(void)
     struct aic_events e, before;
     int unmasked;
 
-    /* Every line is masked when the hypervisor starts, by the boot core, once */
+    /* Every line is masked when the hypervisor is initialized, by the boot core, once */
     aic_reset(true, 8);
     CHECK(hv_vgic_has_aicmap());
-    CHECK(mask_all_calls == 1);
+    CHECK(mask_all_at_init == 1);
     for (u32 line = 0; line < AIC_LINES; line++)
         CHECK(line_masked[line] || line % 4096 >= 2048);
     CHECK(unmask_calls == 0);
@@ -1583,7 +1643,7 @@ static void aic_tests(void)
     /* No table: the hypervisor says so, every line is still masked, none is ever unmasked */
     aic_reset(false, 8);
     CHECK(!hv_vgic_has_aicmap());
-    CHECK(mask_all_calls == 1);
+    CHECK(mask_all_at_init == 1);
     device(32, LINE_A, 1);
     cur = 6;
     windows_enable_spi(32, 0x80, 6, false);
@@ -1591,6 +1651,94 @@ static void aic_tests(void)
     expect_counts("AIC: without a table no line is forwarded", 32, 0, 0, 0, 0);
     CHECK(unmask_calls == 0 && line_masked[LINE_A]);
     line_raise(LINE_A, false);
+
+    guest_handler = NULL;
+    aicmap_fails = false;
+}
+
+/* What hv_vgic_report() prints of AIC's global configuration, "" if nothing */
+static const char *aic_config_report(void)
+{
+    static char said[512];
+    char line[512];
+    FILE *f = tmpfile();
+    int saved;
+
+    said[0] = 0;
+    CHECK(f);
+    fflush(stdout);
+    saved = dup(STDOUT_FILENO);
+    CHECK(saved >= 0 && dup2(fileno(f), STDOUT_FILENO) >= 0);
+    hv_vgic_report();
+    fflush(stdout);
+    CHECK(dup2(saved, STDOUT_FILENO) >= 0);
+    close(saved);
+    rewind(f);
+    while (fgets(line, sizeof(line), f))
+        if (strstr(line, "AIC global configuration"))
+            snprintf(said, sizeof(said), "%s", line);
+    fclose(f);
+    return said;
+}
+
+/*
+ * AIC's global configuration: enabled right before the guest is entered, after every line has
+ * been masked and every software trigger cleared, nothing but the enable bit changed; and
+ * after the guest, every line masked again and the configuration as it was before
+ */
+static void aic_config_tests(void)
+{
+    aic_reset(true, 8);
+    /* hv_init(): masked all, and left the configuration alone */
+    CHECK(aic_ops[0].op == OP_MASK_ALL);
+    /* hv_start(): masked all again, then read the configuration and set the enable bit */
+    CHECK(nr_aic_ops == 4);
+    CHECK(aic_ops[1].op == OP_MASK_ALL);
+    CHECK(aic_ops[2].op == OP_CONFIG_READ && aic_ops[2].val == AIC_CONFIG_M4);
+    CHECK(aic_ops[3].op == OP_CONFIG_WRITE && aic_ops[3].val == (AIC_CONFIG_M4 | 1));
+    CHECK(aic_config == (AIC_CONFIG_M4 | 1));
+    for (u32 line = 0; line < AIC_LINES; line++)
+        CHECK(line_masked[line] || line % 4096 >= 2048);
+    CHECK(!strcmp(aic_config_report(), "HV: vGIC: AIC global configuration 0xe0000000 before the "
+                                       "guest, 0xe0000001 while it ran\n"));
+
+    /* A line the guest has enabled, one in flight, one high */
+    device(32, LINE_A, 1);
+    cur = 6;
+    windows_enable_spi(32, 0x80, 6, false);
+    windows_enable_spi(33, 0x80, 6, false);
+    cores[6].masked = true;
+    line_raise(LINE_B, true);
+    settle(6);
+    CHECK(!line_masked[LINE_A] && line_masked[LINE_B]);
+    cores[6].masked = false;
+
+    /* The guest has been left: everything masked, the configuration as it was */
+    nr_aic_ops = 0;
+    hv_vgic_stop();
+    CHECK(nr_aic_ops == 2);
+    CHECK(aic_ops[0].op == OP_MASK_ALL);
+    CHECK(aic_ops[1].op == OP_CONFIG_WRITE && aic_ops[1].val == AIC_CONFIG_M4);
+    CHECK(aic_config == AIC_CONFIG_M4);
+    for (u32 line = 0; line < AIC_LINES; line++)
+        CHECK(line_masked[line] || line % 4096 >= 2048);
+    /* ...and nothing more is said of it, nor restored a second time */
+    CHECK(!strcmp(aic_config_report(), ""));
+    nr_aic_ops = 0;
+    hv_vgic_stop();
+    CHECK(nr_aic_ops == 1 && aic_ops[0].op == OP_MASK_ALL);
+    line_raise(LINE_B, false);
+    printf("ok   AIC: enabled after masking everything, as it was again after the guest\n");
+
+    /* Before hv_start() AIC reports nothing, though a line is high and unmasked */
+    aic_reset(false, 8);
+    pthread_mutex_lock(&bhl);
+    line_set(LINE_A, true, false);
+    pthread_mutex_unlock(&bhl);
+    cur = 6;
+    CHECK(!physical_interrupt());
+    line_raise(LINE_A, false);
+    printf("ok   AIC: not enabled, it reports nothing\n");
 
     guest_handler = NULL;
     aicmap_fails = false;
@@ -2534,6 +2682,7 @@ int main(int argc, char **argv)
     /* "aic": only the tests of how AIC lines are forwarded (make vgic-broken) */
     if (argc > 1 && !strcmp(argv[1], "aic")) {
         aic_tests();
+        aic_config_tests();
         aic_limit_tests();
         aic_order_tests();
         printf("ALL OK\n");
@@ -2542,6 +2691,7 @@ int main(int argc, char **argv)
     sgi_tests();
     dist_tests();
     aic_tests();
+    aic_config_tests();
     aic_limit_tests();
     aic_order_tests();
     level_timer_tests();

@@ -13,6 +13,7 @@ static struct aic aic1 = {
     .version = 1,
     .nr_die = 1,
     .max_die = 1,
+    .glbcfg_offset = -1,
     .regs =
         {
             .reg_size = AIC_REG_SIZE,
@@ -98,6 +99,12 @@ static int aic23_init(int version, int node)
         printf("AIC: Could not find external interrupt config base\n");
         return -1;
     }
+
+    u32 glbcfg_offset;
+    if (ADT_GETPROP(adt, node, "aicglbcfg-offset", &glbcfg_offset) > 0)
+        aic->glbcfg_offset = glbcfg_offset;
+    else
+        aic->glbcfg_offset = AIC2_CONFIG;
 
     const u64 start_off = aic->regs.config;
     u64 off = start_off + sizeof(u32) * aic->max_irq; /* IRQ_CFG */
@@ -233,6 +240,25 @@ void aic_mask_all(void)
                     0xffffffff);
         }
     }
+}
+
+/*
+ * The global configuration of AIC2 and AIC3, whose bit 0 enables it (Linux: AIC2_CONFIG,
+ * which aic_of_ic_init() sets that bit in once every line is masked). AIC1 has none that
+ * Linux writes: aic_read_config() returns false there.
+ */
+bool aic_read_config(u32 *val)
+{
+    if (aic->glbcfg_offset < 0)
+        return false;
+    *val = read32(aic->base + aic->glbcfg_offset);
+    return true;
+}
+
+void aic_write_config(u32 val)
+{
+    if (aic->glbcfg_offset >= 0)
+        write32(aic->base + aic->glbcfg_offset, val);
 }
 
 void aic_write(u32 reg, u32 val)

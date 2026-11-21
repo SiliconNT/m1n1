@@ -141,6 +141,9 @@ bool hv_aic_hook(void);
 #define HV_VGIC_REDIST_BASE 0x5100000000UL
 #define HV_VGIC_REDIST_SIZE 0x20000UL
 void hv_vgic_init(void);
+/* AIC enabled for the guest, right before it is entered; as it was, once it has been left */
+void hv_vgic_start(void);
+void hv_vgic_stop(void);
 /* Whether hv_vgic_init() has the table of hv_aicmap(): hv_start() does not enter a guest unless */
 bool hv_vgic_has_aicmap(void);
 void hv_vgic_ppi_level(u32 intid, bool high);

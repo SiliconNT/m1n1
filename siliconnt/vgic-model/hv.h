@@ -58,6 +58,8 @@ bool hv_vgic_has_aicmap(void);
 #define HV_VGIC_REDIST_BASE  0x5100000000UL
 #define HV_VGIC_REDIST_SIZE  0x20000UL
 void hv_vgic_init(void);
+void hv_vgic_start(void);
+void hv_vgic_stop(void);
 void hv_vgic_ppi_level(u32 intid, bool high);
 bool hv_vgic_handle_irq(void);
 void hv_vgic_send_sgi(u64 val);

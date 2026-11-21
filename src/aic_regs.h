@@ -24,6 +24,10 @@
 #define AIC2_MAXNUMIRQ 0x000c
 #define AIC2_LATENCY   0x0204
 
+/* Global configuration of AIC2 and AIC3 (Linux: AIC2_CONFIG), unless the ADT says otherwise */
+#define AIC2_CONFIG        0x0014
+#define AIC2_CONFIG_ENABLE BIT(0)
+
 #define AIC2_IRQ_CFG         0x2000
 #define AIC23_IRQ_CFG_TARGET GENMASK(3, 0)
 #define AIC3_IRQ_CFG         0x10000

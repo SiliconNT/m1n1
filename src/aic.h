@@ -32,6 +32,7 @@ struct aic {
 
     int32_t cap0_offset;
     int32_t maxnumirq_offset;
+    int32_t glbcfg_offset; /* -1: none */
     struct aic_regs regs;
 };
 
@@ -42,6 +43,8 @@ void aic_set_sw(int irq, bool active);
 void aic_mask(int irq);
 void aic_unmask(int irq);
 void aic_mask_all(void);
+bool aic_read_config(u32 *val);
+void aic_write_config(u32 val);
 void aic_write(u32 reg, u32 val);
 uint32_t aic_ack(void);
 

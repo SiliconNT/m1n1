@@ -184,6 +184,10 @@ static int vgic_boot_cpu;
 static struct hv_aicmap vgic_aicmap;
 static bool vgic_aicmap_ok;
 
+/* AIC's global configuration as it was before hv_vgic_start() enabled AIC, if it has one */
+static bool vgic_aic_config_saved;
+static u32 vgic_aic_config;
+
 /* What an AIC line of the table is doing */
 enum vgic_line {
     VGIC_LINE_MASKED,    // masked in AIC: the guest does not have its SPI enabled
@@ -381,6 +385,35 @@ static void vgic_init_global(void)
 bool hv_vgic_has_aicmap(void)
 {
     return vgic_aicmap_ok;
+}
+
+/*
+ * AIC reports lines from here on, as Linux starts it (drivers/irqchip/irq-apple-aic.c,
+ * aic_of_ic_init()): every line masked and every software trigger cleared, then the enable
+ * bit of the global configuration set, and nothing else of it changed. Until then AIC
+ * reports nothing (R33: the M4 had 0xe0000000 there under m1n1, and no IRQ came).
+ */
+void hv_vgic_start(void)
+{
+    if (!aic)
+        return;
+    aic_mask_all(); // before it is enabled
+    vgic_aic_config_saved = aic_read_config(&vgic_aic_config);
+    if (vgic_aic_config_saved)
+        aic_write_config(vgic_aic_config | AIC2_CONFIG_ENABLE);
+}
+
+/* ...and AIC as it was before, for m1n1 once every core has left the guest */
+void hv_vgic_stop(void)
+{
+    if (!aic)
+        return;
+    aic_mask_all(); // as it was before
+    for (u32 k = 0; k < HV_AICMAP_MAX; k++)
+        vgic_lines[k] = VGIC_LINE_MASKED;
+    if (vgic_aic_config_saved)
+        aic_write_config(vgic_aic_config);
+    vgic_aic_config_saved = false;
 }
 
 /* Bring up the virtual CPU interface of the core this runs on, with nothing pending */
@@ -1346,6 +1379,14 @@ void hv_vgic_report(void)
                cpu, p->sgi_writes, p->injected, p->maintenance, p->retracted, p->sgi_deferred,
                p->spi_deferred, __atomic_load_n(&p->sgi_pending, __ATOMIC_SEQ_CST), p->forwarded,
                p->late, p->unmapped, p->spurious);
+    }
+
+    if (vgic_aic_config_saved) {
+        u32 now = 0;
+
+        aic_read_config(&now);
+        printf("HV: vGIC: AIC global configuration 0x%x before the guest, 0x%x while it ran\n",
+               vgic_aic_config, now);
     }
 
     for (u32 k = 0; k < vgic_aicmap.count; k++)
