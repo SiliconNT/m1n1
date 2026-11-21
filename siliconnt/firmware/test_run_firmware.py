@@ -38,6 +38,16 @@ M4 = dict(
 MEM_TOP = M4["ba_phys_base"] + M4["ba_mem_size"]
 assert MEM_TOP == 0x103db610000
 
+def aicmap(lines, version=1, count=None):
+    """A table of AIC lines and SPIs as m1n1 writes it: version, count, the lines."""
+    count = len(lines) if count is None else count
+    return struct.pack(f"<II{len(lines)}I", version, count, *lines)
+
+# 391 lines from 0 to 1505, as the M4 has them; which ones in between does not matter here
+AICMAP_M4_LINES = [0] + list(range(100, 489)) + [1505]
+AICMAP_M4 = aicmap(AICMAP_M4_LINES)
+assert len(AICMAP_M4_LINES) == 391
+
 # For --loader m1n1. Three of the ranges of /arm-io that R21 mapped (SiliconNT
 # docs/lab/2026-11-15-boot-disk-4k-plan/run.txt); the UART lies in the first.
 ARM_IO = [(0x200000000, 0x3a0000000), (0x800000000, 0x2e0000000), (0x1cb0000000, 0x10000000)]
@@ -116,7 +126,10 @@ def make_fakes(case):
                                 timeout_at_entry="not entered", debugger_at_entry=None,
                                 pt_walks=[], heap_reads=[], context_fault=None, image_base=None,
                                 # --bugcheck: what rec.stopped was at each read of guest memory
-                                guest_reads=[])
+                                guest_reads=[],
+                                # P_HV_AICMAP: where m1n1 was asked to write the table, and
+                                # what it wrote there
+                                aicmap_calls=[], tables=[])
     heap_top = case.get("heap_top", M4["heap_top"])
 
     def stage2(addr):
@@ -169,6 +182,10 @@ def make_fakes(case):
             assert stype == "ExcInfo"
             return types.SimpleNamespace(elr=rec.image_base + 0x8600)
         def readmem(self, addr, size):
+            # the table of AIC lines and SPIs that m1n1 wrote (M1N1Proxy.hv_aicmap() below)
+            for base, written in rec.tables:
+                if base <= addr and addr + size <= base + len(written):
+                    return written[addr - base:addr - base + size]
             # what ProxyUtils.compressed_writemem() below has put into guest memory
             for base, written in rec.writes:
                 if base <= addr and addr + size <= base + len(written):
@@ -240,6 +257,16 @@ def make_fakes(case):
                                   b"answered\n")
             rec.selfboot_done = True
             return 0
+        def hv_aicmap(self, dest):
+            """hv_aicmap() of src/hv/hv_layout.c: the table of the M4, 391 lines from 0 to
+            1505 (SiliconNT docs/findings/0058), unless the case has another, or m1n1 refuses
+            (-1)."""
+            rec.aicmap_calls.append(dest)
+            if "aicmap_ret" in case:
+                return case["aicmap_ret"]
+            table = case.get("aicmap_table", AICMAP_M4)
+            rec.tables.append((dest, table))
+            return len(table)
         def hv_xtrack(self):
             rec.xtrack = True
             # what was done already, and what was not, when tracking was turned on
@@ -466,6 +493,8 @@ else:
 ADT_BASE = M4["heap_top"] + (32 << 20)
 IMAGE_BASE = align_up(ADT_BASE + align(M4["devtree_size"]), 0x200000)
 BOOTARGS = IMAGE_BASE + align(image_len)
+# The table of AIC lines and SPIs: the page after the boot arguments
+AICMAP = BOOTARGS + 0x4000
 
 # 1. --check-only: decides, touches nothing
 rec, out, code = run({}, "--check-only", *image_args)
@@ -476,6 +505,9 @@ check("check-only marks nothing inside guest RAM", "\n  * " not in out, out)
 check("16-byte memory-map entry was read", "preoslog" in out and "Something-odd" not in out)
 check("check-only prints the EL1 state the firmware starts in",
       "SCTLR_EL12 = 0x30d50980 (M=0 C=0 I=0)" in out and "CPACR_EL12 = 0x0 (FPEN=0)" in out, out)
+check("check-only prints where the table of AIC lines goes, and does not have it written",
+      f"AIC to GIC table     0x{AICMAP:x} .. 0x{AICMAP + 0x4000:x}" in out and
+      rec.aicmap_calls == [], out)
 
 # 2. the whole run
 rec, out, code = run({}, "--seconds", "30", *image_args)
@@ -485,14 +517,35 @@ check("image loaded at the planned base", rec.loaded == (IMAGE_BASE, image_len, 
 check("image base is 2 MB aligned and above the device tree",
       IMAGE_BASE % 0x200000 == 0 and IMAGE_BASE >= ADT_BASE + M4["devtree_size"])
 check("boot arguments right after the image", rec.bootargs_at == BOOTARGS, f"{rec.bootargs_at}")
-check("top_of_kernel_data is the end of the boot arguments page",
-      rec.bootargs_top == BOOTARGS + 0x4000)
+check("top_of_kernel_data is the end of the page of the table after the boot arguments",
+      rec.bootargs_top == AICMAP + 0x4000)
+check("m1n1 writes the table of AIC lines to the page after the boot arguments, once",
+      rec.aicmap_calls == [AICMAP], f"{rec.aicmap_calls}")
+check("memory-map AICToGIC is that page and the size of the table in bytes",
+      getattr(rec.memory_map, "AICToGIC", None) == (AICMAP, 8 + 4 * 391),
+      f"{getattr(rec.memory_map, '_properties', None)}")
+# What the firmware checks of the entry before it reads the table (AppleGetAicToGic() of
+# AppleDTLib.c, siliconnt-firmware aic-to-gic 8b3fe9d): the size is 8 + 4 * the count the
+# table has; the address is the start of a 4 KB page; all of it lies in guest RAM, which is
+# the memory the boot arguments describe (HV._write_boot_args()); the lines go up strictly
+aicmap_base, aicmap_size = getattr(rec.memory_map, "AICToGIC", (1, 0))
+aicmap_written = dict(rec.tables).get(aicmap_base, b"")
+aicmap_count = struct.unpack_from("<I", aicmap_written, 4)[0] if len(aicmap_written) >= 8 else -1
+aicmap_lines = struct.unpack_from(f"<{max(aicmap_count, 0)}I", aicmap_written, 8)
+check("AICToGIC is what the firmware accepts: size, page, in guest RAM, strictly ascending",
+      aicmap_size == 8 + 4 * aicmap_count and aicmap_base % 0x1000 == 0 and
+      M4["heap_top"] <= aicmap_base and aicmap_base + aicmap_size <= MEM_TOP and
+      all(a < b for a, b in zip(aicmap_lines, aicmap_lines[1:])),
+      f"{aicmap_base:#x} {aicmap_size:#x} {aicmap_count}")
+check("the table m1n1 wrote is printed: its size, its count, its first and last line",
+      f"AIC to GIC table at 0x{AICMAP:x}, 0x{8 + 4 * 391:x} bytes: 391 lines, AIC 0 is SPI 32, "
+      "AIC 1505 is SPI 422" in out, out)
 check("entered at the first byte with x0 = boot arguments", rec.hv_start == (IMAGE_BASE, BOOTARGS),
       f"{rec.hv_start}")
 check("memory-map DeviceTree and BootArgs updated",
       rec.memory_map.DeviceTree == (ADT_BASE, align(M4["devtree_size"])) and
       rec.memory_map.BootArgs == (BOOTARGS, 0x4000))
-check("everything below the firmware work area", BOOTARGS + 0x4000 <= MEM_TOP - 0x8000000)
+check("everything below the firmware work area", AICMAP + 0x4000 <= MEM_TOP - 0x8000000)
 check("a stop leaves the guest", rec.stopped == "EXIT_GUEST")
 check("a stop by the timer says where the firmware was and prints the context",
       f"Firmware stopped at PC 0x{IMAGE_BASE + 0x8600:x} (firmware image + 0x8600)" in out and
@@ -548,6 +601,30 @@ rec, out, code = run({"sctlr_el1": 0x30d50981}, *image_args)
 check("EL1 MMU on stops the run",
       code != 0 and "PROBLEM: the EL1 MMU is on" in out and rec.loaded is None and
       not rec.hv_inited, out[-600:])
+
+# 10a. m1n1 writes no table of AIC lines and SPIs (it has more lines than SPIs, say)
+rec, out, code = run({"aicmap_ret": -1}, *image_args)
+check("no table of AIC lines stops the run before the guest is entered",
+      isinstance(code, str) and "P_HV_AICMAP returned -1" in code and rec.hv_start is None and
+      not hasattr(rec.memory_map, "AICToGIC"), f"{code!r}")
+
+# 10b. a table that is not one of version 1: another version, a count that is not the number
+# of lines, lines out of order or twice, a size that is not whole lines
+for what, case in (("another version", {"aicmap_table": aicmap([1, 2], version=2)}),
+                   ("a count that is wrong", {"aicmap_table": aicmap([1, 2], count=3)}),
+                   ("lines out of order", {"aicmap_table": aicmap([2, 1])}),
+                   ("a line twice", {"aicmap_table": aicmap([1, 1])}),
+                   ("half a line", {"aicmap_table": aicmap([1, 2]) + b"\0\0"})):
+    rec, out, code = run(case, *image_args)
+    check(f"a table with {what} stops the run before the guest is entered",
+          isinstance(code, str) and rec.hv_start is None and
+          not hasattr(rec.memory_map, "AICToGIC"), f"{code!r}")
+
+# 10c. a table without lines is a table all the same
+rec, out, code = run({"aicmap_table": aicmap([])}, "--seconds", "30", *image_args)
+check("a table without lines is handed to the firmware",
+      code == 0 and rec.memory_map.AICToGIC == (AICMAP, 8) and
+      f"AIC to GIC table at 0x{AICMAP:x}, 0x8 bytes: no lines" in out, out[-600:])
 
 # ---- how a run ends ------------------------------------------------------------------
 
@@ -633,7 +710,7 @@ def make_disk(name, size, gpt=True):
 # Whole 4 KB pages, but not whole 16 KB pages, and more than one piece
 DISK_LEN = (40 << 20) + 0x1000
 disk_path, disk_data = make_disk("disk.img", DISK_LEN)
-DISK_BASE = align_up(BOOTARGS + 0x4000, 0x200000)
+DISK_BASE = align_up(AICMAP + 0x4000, 0x200000)
 untouched = lambda rec: rec.loaded is None and rec.writes == [] and not rec.hv_inited
 
 # 17. --check-only with a disk: decides, touches nothing
@@ -647,9 +724,9 @@ check("the disk image is identified by size and SHA-256",
 # 18. the whole run with a disk
 rec, out, code = run({}, "--seconds", "30", "--disk", disk_path, *image_args)
 check("full run with a disk exits 0", code == 0, out[-600:])
-check("the disk starts on the first 2 MB boundary after the boot arguments",
+check("the disk starts on the first 2 MB boundary after the table",
       rec.writes and rec.writes[0][0] == DISK_BASE and DISK_BASE % 0x200000 == 0 and
-      0 <= DISK_BASE - (BOOTARGS + 0x4000) < 0x200000, f"{rec.writes[:1]}"[:80])
+      0 <= DISK_BASE - (AICMAP + 0x4000) < 0x200000, f"{rec.writes[:1]}"[:80])
 pieces_follow = all(a_base + len(a) == b_base
                     for (a_base, a), (b_base, b) in zip(rec.writes, rec.writes[1:]))
 check("the disk arrives whole, in pieces that follow each other",
@@ -665,10 +742,11 @@ check("the disk is in place before the guest is entered",
 check("memory-map RAMDisk is the base and the exact size of the image",
       getattr(rec.memory_map, "RAMDisk", None) == (DISK_BASE, DISK_LEN),
       f"{getattr(rec.memory_map, '_properties', None)}")
-check("with a disk the image, DeviceTree and BootArgs are where they are without one",
+check("with a disk the image, DeviceTree, BootArgs and AICToGIC are where they are without one",
       rec.loaded == (IMAGE_BASE, image_len, "firmware") and rec.bootargs_at == BOOTARGS and
       rec.memory_map.DeviceTree == (ADT_BASE, align(M4["devtree_size"])) and
-      rec.memory_map.BootArgs == (BOOTARGS, 0x4000))
+      rec.memory_map.BootArgs == (BOOTARGS, 0x4000) and
+      rec.memory_map.AICToGIC == (AICMAP, 8 + 4 * 391))
 check("top_of_kernel_data is the end of the disk, rounded up to 16 KB",
       rec.bootargs_top == align(DISK_BASE + DISK_LEN) and rec.bootargs_top % 0x4000 == 0,
       f"{rec.bootargs_top}")
@@ -1023,9 +1101,11 @@ check("without --wait-debugger the guest is entered with no debugger, as before"
 image_data = (pathlib.Path(image_args[0]) if image_args else DEFAULT_IMAGE).read_bytes()
 M1N1 = ("--loader", "m1n1", "--disk", disk_path)
 # Nothing of the host's own loader: no HV object, no boot arguments or device tree written,
-# no command to turn execution tracking on
+# no command to turn execution tracking on, no table of AIC lines asked for (m1n1 writes it
+# itself, selfboot_enter() of src/selfboot_run.c)
 no_hv = lambda rec: (not rec.hv_inited and rec.loaded is None and rec.hv_start is None and
-                     rec.xtrack is None and rec.memory_map is None and rec.bootargs_top is None)
+                     rec.xtrack is None and rec.memory_map is None and rec.bootargs_top is None
+                     and rec.aicmap_calls == [])
 tty = lambda out: "\n".join(line for line in out.splitlines() if not line.startswith("FW>"))
 
 # 34. the whole run, ended by the timer

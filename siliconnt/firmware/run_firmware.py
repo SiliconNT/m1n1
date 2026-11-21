@@ -20,6 +20,7 @@ m1n1 occupies is not part of the memory the boot arguments describe:
     phys_base + 32 MB     Apple device tree, as edited by HV.setup_adt()
     next 2 MB boundary    the firmware image, entered at its first byte
     after the image       Apple boot arguments, one 16 KB page
+    next page             the table of AIC lines and SPIs, one 16 KB page
     next 2 MB boundary    the boot disk image, with --disk
     ...
     mem_top - 128 MB      the firmware's own work area: stack, hand-off blocks, DXE core
@@ -36,6 +37,14 @@ a disk with a GPT. The firmware has no storage driver; it is to register the mem
 image lies in as a RAM disk, in place. It learns the address and the size in bytes from
 an entry RAMDisk in /chosen/memory-map of the device tree, next to DeviceTree and
 BootArgs. Without --disk there is no such entry.
+
+The table of AIC lines and SPIs says which GIC interrupt each line of Apple's interrupt
+controller is for the guest: the version (1), the count, then the lines in ascending order,
+each 32 bits; the k-th is SPI 32 + k. m1n1 writes it to its page (P_HV_AICMAP, hv_aicmap()
+of src/hv/hv_layout.c), from its own device tree, with the same code it writes it with when
+it loads the firmware itself; the hypervisor forwards the lines by the same table. The
+firmware finds the address and the size in bytes in the entry AICToGIC of
+/chosen/memory-map.
 
 Before anything is written to the target, the script checks that these ranges fit in guest
 RAM, that the framebuffer lies outside it, that nothing iBoot listed in
@@ -165,6 +174,9 @@ GUEST_GAP = 32 << 20
 # Where the image goes: a multiple of every alignment its modules ask for (64 KB at most)
 IMAGE_ALIGN = 0x200000
 BOOTARGS_SIZE = PAGE
+# The table of AIC lines and SPIs: SELFBOOT_AICMAP_SIZE in src/selfboot.h
+AICMAP_SIZE = PAGE
+AICMAP_VERSION = 1
 
 # The boot disk starts on a 2 MB boundary like the image. The firmware's pages are 4 KB,
 # and it is to reserve exactly the pages the disk lies in.
@@ -281,7 +293,8 @@ class Layout:
         self.image_base = align_up(self.adt_base + self.adt_size, IMAGE_ALIGN)
         self.image_size = image_len
         self.bootargs = self.image_base + align(image_len)
-        self.end = self.bootargs + BOOTARGS_SIZE
+        self.aicmap = self.bootargs + BOOTARGS_SIZE
+        self.end = self.aicmap + AICMAP_SIZE
         self.disk_base = align_up(self.end, DISK_ALIGN)
         self.disk_size = disk_len
         # top_of_kernel_data in the boot arguments: where what was put here ends
@@ -291,10 +304,11 @@ class Layout:
             ("device tree", self.adt_base, self.adt_size),
             ("firmware image", self.image_base, self.image_size),
             ("boot arguments", self.bootargs, BOOTARGS_SIZE),
+            ("AIC to GIC table", self.aicmap, AICMAP_SIZE),
             ("firmware work area", self.uefi_base, UEFI_REGION_SIZE),
         ]
         if disk_len:
-            self.used.insert(3, ("boot disk", self.disk_base, self.disk_size))
+            self.used.insert(4, ("boot disk", self.disk_base, self.disk_size))
 
 layout = Layout(u, len(image), len(disk) if disk is not None else 0)
 problems = []
@@ -307,7 +321,8 @@ for name, base, size in layout.used:
     if base < layout.phys_base or base + size > layout.mem_top:
         problems.append(f"{name} does not fit in guest RAM")
 if layout.end > layout.uefi_base:
-    problems.append("the image and the boot arguments reach into the firmware work area")
+    problems.append("the image, the boot arguments and the table reach into the firmware "
+                    "work area")
 elif layout.disk_size and layout.disk_base + layout.disk_size > layout.uefi_base:
     problems.append("the boot disk reaches into the firmware work area: there is room for "
                     f"{max(layout.uefi_base - layout.disk_base, 0) >> 20} MB")
@@ -894,6 +909,27 @@ if u.mrs(ICH_MISR_EL2):
 uart_base = hv.adt["/arm-io/uart0"].get_reg(0)[0]
 print(f"Virtual UART at 0x{uart_base:x}")
 
+def write_aicmap(base):
+    """Has m1n1 write the table of AIC lines and SPIs to its page and prints what it says.
+    Returns its size in bytes, as the firmware is told it."""
+    size = p.hv_aicmap(base)
+    if not 8 <= size <= AICMAP_SIZE or size % 4:
+        sys.exit(f"m1n1 wrote no table of AIC lines and SPIs (P_HV_AICMAP returned {size}): it "
+                 "has said why above. The guest has not run.")
+    table = iface.readmem(base, size)
+    version, count = struct.unpack_from("<II", table)
+    lines = struct.unpack_from(f"<{(size - 8) // 4}I", table, 8)
+    if version != AICMAP_VERSION or count != len(lines) or list(lines) != sorted(set(lines)):
+        sys.exit(f"The table of AIC lines and SPIs m1n1 wrote is not one of version "
+                 f"{AICMAP_VERSION}: version {version}, count {count}, {len(lines)} lines. The "
+                 "guest has not run.")
+    if count:
+        print(f"AIC to GIC table at 0x{base:x}, 0x{size:x} bytes: {count} lines, AIC "
+              f"{lines[0]} is SPI 32, AIC {lines[-1]} is SPI {32 + count - 1}")
+    else:
+        print(f"AIC to GIC table at 0x{base:x}, 0x{size:x} bytes: no lines")
+    return size
+
 def load_firmware(hv, image, disk, layout):
     """What HV.load_raw() does, without the parts only macOS needs, entering the image at
     its first byte."""
@@ -916,6 +952,7 @@ def load_firmware(hv, image, disk, layout):
     memory_map = hv.adt["chosen"]["memory-map"]
     memory_map.DeviceTree = (layout.adt_base, layout.adt_size)
     memory_map.BootArgs = (layout.bootargs, BOOTARGS_SIZE)
+    memory_map.AICToGIC = (layout.aicmap, write_aicmap(layout.aicmap))
     if disk is not None:
         load_disk(disk, layout.disk_base)
         # The size in bytes, not rounded: it is the size of the disk
