@@ -83,6 +83,26 @@ bool hv_pa_write(struct exc_info *ctx, u64 addr, u64 *val, int width);
 bool hv_pa_read(struct exc_info *ctx, u64 addr, u64 *val, int width);
 bool hv_pa_rw(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width);
 
+/*
+ * What is where in the physical address space of the guest (hv_layout.c).
+ *
+ * The devices of the machine: the ranges of /arm-io of the device tree, as addresses of the
+ * CPU. hv_io_ranges() returns -1 after printing why the tree has none that can be used;
+ * hv_io_ranges_next() returns false after the last one.
+ */
+struct hv_io_ranges {
+    const u8 *next, *end;
+    u32 bus_cells, cpu_cells, size_cells;
+};
+int hv_io_ranges(struct hv_io_ranges *it);
+bool hv_io_ranges_next(struct hv_io_ranges *it, u64 *base, u64 *size);
+/*
+ * Whether the machine has neither a device nor memory where the guest finds the Distributor
+ * and the Redistributors (HV_VGIC_DIST_BASE, HV_VGIC_REDIST_BASE). Prints what is in the way
+ * of which of the two. hv_start() does not enter a guest unless this is true.
+ */
+bool hv_vgic_ranges_free(void);
+
 /* AIC events through tracing the MMIO event address */
 bool hv_trace_irq(u32 type, u32 num, u32 count, u32 flags);
 void hv_aic_init(void);
@@ -92,7 +112,8 @@ bool hv_aic_hook(void);
 #define HV_VGIC_INTID_VTIMER 27 // PPI of the EL1 virtual timer
 /*
  * Where the guest finds the Distributor, and the Redistributor of the core with m1n1 index n:
- * HV_VGIC_REDIST_BASE + n * HV_VGIC_REDIST_SIZE. Nothing of the M4 is at these addresses.
+ * HV_VGIC_REDIST_BASE + n * HV_VGIC_REDIST_SIZE. The same on every machine, so the machine
+ * must have nothing of its own there: hv_vgic_ranges_free().
  */
 #define HV_VGIC_DIST_BASE   0x5000000000UL
 #define HV_VGIC_DIST_SIZE   0x10000UL

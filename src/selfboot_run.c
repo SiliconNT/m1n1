@@ -9,6 +9,9 @@
  * comes before the hypervisor is initialized, and m1n1 keeps the screen and its consoles
  * until nothing can fail any more.
  *
+ * What is the same for every guest, where the devices of the machine are and whether the
+ * guest can have its GIC where it is, is src/hv/hv_layout.c.
+ *
  * Tested on the build machine by siliconnt/selfboot-model (run_test.c).
  */
 
@@ -73,14 +76,6 @@ static void selfboot_regs(void)
     sysop("isb");
 }
 
-static u64 cells(const u8 *p, u32 count)
-{
-    u64 value = 0;
-
-    memcpy(&value, p, 4 * count);
-    return value;
-}
-
 static int map_hw(const char *what, u64 base, u64 size)
 {
     if (hv_map_hw(base, base, size) < 0) {
@@ -100,31 +95,16 @@ static int map_hw(const char *what, u64 base, u64 size)
 static int selfboot_map(const struct selfboot_layout *l, iodev_id_t host)
 {
     u64 ram_base = l->phys_base & ~0xffffffffUL;
-    u32 ac, sc, pac, len, entry, irq;
-    const u8 *ranges;
+    struct hv_io_ranges ranges;
+    u64 base, size, uart;
     int path[8];
-    u64 uart;
-    int node;
+    u32 irq;
 
-    /* Every range of /arm-io: bus address, address of the CPU, size */
-    node = adt_path_offset(adt, ARM_IO);
-    ranges = node < 0 ? NULL : adt_getprop(adt, node, "ranges", &len);
-    if (!ranges || ADT_GETPROP(adt, node, "#address-cells", &ac) < 0 ||
-        ADT_GETPROP(adt, node, "#size-cells", &sc) < 0 ||
-        ADT_GETPROP(adt, 0, "#address-cells", &pac) < 0) {
-        printf("selfboot: " ARM_IO " of the device tree has no ranges to map\n");
+    /* Every range of /arm-io, where the CPU has it */
+    if (hv_io_ranges(&ranges) < 0)
         return -1;
-    }
-    if (!ac || ac > 2 || !sc || sc > 2 || !pac || pac > 2) {
-        printf("selfboot: the ranges of " ARM_IO " have addresses of %d and %d cells and sizes "
-               "of %d\n",
-               ac, pac, sc);
-        return -1;
-    }
-    entry = 4 * (ac + pac + sc);
-    for (u32 off = 0; off + entry <= len; off += entry)
-        if (map_hw("a range of " ARM_IO, cells(ranges + off + 4 * ac, pac),
-                   cells(ranges + off + 4 * (ac + pac), sc)) < 0)
+    while (hv_io_ranges_next(&ranges, &base, &size))
+        if (map_hw("a range of " ARM_IO, base, size) < 0)
             return -1;
 
     /*
@@ -178,6 +158,14 @@ static int selfboot_enter(const struct selfboot_layout *l, iodev_id_t host)
         printf("selfboot: the MMU of EL1 is on, the firmware expects it off\n");
         return -1;
     }
+
+    /*
+     * Not in run_firmware.py: the firmware tells Windows where the GIC is, and the machine
+     * must have nothing of its own there. hv_start() asks again, for every guest, but by
+     * then the screen is no longer m1n1's to say so on.
+     */
+    if (!hv_vgic_ranges_free())
+        return -1;
 
     /* The device tree and the boot arguments: load_firmware() and HV.start() */
     if (selfboot_adt((void *)l->adt_base, cur_boot_args.devtree_size, l) < 0)

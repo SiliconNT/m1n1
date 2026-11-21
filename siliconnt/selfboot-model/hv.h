@@ -7,6 +7,12 @@
 #include "iodev.h"
 #include "types.h"
 
+/* From the real header, by the Makefile: the two ranges of the vGIC, struct hv_io_ranges */
+#include "hv_layout.h"
+
+int hv_io_ranges(struct hv_io_ranges *it);
+bool hv_io_ranges_next(struct hv_io_ranges *it, u64 *base, u64 *size);
+bool hv_vgic_ranges_free(void);
 void hv_init(void);
 void hv_write_hcr(u64 val);
 void hv_write_hacr(u64 val);

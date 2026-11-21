@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Host-side model test for src/selfboot_run.c, with the real src/selfboot.c under it.
+ * Host-side model test for src/selfboot_run.c, with the real src/selfboot.c,
+ * src/selfboot_files.c and src/hv/hv_layout.c under it.
  *
  * The real files are compiled for the build machine. Everything of m1n1 they call is stood in
  * for here, and every call is written down in the order it came: the SSD and its two files,
@@ -66,24 +67,9 @@
 #define MDCR_WANTED      0xe00UL
 
 struct boot_args cur_boot_args;
-u64 mem_size_actual;
+u64 ram_base, mem_size_actual;
 size_t mcc_carveout_count;
 struct mcc_carveout mcc_carveouts[4];
-
-/* "Mapping MMIO range" of R21: the ranges of /arm-io, as addresses of the CPU */
-static const u64 mmio[][2] = {
-    {0x200000000, 0x5a0000000},   {0x400000000, 0x404074000},   {0x408000000, 0x40c074000},
-    {0x410000000, 0x414074000},   {0x418000000, 0x41c074000},   {0x800000000, 0xa00000000},
-    {0xc00000000, 0xe00000000},   {0x1000000000, 0x1200000000}, {0x1400000000, 0x1600000000},
-    {0xa00000000, 0xa80000000},   {0xe00000000, 0xe80000000},   {0x1200000000, 0x1280000000},
-    {0x1600000000, 0x1680000000}, {0x1c50000000, 0x1c60000000}, {0x1c60000000, 0x1c70000000},
-    {0x1c70000000, 0x1c80000000}, {0x1c80000000, 0x1c90000000}, {0x404000000, 0x404074000},
-    {0x40c000000, 0x40c074000},   {0x414000000, 0x414074000},   {0x41c000000, 0x41c074000},
-    {0x490000000, 0x497060000},   {0x1cb0000000, 0x1cc0000000}, {0xbc0000000, 0xbe0000000},
-    {0xb80000000, 0xbc0000000},   {0xac0000000, 0xae0000000},   {0xa80000000, 0xac0000000},
-};
-/* The addresses on the bus of /arm-io are these much lower: made up, R21 did not print them */
-#define BUS_OFFSET 0x200000000UL
 
 /* ---- the device tree ---------------------------------------------------------------------- */
 
@@ -91,18 +77,27 @@ static u8 tree[ADT_SIZE], tree_before[ADT_SIZE];
 static int spare_entries;
 static u32 arm_io_cells;
 static bool with_ranges;
+/* A device the M4 does not have: where it is and its size, none if that is 0 */
+static u64 one_more_device[2];
 
+/* The ranges of /arm-io are those of R21 (r21_mmio of model.c) */
 static void make_tree(void)
 {
     u8 *p = tree;
     char name[32];
-    u64 ranges[COUNT(mmio)][3];
-    u64 uart_reg[2] = {UART_BASE - BUS_OFFSET, 0x4000};
+    u64 ranges[R21_MMIO_COUNT + 1][3];
+    u64 uart_reg[2] = {UART_BASE - R21_BUS_OFFSET, 0x4000};
+    unsigned n_ranges = R21_MMIO_COUNT;
 
-    for (unsigned i = 0; i < COUNT(mmio); i++) {
-        ranges[i][0] = mmio[i][0] - BUS_OFFSET;
-        ranges[i][1] = mmio[i][0];
-        ranges[i][2] = mmio[i][1] - mmio[i][0];
+    for (unsigned i = 0; i < R21_MMIO_COUNT; i++) {
+        ranges[i][0] = r21_mmio[i][0] - R21_BUS_OFFSET;
+        ranges[i][1] = r21_mmio[i][0];
+        ranges[i][2] = r21_mmio[i][1] - r21_mmio[i][0];
+    }
+    if (one_more_device[1]) {
+        ranges[n_ranges][0] = one_more_device[0] - R21_BUS_OFFSET;
+        ranges[n_ranges][1] = one_more_device[0];
+        ranges[n_ranges++][2] = one_more_device[1];
     }
 
     memset(tree, 0, sizeof(tree));
@@ -129,7 +124,7 @@ static void make_tree(void)
     p = put_prop(p, "#address-cells", &arm_io_cells, 4);
     p = put_prop(p, "#size-cells", &(u32){2}, 4);
     if (with_ranges)
-        p = put_prop(p, "ranges", ranges, sizeof(ranges));
+        p = put_prop(p, "ranges", ranges, n_ranges * sizeof(ranges[0]));
     p = put_node(p, 3, 0);
     p = put_name(p, "uart0");
     p = put_prop(p, "reg", uart_reg, sizeof(uart_reg));
@@ -429,6 +424,8 @@ static void reset(void)
     actlr_el12 = ACTLR_EL12_BEFORE;
 
     r21_ba(&cur_boot_args);
+    /* mmu_add_default_mappings() of src/memory.c */
+    ram_base = cur_boot_args.phys_base & ~0xffffffffUL;
     mem_size_actual = cur_boot_args.rv3.mem_size_actual;
     /* "Unmapping TZ carveouts..." of R21 */
     mcc_carveouts[0] = (struct mcc_carveout){0x103db610000, 0x103dd680000 - 0x103db610000};
@@ -439,6 +436,7 @@ static void reset(void)
     spare_entries = 3;
     arm_io_cells = 2;
     with_ranges = true;
+    one_more_device[0] = one_more_device[1] = 0;
     make_tree();
     make_files();
 
@@ -836,24 +834,27 @@ static void test_a_machine_that_will_not_do(void)
     spare_entries = 0;
     make_tree();
     check_not_started(selfboot_run(PART_UUID));
-}
 
-static void test_mappings_that_fail(void)
-{
-    /* /arm-io without ranges, and with addresses of three cells */
+    /*
+     * /arm-io without ranges, and with addresses of three cells: where the devices of the
+     * machine are is not known, and so not whether one is where the guest finds its GIC
+     */
     reset();
     with_ranges = false;
     make_tree();
-    check_not_entered(selfboot_run(PART_UUID));
+    check_not_started(selfboot_run(PART_UUID));
 
     reset();
     arm_io_cells = 3;
     make_tree();
-    check_not_entered(selfboot_run(PART_UUID));
+    check_not_started(selfboot_run(PART_UUID));
+}
 
+static void test_mappings_that_fail(void)
+{
     /* The first mapping, one in the middle, the last one of memory */
     for (unsigned i = 0; i < 3; i++) {
-        static const int at[] = {0, 11, COUNT(mmio) + 1};
+        static const int at[] = {0, 11, R21_MMIO_COUNT + 1};
 
         reset();
         map_hw_fails_at = at[i];
@@ -913,6 +914,69 @@ static void test_loaded_refuses(void)
     check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE + 0x800, 4));
 }
 
+/*
+ * The firmware is not entered on a machine that has something of its own where the guest
+ * finds the Distributor or the Redistributors of its GIC (src/hv/hv_layout.c, which has its
+ * own test in layout_test.c). It is found out before anything is set up for the guest.
+ */
+static void check_nothing_for_the_guest(const struct where *w)
+{
+    CHECK(all_bytes(w->phys_base, w->image, FILL));
+    CHECK(all_bytes(w->bootargs, w->disk, FILL));
+}
+
+static void test_a_machine_with_something_at_the_gic(void)
+{
+    struct where self = where(SELF_PHYS_BASE), host = where(R21_PHYS_BASE);
+
+    /* A device at the Distributor */
+    reset();
+    one_more_device[0] = 0x5000000000;
+    one_more_device[1] = 0x4000;
+    make_tree();
+    check_not_started(selfboot_run(PART_UUID));
+    check_nothing_for_the_guest(&self);
+
+    /* A device at the Redistributor of the last core there can be */
+    reset();
+    one_more_device[0] = 0x51003e0000;
+    one_more_device[1] = 0x20000;
+    make_tree();
+    check_not_started(selfboot_run(PART_UUID));
+    check_nothing_for_the_guest(&self);
+
+    /* Memory that reaches the Redistributors */
+    reset();
+    ram_base = 0x5000000000 + 0x100000000;
+    check_not_started(selfboot_run(PART_UUID));
+    check_nothing_for_the_guest(&self);
+
+    /* The same when a host has done the loading */
+    reset();
+    put_files(&host);
+    one_more_device[0] = 0x5000000000;
+    one_more_device[1] = 0x4000;
+    make_tree();
+    check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
+    check_nothing_for_the_guest(&host);
+
+    reset();
+    put_files(&host);
+    ram_base = 0x5000000000 - 0x100000000;
+    mem_size_actual = 0x100004000;
+    check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
+    check_nothing_for_the_guest(&host);
+
+    /* A device right after the Redistributors is in nobody's way, and is the guest's */
+    reset();
+    one_more_device[0] = 0x5100400000;
+    one_more_device[1] = 0x4000;
+    make_tree();
+    CHECK_EQ(selfboot_run(PART_UUID), 0);
+    CHECK_EQ(count(EV_HV_START), 1);
+    CHECK_EQ(count(EV_MAP_HW), R21_MMIO_COUNT + 1 + 2);
+}
+
 int main(void)
 {
     map_window(SELF_PHYS_BASE);
@@ -926,6 +990,7 @@ int main(void)
     test_mappings_that_fail();
     test_loaded_by_a_host();
     test_loaded_refuses();
+    test_a_machine_with_something_at_the_gic();
 
     printf("run_test: %d checks, %d failed\n", checks, failed);
     if (!failed)

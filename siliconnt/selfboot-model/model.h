@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * What the two model tests of this directory share: the checks, the device tree functions of
+ * What the model tests of this directory share: the checks, the device tree functions of
  * src/adt.h over a device tree that a test makes (model.c), and the M4 as it was in R21.
  */
 
@@ -57,5 +57,11 @@ u8 *put_range(u8 *p, const char *name, u64 base, u64 size);
 
 /* The boot arguments m1n1 had there */
 void r21_ba(struct boot_args *out);
+
+/* "Mapping MMIO range" there: the ranges of /arm-io, as addresses of the CPU, start and end */
+#define R21_MMIO_COUNT 27
+extern const u64 r21_mmio[R21_MMIO_COUNT][2];
+/* The addresses on the bus of /arm-io are these much lower: made up, R21 did not print them */
+#define R21_BUS_OFFSET 0x200000000UL
 
 #endif

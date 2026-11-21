@@ -241,6 +241,11 @@ void hv_start(void *entry, u64 regs[4])
         return;
     }
 
+    if (!hv_vgic_ranges_free()) {
+        printf("HV: the guest would not find its GIC; can't start the hypervisor\n");
+        return;
+    }
+
     if (!hv_cpu_power_init()) {
         printf("HV: CPU power protection hooks failed; can't start the hypervisor\n");
         return;

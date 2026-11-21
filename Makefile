@@ -132,6 +132,7 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 	hv_asm.o \
 	hv_dbg.o \
 	hv_exc.o \
+	hv_layout.o \
 	hv_pmu.o \
 	hv_psci.o \
 	hv_sprr.o \
