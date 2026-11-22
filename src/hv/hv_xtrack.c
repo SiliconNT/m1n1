@@ -2,81 +2,107 @@
 
 /*
  * Execution tracking: every page of the guest's memory is scanned before code in it runs, and
- * what is replaced in it is kept from the guest's eyes.
+ * the core executes a copy of it in which what had to be replaced is replaced.
  *
  * hv_pmu.c replaces the instructions of the guest that the core cannot execute. The guest is
  * Windows with a UEFI firmware in front of it: it loads its own boot manager, loader, kernel
  * and drivers, each stage the next, and nothing tells EL2 when code has arrived somewhere.
  * And Windows reads its code as data: constants that the compiler put between functions, and
  * checksums of its kernel that it takes again later and stops (bug check 0x109) when they
- * differ. So the second stage of translation is made to tell when code runs, and to keep
- * what was replaced out of every read. The rule: what the guest reads from memory as data is
- * what it wrote there. Only the core, fetching instructions, sees what was replaced.
+ * differ. Devices read it too: pages of code go out to the paging file and come back, and are
+ * checked when they do. So the second stage of translation is made to tell when code runs,
+ * and what is replaced is never put into the guest's memory. The rule: the guest's memory
+ * holds what the guest, or a device, wrote there, and that is what every reader gets, the
+ * guest reading it as data, a device, the host. Only the core, fetching instructions, sees
+ * what was replaced.
  *
- * A page of memory is in one of three states (hv_pt_scanned(), hv_pt_set_scanned()):
+ * A page of memory (the guest's page, below) is in one of three states (hv_pt_scanned(),
+ * hv_pt_set_scanned()):
  *
- *   HV_XPAGE_UNSCANNED  data: read and written, not executed. What the guest wrote.
- *   HV_XPAGE_SCANNED    code with nothing replaced: read and executed, not written. What the
- *                       guest wrote.
+ *   HV_XPAGE_UNSCANNED  data: read and written, not executed. Stage 2 points to the guest's
+ *                       page.
+ *   HV_XPAGE_SCANNED    code with nothing to replace: read and executed, not written. Stage 2
+ *                       points to the guest's page.
  *   HV_XPAGE_XONLY      code with instructions replaced: executed, and neither read nor
- *                       written. For such a page there is a record here of which of its 1024
- *                       words were replaced. What they were is not kept: it can be had back
- *                       from what they are now (hv_pmu_original_word()).
+ *                       written. Stage 2 points to a shadow page of this file: a copy of the
+ *                       guest's page with the accesses replaced. A record here says which
+ *                       shadow page, and where the guest's page is.
+ *
+ * Every word of a shadow page is the word of the guest's page at the same place, replaced if
+ * it is an access, and as it is if not (xt_shadow_word()). Nothing else is kept of what was
+ * replaced: it is that word of the guest's page.
  *
  * All memory starts out as data (hv_pt_xtrack()). From there:
  *
  *  - The first instruction fetched from a page of data is a stage 2 permission fault, an
- *    Instruction Abort (hv_xtrack_iabort()). The page is scanned, the instructions in question
- *    are replaced and recorded, and the page becomes code of the one kind or the other.
+ *    Instruction Abort (hv_xtrack_iabort()). The guest's page is scanned. With an access in it,
+ *    a shadow page is made from it and the page becomes execute-only; without, it becomes code
+ *    with nothing to replace.
  *  - A read of an execute-only page is a Data Abort (hv_xtrack_dabort()) and is carried out
- *    here: the guest gets the bytes of the page with every recorded word put back to what it
- *    was. Where ESR_EL2 describes the access (a load of one general-purpose register without
- *    writeback) and all of it is in the page, that is all there is to it. Otherwise the
- *    instruction is read and taken apart (hv_xinsn.c); an access across two pages is carried
- *    out page by page.
+ *    here, from the guest's page. Where ESR_EL2 describes the access (a load of one
+ *    general-purpose register without writeback) and all of it is in the page, that is all
+ *    there is to it. Otherwise the instruction is read (from the copy that the core executes)
+ *    and taken apart (hv_xinsn.c); an access across two pages is carried out page by page.
  *  - A store into a page of code from an instruction in another page: the page becomes data
- *    again, with every recorded word put back first, and the guest stores again. When code in
- *    it next runs, it is scanned again.
+ *    again, its shadow page given back, and the guest stores again. When code in it next runs,
+ *    it is scanned again.
  *  - A store into a page of code from an instruction in that very page (code and writable
  *    data that share a page) cannot go that way: the store needs the page writable and the
- *    instruction that stores needs it executable. It is carried out here, and only the words
- *    that it wrote to are looked at afterwards: a word that is now an access is replaced and
- *    recorded, a recorded word that is no longer one is released. The atomic operations and
- *    CAS are carried out the same way, which is atomic because this runs with the hypervisor
- *    lock held and every other access to such a page comes here or reads what a single store
- *    left.
+ *    instruction that stores needs it executable. It is carried out here, into the guest's
+ *    page, and the words that it wrote to are made again in the shadow page. A page of code
+ *    with nothing replaced that gets an access this way gets a shadow page too; one that has a
+ *    shadow page keeps it until it becomes data, whatever is written. The atomic operations
+ *    and CAS are carried out the same way, which is atomic because this runs with the
+ *    hypervisor lock held and every other access to such a page comes here or reads what a
+ *    single store left.
  *  - An instruction that hv_xinsn.c does not take: if it is in another page, the page it
  *    accesses becomes data and the guest executes it again. If it is in the page it accesses,
  *    there is no way, and the guest is stopped with a line that says which instruction.
  *  - DC IVAC on a page of code faults because it asks for write permission (Arm DDI 0487 M.d,
- *    D7.5.9.2). DC CIVAC on the same line is carried out for it: with stage 2 on, that is
- *    what the guest's DC IVAC does anyway (same section).
+ *    D7.5.9.2). The page becomes data, DC CIVAC of the same line of the guest's page is carried
+ *    out for it (with stage 2 on, that is what the guest's DC IVAC does anyway, same section),
+ *    and the guest goes on behind it. Windows does DC IVAC on a buffer before and after a
+ *    device that is not cache coherent writes into it (DMA). That is how a page of code learns
+ *    that a device has written into the guest's page: once is enough, before or after.
  *
- * Between data and code a page is nobody's (HV_XPAGE_NONE, and the TLBs of all cores told)
- * while its words are changed: no core executes an access that is not replaced yet, and none
- * reads a page that is half done.
+ * A page goes from one state to another through an invalid entry, with the TLBs of all cores
+ * told (hv_pt_set_scanned()): no core executes an access that is not replaced yet, or a shadow
+ * page that is not done or out of date. A core that faults on the page in between finds it
+ * done when it gets the lock, and goes on.
  *
- * The guest is also stopped when there is no room for another record, when a walk of its own
- * stage 1 tables is refused by stage 2 (then one of those tables is in a page of code; which
- * one is not looked for), and when its stage 1 does not translate an address that is needed
- * to carry an access out. It is never left to go on with a replaced word where it can
- * read it.
+ * Caches. A shadow page is cleaned to the point of coherency, and the instruction caches of
+ * all cores are dropped, before stage 2 points to it: a core that fetches with its MMU off
+ * (the firmware before it turns its own on, a core that comes up through CPU_ON) reads memory.
+ * What the guest does to the caches by address lands on the shadow page while the page is
+ * execute-only, and not on the guest's page. So the guest's page is kept clean to the point of
+ * coherency here, for the devices that read memory: all of it when the page becomes
+ * execute-only, and the lines that this file stores into after that. When a page stops being
+ * execute-only, the instruction caches are dropped once more: the guest's page may be executed
+ * again, and lines of it from before may still be there.
  *
- * What gets past this: memory written from outside the guest's stage 2 mappings while it is
- * executable. That is the host of the hypervisor writing to guest memory, and devices doing
- * DMA. A recorded word that such a write has changed is given to the guest as it is now.
+ * What gets past this: memory written from outside the guest's stage 2 mappings (a device, the
+ * host) into an execute-only page with no DC IVAC after it. The core goes on executing the
+ * shadow page as it was. When this file next reads or writes a word of such a page for the
+ * guest, it finds that the shadow page does not have that word made from the guest's word:
+ * the page becomes data, a line is printed and it is counted. A page of code with nothing
+ * replaced executes what was written, as it is.
+ *
+ * The guest is also stopped when there is no shadow page left for a page that needs one, when
+ * a walk of its own stage 1 tables is refused by stage 2 (then one of those tables is in a
+ * page of code; which one is not looked for), and when its stage 1 does not translate an
+ * address that is needed to carry an access out.
  *
  * Device registers are not memory here: a guest that executes from them is stopped
  * (hv_pt_scanned() knows nothing below the start of RAM).
  *
  * Everything here runs with the hypervisor lock held. The stage 2 tables are shared by all
- * cores, and a change of permissions is followed by a TLB invalidation on all of them
- * (hv_pt_set_scanned()), so a core that faults on a page another core has just dealt with
- * finds it done and simply goes on.
+ * cores, and every change of an entry is followed by a TLB invalidation on all of them
+ * (hv_pt_set_scanned()).
  */
 
 #include "hv.h"
 #include "cpu_regs.h"
+#include "malloc.h"
 #include "memory.h"
 #include "smp.h"
 #include "utils.h"
@@ -85,38 +111,54 @@
 #define XT_PAGE  0x1000UL
 #define XT_WORDS (XT_PAGE / 4)
 
+/* The lines that cache maintenance by address goes by, as memory.c has them */
+#define XT_LINE 64UL
+
 /* The most bytes that one instruction of hv_xinsn.c accesses: DC ZVA of a 64-byte block */
 #define XT_MAX_ACCESS 64
 
 /*
  * ESR_ELx.ISS of an abort (Arm DDI 0487 M.d, D24.2.45): the fault status code is in bits 5:0,
- * 0b0011xx is a permission fault
+ * 0b0011xx is a permission fault and 0b0001xx a translation fault
  */
-#define ISS_FSC     GENMASK(5, 0)
-#define FSC_PERM(x) (((x) & 0x3c) == 0x0c)
-#define ISS_S1PTW   BIT(7)
-#define ISS_ISV     BIT(24)
-#define ISS_SAS     GENMASK(23, 22)
-#define ISS_SSE     BIT(21)
-#define ISS_SRT     GENMASK(20, 16)
-#define ISS_SF      BIT(15)
+#define ISS_FSC      GENMASK(5, 0)
+#define FSC_PERM(x)  (((x) & 0x3c) == 0x0c)
+#define FSC_TRANS(x) (((x) & 0x3c) == 0x04)
+#define ISS_S1PTW    BIT(7)
+#define ISS_ISV      BIT(24)
+#define ISS_SAS      GENMASK(23, 22)
+#define ISS_SSE      BIT(21)
+#define ISS_SRT      GENMASK(20, 16)
+#define ISS_SF       BIT(15)
 
 #define DC_IVAC 0xd5087620 // dc ivac, x0
 
 /* How often a core may fault on the same page that is executable already before it is stopped */
 #define XTRACK_MAX_REPEATS 16
 
-/* Pages with replaced instructions that there is room to record: a power of two */
+/*
+ * Pages with replaced instructions that there can be at one time: a record and a shadow page
+ * for each, so both run out together. A power of two
+ */
 #ifndef XT_MAX_PAGES
 #define XT_MAX_PAGES 8192
 #endif
 
-/* By IPA of the page; page == 0 is a free entry. A bit of map for each word of the page */
+/* By IPA of the page; page == 0 is a free entry */
 static struct xt_rec {
-    u64 page;
-    u64 map[XT_WORDS / 64];
+    u64 page;   // the IPA
+    u64 orig;   // the guest's page, where stage 2 points in the other states
+    u32 shadow; // the shadow page, by number in xt_pool
 } xt_recs[XT_MAX_PAGES];
 static u32 xt_nr_recs;
+
+/*
+ * The shadow pages, taken from the heap of m1n1 once (hv_xtrack_start()), and the numbers of
+ * those that are free
+ */
+static u8 *xt_pool;
+static u32 xt_free[XT_MAX_PAGES];
+static u32 xt_nr_free;
 
 /* The instructions that were taken apart here, by where the guest has them */
 #define XT_MAX_PCS 1024
@@ -137,25 +179,25 @@ static struct xt_pc {
 } xt_pcs[XT_MAX_PCS];
 
 static struct {
-    u64 scans;     // instruction aborts that scanned a page
-    u64 scans_el0; // ...of which came from EL0
-    u64 hits;      // ...and of which found something to replace
-    u64 done;      // instruction aborts on a page that was executable already
-    u64 ticks;     // time spent scanning, in timer ticks
-    u64 longest;
-    u64 recs_max;     // most pages with replaced instructions at one time
+    u64 scans;        // instruction aborts that scanned a page
+    u64 scans_el0;    // ...of which came from EL0
+    u64 hits;         // ...and of which found something to replace
+    u64 done;         // instruction aborts on a page that was executable already, or in between
+    u64 ticks;        // time spent scanning, in timer ticks
+    u64 longest;      //
+    u64 shadows_max;  // most shadow pages in use at one time
     u64 to_data;      // pages of code that became data again
     u64 to_data_read; // ...for an instruction elsewhere that is not taken apart here
+    u64 ivac;         // ...for DC IVAC
+    u64 stale;        // ...because their shadow page was found out of date
     u64 reads_syn;    // reads carried out from what ESR_EL2 says
     u64 reads_el0;    // ...of which came from EL0
     u64 writes_syn;   // stores into the instruction's own page, likewise
     u64 reads_insn;   // reads carried out from the instruction
     u64 writes_insn;  // stores into the instruction's own page, likewise
     u64 atomics;      // ...of which were atomic operations
-    u64 rerecorded;   // stores that changed which words of a page are replaced
-    u64 ivac;         // DC IVAC on a page of code
+    u64 rerecorded;   // stores that changed which words of a page are accesses
     u64 insn_ticks;   // time spent on what was taken apart
-    u64 stale;        // recorded words found changed by somebody else
     u64 pcs_lost;     // instructions that xt_pcs had no room for
     u64 stops;
 } xt_stats;
@@ -165,11 +207,23 @@ static struct {
     u32 repeats;
 } xtrack_last[MAX_CPUS];
 
+/* Every shadow page is free */
+static void xt_free_all(void)
+{
+    for (u32 i = 0; i < XT_MAX_PAGES; i++)
+        xt_free[i] = XT_MAX_PAGES - 1 - i;
+    xt_nr_free = XT_MAX_PAGES;
+}
+
 void hv_xtrack_init(void)
 {
     for (u32 i = 0; i < XT_MAX_PAGES; i++)
         xt_recs[i].page = 0;
     xt_nr_recs = 0;
+    /* No guest runs now: the shadow pages, if there are any yet, are all free */
+    xt_nr_free = 0;
+    if (xt_pool)
+        xt_free_all();
     for (u32 i = 0; i < XT_MAX_PCS; i++)
         xt_pcs[i].count = 0;
 
@@ -179,9 +233,11 @@ void hv_xtrack_init(void)
     xt_stats.done = 0;
     xt_stats.ticks = 0;
     xt_stats.longest = 0;
-    xt_stats.recs_max = 0;
+    xt_stats.shadows_max = 0;
     xt_stats.to_data = 0;
     xt_stats.to_data_read = 0;
+    xt_stats.ivac = 0;
+    xt_stats.stale = 0;
     xt_stats.reads_syn = 0;
     xt_stats.reads_el0 = 0;
     xt_stats.writes_syn = 0;
@@ -189,9 +245,7 @@ void hv_xtrack_init(void)
     xt_stats.writes_insn = 0;
     xt_stats.atomics = 0;
     xt_stats.rerecorded = 0;
-    xt_stats.ivac = 0;
     xt_stats.insn_ticks = 0;
-    xt_stats.stale = 0;
     xt_stats.pcs_lost = 0;
     xt_stats.stops = 0;
 
@@ -201,7 +255,27 @@ void hv_xtrack_init(void)
     }
 }
 
-/* ---- the record of which words of a page were replaced ---- */
+/*
+ * Execution tracking is about to start (hv_pt_xtrack()): all the shadow pages there can be,
+ * now, before there is a guest to stop for want of one. They are kept for as long as m1n1
+ * runs. Returns -1 if there is no room for them; memalign() of m1n1 stops m1n1 itself when
+ * the heap runs out, so on m1n1 that is where it ends.
+ */
+int hv_xtrack_start(void)
+{
+    if (!xt_pool) {
+        xt_pool = memalign(XT_PAGE, XT_MAX_PAGES * XT_PAGE);
+        if (!xt_pool) {
+            printf("HV: execution tracking: no room for %d shadow pages\n", XT_MAX_PAGES);
+            return -1;
+        }
+        xt_free_all();
+    }
+    printf("HV: execution tracking: %d shadow pages at %p\n", XT_MAX_PAGES, xt_pool);
+    return 0;
+}
+
+/* ---- the records of the pages with a shadow page ---- */
 
 static u32 xt_hash(u64 key)
 {
@@ -221,28 +295,33 @@ static struct xt_rec *xt_find(u64 page)
     return NULL;
 }
 
-/* A record for a page that has none, with no word marked; NULL if there is no room */
-static struct xt_rec *xt_add(u64 page)
+/* A record and a shadow page for a page that has none; NULL if there is no room */
+static struct xt_rec *xt_add(u64 page, u64 orig)
 {
     u32 i = xt_hash(page >> 12);
 
-    if (xt_nr_recs == XT_MAX_PAGES)
+    if (xt_nr_recs == XT_MAX_PAGES || !xt_nr_free)
         return NULL;
     while (xt_recs[i].page)
         i = (i + 1) & (XT_MAX_PAGES - 1);
 
     xt_recs[i].page = page;
-    for (u32 n = 0; n < XT_WORDS / 64; n++)
-        xt_recs[i].map[n] = 0;
-    if (++xt_nr_recs > xt_stats.recs_max)
-        xt_stats.recs_max = xt_nr_recs;
+    xt_recs[i].orig = orig;
+    xt_recs[i].shadow = xt_free[--xt_nr_free];
+    if (++xt_nr_recs > xt_stats.shadows_max)
+        xt_stats.shadows_max = xt_nr_recs;
     return &xt_recs[i];
 }
 
-/* Records move when one is deleted: no pointer to one is good afterwards */
+/*
+ * The record goes, and its shadow page is free again. Records move when one is deleted: no
+ * pointer to one is good afterwards
+ */
 static void xt_del(struct xt_rec *r)
 {
     u32 i = r - xt_recs, j = i;
+
+    xt_free[xt_nr_free++] = r->shadow;
 
     /* Close the gap, so that a search that stops at a free entry has missed nothing */
     for (u32 n = 1; n < XT_MAX_PAGES; n++) {
@@ -262,61 +341,56 @@ static void xt_del(struct xt_rec *r)
     xt_nr_recs--;
 }
 
-static bool xt_marked(const struct xt_rec *r, u32 i)
+static u32 *xt_shadow(const struct xt_rec *r)
 {
-    return r->map[i / 64] & BIT(i % 64);
+    return (u32 *)(xt_pool + (u64)r->shadow * XT_PAGE);
 }
 
-static bool xt_empty(const struct xt_rec *r)
+/* What a word of the guest's page is in the shadow page */
+static u32 xt_shadow_word(u32 word)
 {
-    for (u32 n = 0; n < XT_WORDS / 64; n++)
-        if (r->map[n])
-            return false;
-    return true;
+    return hv_pmu_is_access(word) ? hv_pmu_patch_word(word) : word;
 }
 
 /*
- * Word i of the page at pa as the guest wrote it: the word, or what it was before it was
- * replaced. A recorded word that is not what an access becomes was written by somebody who
- * does not come through stage 2: it is the guest's as it is, and no longer recorded.
+ * The guest's page of a page in this state whose entry points to pa: pa, but for an
+ * execute-only page, whose entry points to its shadow page. 0 if there is no record of it.
  */
-static u32 xt_view(struct xt_rec *r, u64 pa, u32 i)
+static u64 xt_orig(u64 page, int state, u64 pa)
 {
-    u32 word = ((u32 *)pa)[i];
+    if (state != HV_XPAGE_XONLY)
+        return pa;
 
-    if (!r || !xt_marked(r, i))
-        return word;
-
-    u32 orig = hv_pmu_original_word(word);
-
-    if (orig)
-        return orig;
-    r->map[i / 64] &= ~BIT(i % 64);
-    xt_stats.stale++;
-    return word;
-}
-
-/* A page with a record and nothing recorded in it any more is code with nothing replaced */
-static void xt_settle(u64 page)
-{
     struct xt_rec *r = xt_find(page);
 
-    if (!r || !xt_empty(r))
-        return;
-    xt_del(r);
-    hv_pt_set_scanned(page, HV_XPAGE_SCANNED);
+    return r ? r->orig : 0;
 }
 
-/* len bytes at off of the page at this IPA and pa, as the guest wrote them */
-static void xt_read(u64 page, u64 pa, u32 off, u32 len, u8 *buf)
-{
-    struct xt_rec *r = xt_find(page);
-    u64 stale = xt_stats.stale;
+/* ---- memory and caches ---- */
 
-    for (u32 n = 0; n < len; n++, off++)
-        buf[n] = xt_view(r, pa, off / 4) >> (8 * (off % 4));
-    if (xt_stats.stale != stale)
-        xt_settle(page);
+/* Clean the lines that hold these bytes to the point of coherency. memory.c steps from addr */
+static void xt_clean(u64 addr, u64 len)
+{
+    u64 start = addr & ~(XT_LINE - 1);
+
+    dc_cvac_range((void *)start, addr + len - start);
+    sysop("dsb sy");
+}
+
+/* Drop every instruction cache entry on every core */
+static void xt_drop_icache(void)
+{
+    sysop("dsb ish");
+    ic_ialluis();
+    sysop("dsb ish");
+    sysop("isb");
+}
+
+/* len bytes at off of the guest's page at orig */
+static void xt_read(u64 orig, u32 off, u32 len, u8 *buf)
+{
+    for (u32 n = 0; n < len; n++)
+        buf[n] = ((volatile u8 *)orig)[off + n];
 }
 
 /* A store as the guest would have done it: in one piece where the architecture has it so */
@@ -345,38 +419,115 @@ static void xt_put(u64 pa, const u8 *buf, u32 len)
     }
 }
 
-static void xt_sync_code(void *addr, u64 size)
+/*
+ * Make the shadow page of r from the guest's page, and clean both to the point of coherency;
+ * the instruction caches of all cores are dropped after. Stage 2 may point to it then.
+ */
+static void xt_make_shadow(struct xt_rec *r)
 {
-    /*
-     * The guest may have executed these words before, through any address. Clean them to the
-     * point of coherency and drop every instruction cache entry on every core.
-     */
-    dc_cvau_range(addr, size);
-    sysop("dsb ish");
-    ic_ialluis();
-    sysop("dsb ish");
-    sysop("isb");
+    u32 *shadow = xt_shadow(r);
+
+    hv_pmu_patch_range((const u32 *)r->orig, shadow, XT_WORDS);
+    xt_clean((u64)shadow, XT_PAGE);
+    xt_clean(r->orig, XT_PAGE);
+    xt_drop_icache();
+}
+
+/* ---- the states ---- */
+
+/*
+ * A page of code becomes data: stage 2 points to the guest's page at orig, and its shadow page,
+ * if it has one, is given back
+ */
+static int xt_to_data(u64 page, u64 orig)
+{
+    if (hv_pt_set_scanned(page, HV_XPAGE_INVALID, 0) < 0)
+        return -1;
+
+    struct xt_rec *r = xt_find(page);
+
+    if (r) {
+        xt_del(r);
+        /* The guest's page may be executed again, and lines of it from before be in the caches */
+        xt_drop_icache();
+    }
+
+    xt_stats.to_data++;
+    return hv_pt_set_scanned(page, HV_XPAGE_UNSCANNED, orig);
 }
 
 /*
- * The guest writes len bytes at off into a page of code, at this IPA and pa, that stays code:
- * the store of an instruction that is in the page. The words written to are what the guest
- * says, but for those that are accesses now, which are replaced and recorded. Returns -1,
- * with nothing written, if there is no room for the record that this needs.
+ * A page of data at orig becomes code: scanned, and given a shadow page if there is an access
+ * in it. Returns the state it is in now, or -1 if it is data still: no shadow page left.
  */
-static int xt_write(u64 page, u64 pa, u32 off, u32 len, const u8 *buf)
+static int xt_to_code(u64 page, u64 orig)
+{
+    if (hv_pt_set_scanned(page, HV_XPAGE_INVALID, 0) < 0)
+        return -1;
+
+    if (!hv_pmu_count_accesses((const u32 *)orig, XT_WORDS))
+        return hv_pt_set_scanned(page, HV_XPAGE_SCANNED, orig) < 0 ? -1 : HV_XPAGE_SCANNED;
+
+    struct xt_rec *r = xt_add(page, orig);
+
+    if (!r) {
+        hv_pt_set_scanned(page, HV_XPAGE_UNSCANNED, orig);
+        return -1;
+    }
+    xt_make_shadow(r);
+    if (hv_pt_set_scanned(page, HV_XPAGE_XONLY, (u64)xt_shadow(r)) < 0)
+        return -1;
+    return HV_XPAGE_XONLY;
+}
+
+/*
+ * Bytes off to off + len of the page at this IPA are about to be read or written for the
+ * guest. If the page is execute-only, are the words that they are in what the guest's page
+ * has there, made into shadow words? If not, the guest's page has been written from outside
+ * stage 2 with no DC IVAC after it, and the core has been executing what was there before:
+ * the page becomes data, which is what it is. Returns 0 if the page is as it was, 1 if it has
+ * become data, -1 if it could not be made data.
+ */
+static int xt_check(u64 page, u32 off, u32 len)
 {
     struct xt_rec *r = xt_find(page);
-    u32 *words = (u32 *)pa;
+
+    if (!r)
+        return 0;
+
+    const u32 *words = (const u32 *)r->orig, *shadow = xt_shadow(r);
+    u64 orig = r->orig;
+
+    for (u32 i = off / 4; i <= (off + len - 1) / 4; i++) {
+        if (shadow[i] == xt_shadow_word(words[i]))
+            continue;
+        printf("HV: execution tracking: the page at IPA 0x%lx was written from outside with no "
+               "DC IVAC: its shadow page was out of date, and it is data now\n",
+               page);
+        xt_stats.stale++;
+        return xt_to_data(page, orig) < 0 ? -1 : 1;
+    }
+    return 0;
+}
+
+/*
+ * The guest writes len bytes at off into a page of code at this IPA, whose guest's page is at
+ * orig, and which stays code: the store of an instruction that is in the page. Returns -1,
+ * with nothing written, if the page needs a shadow page now and there is none left.
+ */
+static int xt_write(u64 page, u64 orig, u32 off, u32 len, const u8 *buf)
+{
+    struct xt_rec *r = xt_find(page);
+    const u32 *words = (const u32 *)orig;
     u32 first = off / 4;
     u32 nr = (off + len + 3) / 4 - first;
-    u32 raw[XT_MAX_ACCESS / 4 + 1];
-    u64 is_now = 0, was = 0;
+    u64 was = 0, is_now = 0;
 
+    /* Which of the words written to are accesses, before the store and after it */
     for (u32 n = 0; n < nr; n++) {
-        u32 word = xt_view(r, pa, first + n);
+        u32 word = words[first + n];
 
-        if (r && xt_marked(r, first + n))
+        if (hv_pmu_is_access(word))
             was |= BIT(n);
         for (u32 b = 0; b < 4; b++) {
             u32 at = 4 * (first + n) + b;
@@ -384,104 +535,46 @@ static int xt_write(u64 page, u64 pa, u32 off, u32 len, const u8 *buf)
             if (at >= off && at < off + len)
                 word = (word & ~(0xffU << (8 * b))) | ((u32)buf[at - off] << (8 * b));
         }
-        if (hv_pmu_is_access(word)) {
+        if (hv_pmu_is_access(word))
             is_now |= BIT(n);
-            word = hv_pmu_patch_word(word);
-        }
-        raw[n] = word;
     }
-
-    /* Nothing replaced before or after: the bytes go in as the guest's store would put them */
-    if (!is_now && !was) {
-        xt_put(pa + off, buf, len);
-        if (r)
-            xt_settle(page);
-        return 0;
-    }
-
-    if (is_now && !r) {
-        r = xt_add(page);
-        if (!r)
-            return -1;
-        /* Not to be read from the moment that a replaced word is in it */
-        if (hv_pt_set_scanned(page, HV_XPAGE_XONLY) < 0) {
-            xt_del(r);
-            return -1;
-        }
-    }
-
-    for (u32 n = 0; n < nr; n++) {
-        u32 i = first + n;
-
-        if (words[i] != raw[n])
-            *(volatile u32 *)&words[i] = raw[n];
-        if (is_now & BIT(n))
-            r->map[i / 64] |= BIT(i % 64);
-        else
-            r->map[i / 64] &= ~BIT(i % 64);
-    }
-    if (is_now)
-        xt_sync_code(&words[first], 4 * nr);
     if (is_now != was)
         xt_stats.rerecorded++;
 
-    /* ...and to be read again when the last one is gone */
-    xt_settle(page);
-    return 0;
-}
-
-/* A page of code becomes data: as the guest wrote it, every replaced word put back */
-static int xt_to_data(u64 page, u64 pa)
-{
-    if (hv_pt_set_scanned(page, HV_XPAGE_NONE) < 0)
-        return -1;
-
-    struct xt_rec *r = xt_find(page);
-
-    if (r) {
-        u32 *words = (u32 *)pa;
-
-        for (u32 i = 0; i < XT_WORDS; i++) {
-            if (!r->map[i / 64]) {
-                i |= 63;
-                continue;
-            }
-            if (xt_marked(r, i))
-                words[i] = xt_view(r, pa, i);
-        }
-        xt_del(r);
+    /* Code with nothing replaced that stays so: the guest's page is what the core executes */
+    if (!r && !is_now) {
+        xt_put(orig + off, buf, len);
+        return 0;
     }
 
-    xt_stats.to_data++;
-    return hv_pt_set_scanned(page, HV_XPAGE_UNSCANNED);
-}
-
-/*
- * A page of data becomes code: scanned, what has to be replaced in it replaced and recorded.
- * Returns the state it is in now, or -1 if it is data still: no room for the record.
- */
-static int xt_to_code(u64 page, u64 pa)
-{
-    int state = HV_XPAGE_SCANNED;
-
-    if (hv_pt_set_scanned(page, HV_XPAGE_NONE) < 0)
-        return -1;
-
-    if (hv_pmu_count_accesses((u32 *)pa, XT_WORDS)) {
-        struct xt_rec *r = xt_add(page);
-
+    /* ...that gets its first access: execute-only, with a shadow page made after the store */
+    if (!r) {
+        if (hv_pt_set_scanned(page, HV_XPAGE_INVALID, 0) < 0)
+            return -1;
+        r = xt_add(page, orig);
         if (!r) {
-            hv_pt_set_scanned(page, HV_XPAGE_UNSCANNED);
+            hv_pt_set_scanned(page, HV_XPAGE_SCANNED, orig);
             return -1;
         }
-        hv_pmu_patch_range((u32 *)pa, XT_WORDS, r->map);
-        xt_sync_code((void *)pa, XT_PAGE);
-        state = HV_XPAGE_XONLY;
+        xt_put(orig + off, buf, len);
+        xt_make_shadow(r);
+        return hv_pt_set_scanned(page, HV_XPAGE_XONLY, (u64)xt_shadow(r));
     }
 
-    if (hv_pt_set_scanned(page, state) < 0)
-        return -1;
-    return state;
+    /* Execute-only: the store into the guest's page, kept clean; the words in the shadow page */
+    u32 *shadow = xt_shadow(r);
+
+    xt_put(orig + off, buf, len);
+    xt_clean(orig + off, len);
+    for (u32 i = first; i < first + nr; i++) {
+        u32 word = xt_shadow_word(words[i]);
+
+        if (shadow[i] != word)
+            *(volatile u32 *)&shadow[i] = word;
+    }
+    xt_clean((u64)&shadow[first], 4 * nr);
+    xt_drop_icache();
+    return 0;
 }
 
 /* ---- instruction aborts ---- */
@@ -501,7 +594,14 @@ bool hv_xtrack_iabort(struct exc_info *ctx)
         return false;
     }
 
-    if (!FSC_PERM(esr & ISS_FSC) || (esr & ISS_S1PTW)) {
+    /*
+     * A permission fault on the page of the instruction, or a translation fault anywhere: a
+     * page that was on its way from one state to another, through an invalid entry. The page
+     * may be the one of the instruction or one of the guest's stage 1 tables (S1PTW).
+     */
+    bool trans = FSC_TRANS(esr & ISS_FSC);
+
+    if (!trans && (!FSC_PERM(esr & ISS_FSC) || (esr & ISS_S1PTW))) {
         printf("HV: instruction abort at 0x%lx that is not a stage 2 permission fault (ESR "
                "0x%lx)\n",
                far, esr);
@@ -523,8 +623,11 @@ bool hv_xtrack_iabort(struct exc_info *ctx)
         return false;
     }
 
-    if (state != HV_XPAGE_UNSCANNED) {
-        /* Another core got there first, or this one faulted on what was left in its TLB */
+    if (trans || state != HV_XPAGE_UNSCANNED) {
+        /*
+         * Another core got there first, or this one faulted on what was left in its TLB, or
+         * on an entry that was invalid for the moment
+         */
         if (xtrack_last[ctx->cpu_id].page == page) {
             if (++xtrack_last[ctx->cpu_id].repeats > XTRACK_MAX_REPEATS) {
                 printf("HV: instruction abort at 0x%lx (IPA 0x%lx, ESR 0x%lx) again and again "
@@ -545,7 +648,7 @@ bool hv_xtrack_iabort(struct exc_info *ctx)
     state = xt_to_code(page, pa);
     if (state < 0) {
         printf("HV: execution tracking stops the guest: it executes 0x%lx (IPA 0x%lx), a page "
-               "with instructions to replace, and there is room to record %d such pages\n",
+               "with instructions to replace, and all %d shadow pages are in use\n",
                far, ipa, XT_MAX_PAGES);
         xt_stats.stops++;
         return false;
@@ -623,7 +726,8 @@ union xt_simd {
 /*
  * Carry out the instruction d, which is in the page pc_page, has faulted on stage 2 and is
  * one that reads an execute-only page or writes to the page it is in. Returns
- * HV_XTRACK_SKIP, or HV_XTRACK_STOP with nothing changed.
+ * HV_XTRACK_SKIP; HV_XTRACK_RETRY when it writes to a page whose shadow page was out of date,
+ * which is data now; or HV_XTRACK_STOP. Nothing else is changed for the last two.
  */
 static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u64 ipa, u64 pc_page,
                     u32 *flags)
@@ -650,10 +754,11 @@ static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u6
     if (((hv_get_far() - va) & MASK(56)) >= len)
         return xt_stop(ctx, ipa, insn, "the instruction does not access the address that faulted");
 
-    /* The page that each part of the access is in: two at most */
+    /* The page that each part of the access is in, two at most, and the guest's page of it */
     struct {
         u64 page;
-        u64 pa;
+        u64 orig;
+        int state;
         u32 off;
         u32 len;
     } part[2];
@@ -666,17 +771,34 @@ static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u6
         if (!at)
             return xt_stop(ctx, ipa, insn,
                            "the guest's stage 1 does not translate part of the access");
-        if (hv_pt_scanned(at, &pa) < 0)
+        part[parts].state = hv_pt_scanned(at, &pa);
+        if (part[parts].state < 0)
             return xt_stop(ctx, ipa, insn, "part of the access is not in memory");
 
         part[parts].page = at & ~(XT_PAGE - 1);
-        part[parts].pa = pa;
+        part[parts].orig = xt_orig(part[parts].page, part[parts].state, pa);
+        if (!part[parts].orig)
+            return xt_stop(ctx, ipa, insn, "an execute-only page has no record");
         part[parts].off = at & (XT_PAGE - 1);
         part[parts].len = min(len - done, XT_PAGE - part[parts].off);
         done += part[parts].len;
     }
     if (parts == 2)
         *flags |= XT_PC_TWO_PAGES;
+
+    /*
+     * The shadow pages of what it accesses: one out of date makes its page data. A store then
+     * goes again, so that it finds the page as it is now; a load reads the guest's page here
+     * all the same, which is right.
+     */
+    for (u32 i = 0; i < parts; i++) {
+        int stale = xt_check(part[i].page, part[i].off, part[i].len);
+
+        if (stale < 0)
+            return xt_stop(ctx, ipa, insn, "a page of code could not be made data");
+        if (stale && wr)
+            return HV_XTRACK_RETRY;
+    }
 
     /* As strong as the ordering of any instruction that this stands in for */
     sysop("dmb ish");
@@ -688,7 +810,7 @@ static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u6
 
     if (rd)
         for (u32 i = 0, done = 0; i < parts; done += part[i++].len)
-            xt_read(part[i].page, part[i].pa, part[i].off, part[i].len, old + done);
+            xt_read(part[i].orig, part[i].off, part[i].len, old + done);
     if (d->simd)
         get_simd_state(simd);
 
@@ -766,10 +888,10 @@ static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u6
         /* The part in the instruction's own page first: the one there may be no room for */
         for (u32 i = 0, done = 0; i < parts; done += part[i++].len)
             if (part[i].page == pc_page &&
-                xt_write(part[i].page, part[i].pa, part[i].off, part[i].len, new + done) < 0)
+                xt_write(part[i].page, part[i].orig, part[i].off, part[i].len, new + done) < 0)
                 return xt_stop(ctx, ipa, insn,
                                "a store puts an instruction to replace into a page that had "
-                               "none, and there is no room to record another such page");
+                               "none, and all shadow pages are in use");
 
         for (u32 i = 0, done = 0; i < parts; done += part[i++].len) {
             u64 pa;
@@ -778,9 +900,9 @@ static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u6
                 continue;
             /* The other page of the two: if it is code, it is data from now on */
             if (hv_pt_scanned(part[i].page, &pa) != HV_XPAGE_UNSCANNED &&
-                xt_to_data(part[i].page, part[i].pa) < 0)
+                xt_to_data(part[i].page, part[i].orig) < 0)
                 return xt_stop(ctx, ipa, insn, "a page of code could not be made data");
-            xt_put(part[i].pa + part[i].off, new + done, part[i].len);
+            xt_put(part[i].orig + part[i].off, new + done, part[i].len);
         }
     }
 
@@ -857,10 +979,11 @@ static void xt_count_pc(u64 pc, u32 insn, u32 flags)
 }
 
 /*
- * An access to a page of code that ESR_EL2 does not describe, or not well enough. same: the
- * instruction is in the page, whose state is given.
+ * An access to a page of code that ESR_EL2 does not describe, or not well enough. orig is the
+ * guest's page; same: the instruction is in the page, whose state is given.
  */
-static int xt_from_insn(struct exc_info *ctx, u64 ipa, u64 pa, int state, bool same, bool is_write)
+static int xt_from_insn(struct exc_info *ctx, u64 ipa, u64 orig, int state, bool same,
+                        bool is_write)
 {
     u64 t0 = mrs(CNTPCT_EL0);
     u64 page = ipa & ~(XT_PAGE - 1);
@@ -876,7 +999,10 @@ static int xt_from_insn(struct exc_info *ctx, u64 ipa, u64 pa, int state, bool s
     int ret;
 
     if ((insn & ~31U) == DC_IVAC) {
-        dc_civac_range((void *)(pa + (ipa & (XT_PAGE - 1))), 1);
+        /* A device may write into the guest's page: the core is to execute what it writes */
+        if (xt_to_data(page, orig) < 0)
+            return xt_stop(ctx, ipa, insn, "a page of code could not be made data");
+        dc_civac_range((void *)(orig + (ipa & (XT_PAGE - 1))), 1);
         xt_stats.ivac++;
         ret = HV_XTRACK_SKIP;
     } else if (!hv_xinsn_decode(insn, &d)) {
@@ -885,7 +1011,7 @@ static int xt_from_insn(struct exc_info *ctx, u64 ipa, u64 pa, int state, bool s
             return xt_stop(ctx, ipa, insn,
                            "an instruction that EL2 does not know how to carry out reads or "
                            "writes the page of code that it is in");
-        if (xt_to_data(page, pa) < 0)
+        if (xt_to_data(page, orig) < 0)
             return xt_stop(ctx, ipa, insn, "a page of code could not be made data");
         if (!is_write)
             xt_stats.to_data_read++;
@@ -898,7 +1024,7 @@ static int xt_from_insn(struct exc_info *ctx, u64 ipa, u64 pa, int state, bool s
     } else if (!same) {
         /* An atomic operation from elsewhere, on a page that is not to be read */
         flags |= XT_PC_WRITE;
-        if (xt_to_data(page, pa) < 0)
+        if (xt_to_data(page, orig) < 0)
             return xt_stop(ctx, ipa, insn, "a page of code could not be made data");
         ret = HV_XTRACK_RETRY;
     } else {
@@ -952,6 +1078,12 @@ int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write)
     if (state == HV_XPAGE_SCANNED && !is_write)
         return HV_XTRACK_NONE;
 
+    /* Reads and writes go to the guest's page, never to the shadow page */
+    u64 orig = xt_orig(page, state, pa);
+
+    if (!orig)
+        return xt_stop(ctx, ipa, 0, "an execute-only page has no record");
+
     /*
      * Does ESR_EL2 describe the access, and is all of it in this page? The address that the
      * core reports is the first byte that faulted: at the start of a page that may be the
@@ -964,7 +1096,10 @@ int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write)
     u8 buf[8];
 
     if (whole && !is_write) {
-        xt_read(page, pa, off, size, buf);
+        /* A shadow page that is out of date makes the page data; the read is right either way */
+        if (xt_check(page, off, size) < 0)
+            return xt_stop(ctx, ipa, 0, "a page of code could not be made data");
+        xt_read(orig, off, size, buf);
 
         u64 val = xt_le(buf, size);
 
@@ -993,25 +1128,33 @@ int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write)
      * cache maintenance instruction (ISS bit 8, CM), which writes nothing.
      */
     if (is_write && !same && !(esr & BIT(8))) {
-        if (xt_to_data(page, pa) < 0)
+        if (xt_to_data(page, orig) < 0)
             return xt_stop(ctx, ipa, 0, "a page of code could not be made data");
         return HV_XTRACK_RETRY;
     }
 
     if (whole && is_write) {
+        int stale = xt_check(page, off, size);
+
+        if (stale < 0)
+            return xt_stop(ctx, ipa, 0, "a page of code could not be made data");
+        /* The page is data now: the guest stores again, and finds it so */
+        if (stale)
+            return HV_XTRACK_RETRY;
+
         u64 val = xt_reg(ctx, rt);
 
         for (u32 i = 0; i < size; i++)
             buf[i] = val >> (8 * i);
-        if (xt_write(page, pa, off, size, buf) < 0)
+        if (xt_write(page, orig, off, size, buf) < 0)
             return xt_stop(ctx, ipa, 0,
                            "a store puts an instruction to replace into a page that had none, "
-                           "and there is no room to record another such page");
+                           "and all shadow pages are in use");
         xt_stats.writes_syn++;
         return HV_XTRACK_SKIP;
     }
 
-    return xt_from_insn(ctx, ipa, pa, state, same, is_write);
+    return xt_from_insn(ctx, ipa, orig, state, same, is_write);
 }
 
 void hv_xtrack_report(void)
@@ -1026,22 +1169,22 @@ void hv_xtrack_report(void)
 
     printf("HV: execution tracking: %ld pages scanned before they ran (%ld of them for EL0, %ld "
            "had instructions to replace), %ld us in all, longest %ld us; %ld faults on pages "
-           "already done\n",
+           "already done or on their way\n",
            xt_stats.scans, xt_stats.scans_el0, xt_stats.hits, us, longest, xt_stats.done);
-    printf("HV: execution tracking: %d pages with replaced instructions now, %ld at most, room "
-           "for %d; %ld times a page of code became data again (%ld of them for a read that "
-           "EL2 does not know how to carry out)\n",
-           xt_nr_recs, xt_stats.recs_max, XT_MAX_PAGES, xt_stats.to_data, xt_stats.to_data_read);
+    printf("HV: execution tracking: %d shadow pages in use now, %ld at most, room for %d; %ld "
+           "times a page of code became data again (%ld of them for DC IVAC, %ld for a read that "
+           "EL2 does not know how to carry out, %ld because the shadow page was out of date)\n",
+           xt_nr_recs, xt_stats.shadows_max, XT_MAX_PAGES, xt_stats.to_data, xt_stats.ivac,
+           xt_stats.to_data_read, xt_stats.stale);
     printf("HV: execution tracking: reads of pages with replaced instructions carried out in "
            "EL2: %ld from what ESR_EL2 says (%ld from EL0), %ld from the instruction; stores "
            "into the page that the instruction is in: %ld and %ld (%ld atomic); %ld stores "
-           "changed which words are replaced; %ld dc ivac\n",
+           "changed which words are accesses\n",
            xt_stats.reads_syn, xt_stats.reads_el0, xt_stats.reads_insn, xt_stats.writes_syn,
-           xt_stats.writes_insn, xt_stats.atomics, xt_stats.rerecorded, xt_stats.ivac);
+           xt_stats.writes_insn, xt_stats.atomics, xt_stats.rerecorded);
     printf("HV: execution tracking: %ld us in all for what was done from the instruction; %ld "
-           "replaced words found changed from outside; %ld times the guest was stopped; no "
-           "room to list %ld instructions\n",
-           insn_us, xt_stats.stale, xt_stats.stops, xt_stats.pcs_lost);
+           "times the guest was stopped; no room to list %ld instructions\n",
+           insn_us, xt_stats.stops, xt_stats.pcs_lost);
 
     /* For the host to take apart: one line for each instruction that was taken apart here */
     for (u32 i = 0; i < XT_MAX_PCS; i++)

@@ -126,6 +126,14 @@ static u64 m1n1_base;
 
 u64 hv_pt_walk(u64 addr);
 
+/* hv_xtrack.c sets aside its shadow pages when tracking starts, or cannot */
+static int xtrack_start_ret;
+
+static int hv_xtrack_start(void)
+{
+    return xtrack_start_ret;
+}
+
 #include "hv_vm_pt.inc"
 
 /* ---- checks --------------------------------------------------------------------------- */
@@ -270,10 +278,9 @@ static void verify(u64 ipa)
 
     switch (w.kind) {
         case K_HW: {
-            /* Data cannot be executed, and a page that nobody has access to neither */
-            bool none = w.state == HV_XPAGE_NONE;
-            unsigned xn = (xtrack && (w.state == HV_XPAGE_UNSCANNED || none)) ? 2 : 0;
-            u64 ap = w.state == HV_XPAGE_SCANNED ? 1 : (w.state == HV_XPAGE_XONLY || none) ? 0 : 3;
+            /* Data cannot be executed */
+            unsigned xn = (xtrack && w.state == HV_XPAGE_UNSCANNED) ? 2 : 0;
+            u64 ap = w.state == HV_XPAGE_SCANNED ? 1 : w.state == HV_XPAGE_XONLY ? 0 : 3;
             /* MemAttr 0b1111, S2AP, SH 0b11, AF */
             u64 attr = (0xfUL << 2) | (ap << 6) | (3UL << 8) | BIT(10);
 
@@ -407,16 +414,47 @@ static void py_map_hw(u64 ipa, u64 pa, u64 size)
         t_map_sw(ipa_p + size_p, pa + size_p, size - size_p);
 }
 
-static void t_set_scanned(u64 ipa, int state)
+/*
+ * A page of memory goes to another state, with its entry pointing to pa: through an invalid
+ * entry, break-before-make, which is the only way that hv_pt_set_scanned() takes
+ */
+static void t_set_scanned(u64 ipa, int state, u64 pa)
 {
-    u64 page = ipa & ~0xfffUL, pa = 0;
+    u64 page = ipa & ~0xfffUL, other = page - 0x1000, got = 0;
     unsigned long flushes = tlb_flushes;
+    int was = hv_pt_scanned(page, &got);
 
-    check(hv_pt_set_scanned(ipa, state) == 0, "hv_pt_set_scanned(0x%lx, %d) failed", ipa, state);
-    op_add(page, 0x1000, K_HW, page, state);
-    check(tlb_flushes > flushes, "0x%lx: page state %d without a TLB invalidation", ipa, state);
-    check(hv_pt_scanned(page + 0xff8, &pa) == state && pa == page,
-          "0x%lx: hv_pt_scanned() does not say state %d at 0x%lx (pa 0x%lx)", ipa, state, page, pa);
+    /* Not from one valid entry to another */
+    check(hv_pt_set_scanned(ipa, state, pa) < 0,
+          "0x%lx: from state %d to %d without an invalid "
+          "entry in between",
+          ipa, was, state);
+    check(hv_pt_scanned(page, &got) == was, "0x%lx: a change that was refused changed the state",
+          ipa);
+
+    check(hv_pt_set_scanned(ipa, HV_XPAGE_INVALID, 0) == 0,
+          "hv_pt_set_scanned(0x%lx, invalid) failed", ipa);
+    op_add(page, 0x1000, K_NONE, 0, 0);
+    check(tlb_flushes > flushes, "0x%lx: an invalid entry without a TLB invalidation", ipa);
+    check(!s2_walk(page + 0x800).valid && hv_pt_scanned(page, &got) < 0,
+          "0x%lx: the entry is not invalid", ipa);
+    verify(page);
+    /* While it is, nothing else: not another page, not the page again, not half a page */
+    check(hv_pt_set_scanned(other, HV_XPAGE_INVALID, 0) < 0 &&
+              hv_pt_set_scanned(other, HV_XPAGE_SCANNED, other) < 0 &&
+              hv_pt_set_scanned(page, HV_XPAGE_INVALID, 0) < 0 &&
+              hv_pt_set_scanned(page, state, pa + 0x800) < 0 && hv_pt_set_scanned(page, 7, pa) < 0,
+          "0x%lx: hv_pt_set_scanned() takes something else while the page has an invalid entry",
+          ipa);
+
+    flushes = tlb_flushes;
+    check(hv_pt_set_scanned(ipa, state, pa) == 0, "hv_pt_set_scanned(0x%lx, %d, 0x%lx) failed", ipa,
+          state, pa);
+    op_add(page, 0x1000, K_HW, pa, state);
+    check(tlb_flushes > flushes, "0x%lx: page state %d without the barriers", ipa, state);
+    check(hv_pt_scanned(page + 0xff8, &got) == state && got == pa,
+          "0x%lx: hv_pt_scanned() does not say state %d at 0x%lx, to 0x%lx (it says 0x%lx)", ipa,
+          state, page, pa, got);
 
     /* The page, and the 16 KB to either side of it */
     for (u64 a = page - 0x4000; a < page + 0x5000; a += 0x1000) {
@@ -440,6 +478,14 @@ static void init(u64 mmfr0, u64 ram, u64 m1n1, u64 top)
 static void start_xtrack(void)
 {
     unsigned long flushes = tlb_flushes;
+
+    /* No room for the shadow pages: no tracking, and nothing changed */
+    xtrack_start_ret = -1;
+    check(hv_pt_xtrack() < 0 && !hv_pt_xtrack_on(),
+          "hv_pt_xtrack() goes on without the memory that execution tracking needs");
+    check(tlb_flushes == flushes, "hv_pt_xtrack() changed the tables, and did not start");
+    verify_all();
+    xtrack_start_ret = 0;
 
     check(hv_pt_xtrack() == 0 && hv_pt_xtrack_on(), "hv_pt_xtrack() failed");
     check(tlb_flushes > flushes, "execution tracking starts without a TLB invalidation");
@@ -483,6 +529,7 @@ static void check_config(unsigned pa_range, unsigned ia_bits)
 #define M4_RAM   0x10000000000UL
 #define M4_M1N1  0x10004a60000UL
 #define HOOK(n)  (0x70000000UL + (n) * 0x100)
+#define SHADOW   0x10004b00000UL /* in the heap of m1n1, which is not the guest's memory */
 
 static void test_m4(void)
 {
@@ -543,29 +590,28 @@ static void test_m4(void)
     check(s2_walk(0x1000000000).level == 2 && s2_walk(0x1000000000).xn == 2,
           "device registers are not left as a block that cannot be executed");
 
-    /* A page that is scanned, taken away, written to again: that page and no other */
-    t_set_scanned(0x10100005123, HV_XPAGE_SCANNED);
-    t_set_scanned(0x10100005000, HV_XPAGE_NONE);
-    check(s2_walk(0x10100005000).valid && (s2_walk(0x10100005000).attr >> 6 & 3) == 0 &&
-              s2_walk(0x10100005000).xn == 2,
-          "a page that nobody has access to: S2AP %ld and XN %d in the descriptor",
-          s2_walk(0x10100005000).attr >> 6 & 3, s2_walk(0x10100005000).xn);
-    t_set_scanned(0x10100005ffc, HV_XPAGE_UNSCANNED);
-    t_set_scanned(0x10100005000, HV_XPAGE_SCANNED);
-    t_set_scanned(0x10100006000, HV_XPAGE_SCANNED);
+    /* A page that is scanned, made data again, scanned again: that page and no other */
+    t_set_scanned(0x10100005123, HV_XPAGE_SCANNED, 0x10100005000);
+    t_set_scanned(0x10100005ffc, HV_XPAGE_UNSCANNED, 0x10100005000);
+    t_set_scanned(0x10100005000, HV_XPAGE_SCANNED, 0x10100005000);
+    t_set_scanned(0x10100006000, HV_XPAGE_SCANNED, 0x10100006000);
     /* The last page of 2 MB and the first of the next; below m1n1, where there never were blocks */
-    t_set_scanned(0x101001ff000, HV_XPAGE_SCANNED);
-    t_set_scanned(0x10100200000, HV_XPAGE_NONE);
-    t_set_scanned(0x10000004000, HV_XPAGE_SCANNED);
-    t_set_scanned(0x10000004000, HV_XPAGE_UNSCANNED);
-    /* A page that executes and is neither read nor written, and what it was before and after */
-    t_set_scanned(0x10100006000, HV_XPAGE_XONLY);
-    check(s2_walk(0x10100006000).valid && (s2_walk(0x10100006000).attr >> 6 & 3) == 0 &&
-              s2_walk(0x10100006000).xn == 0,
-          "an execute-only page: S2AP %ld and XN %d in the descriptor",
-          s2_walk(0x10100006000).attr >> 6 & 3, s2_walk(0x10100006000).xn);
-    /* Where EL2 reads an instruction of the guest: in such a page too, to the byte */
-    check(hv_translate_insn(0x10100006a4a) == 0x10100006a4a &&
+    t_set_scanned(0x101001ff000, HV_XPAGE_SCANNED, 0x101001ff000);
+    t_set_scanned(0x10100200000, HV_XPAGE_UNSCANNED, 0x10100200000);
+    t_set_scanned(0x10000004000, HV_XPAGE_SCANNED, 0x10000004000);
+    t_set_scanned(0x10000004000, HV_XPAGE_UNSCANNED, 0x10000004000);
+    /*
+     * A page that executes and is neither read nor written, and executes another page: a
+     * shadow page in the heap of m1n1, which the guest has no mapping of
+     */
+    t_set_scanned(0x10100006000, HV_XPAGE_XONLY, SHADOW);
+    check(s2_walk(0x10100006000).valid && s2_walk(0x10100006abc).pa == SHADOW + 0xabc &&
+              (s2_walk(0x10100006000).attr >> 6 & 3) == 0 && s2_walk(0x10100006000).xn == 0,
+          "an execute-only page: S2AP %ld and XN %d in the descriptor, to 0x%lx",
+          s2_walk(0x10100006000).attr >> 6 & 3, s2_walk(0x10100006000).xn,
+          s2_walk(0x10100006000).pa);
+    /* Where EL2 reads an instruction of the guest: what the core executes, to the byte */
+    check(hv_translate_insn(0x10100006a4a) == SHADOW + 0xa4a &&
               hv_translate_insn(0x10100005ffd) == 0x10100005ffd &&
               hv_translate_insn(0x1000000127) == 0x1000000127,
           "hv_translate_insn() in an execute-only page, a read-only page and a block: 0x%lx "
@@ -575,19 +621,22 @@ static void test_m4(void)
     check(hv_translate_insn(0x5000000000) == 0 && hv_translate_insn(0x103dc000000) == 0 &&
               hv_translate_insn(1UL << 43) == 0,
           "hv_translate_insn() finds an instruction in a hook, a hole or past the end");
-    t_set_scanned(0x10100006000, HV_XPAGE_SCANNED);
-    t_set_scanned(0x10100006000, HV_XPAGE_XONLY);
-    t_set_scanned(0x10100006000, HV_XPAGE_UNSCANNED);
-    t_set_scanned(0x10100006000, HV_XPAGE_SCANNED);
-    t_set_scanned(0x101001ff000, HV_XPAGE_XONLY);
+    t_set_scanned(0x10100006000, HV_XPAGE_SCANNED, 0x10100006000);
+    t_set_scanned(0x10100006000, HV_XPAGE_XONLY, SHADOW + 0x3000);
+    t_set_scanned(0x10100006000, HV_XPAGE_UNSCANNED, 0x10100006000);
+    t_set_scanned(0x10100006000, HV_XPAGE_SCANNED, 0x10100006000);
+    t_set_scanned(0x101001ff000, HV_XPAGE_XONLY, SHADOW + 0x1000);
+    t_set_scanned(0x10100200000, HV_XPAGE_XONLY, SHADOW);
 
     /* What is not memory has no state, and gets none */
     check(hv_pt_scanned(0x5000000000, &pa) < 0 && hv_pt_scanned(0x103dc000000, &pa) < 0 &&
               hv_pt_scanned(1UL << 42, &pa) < 0 && hv_pt_scanned(0x1000000000, &pa) < 0,
           "hv_pt_scanned() finds memory in a hook, a hole, past the end or in device registers");
-    check(hv_pt_set_scanned(0x1000000000, HV_XPAGE_SCANNED) < 0 &&
-              hv_pt_set_scanned(0x5000000000, HV_XPAGE_SCANNED) < 0,
-          "hv_pt_set_scanned() takes device registers or a hook for memory");
+    check(hv_pt_set_scanned(0x1000000000, HV_XPAGE_INVALID, 0) < 0 &&
+              hv_pt_set_scanned(0x5000000000, HV_XPAGE_INVALID, 0) < 0 &&
+              hv_pt_set_scanned(0x103dc000000, HV_XPAGE_INVALID, 0) < 0 &&
+              hv_pt_set_scanned(0x1000000000, HV_XPAGE_SCANNED, 0x1000000000) < 0,
+          "hv_pt_set_scanned() takes device registers, a hook or a hole for memory");
     verify_range(0x1000000000, 0x1000400000);
 
     /* Memory mapped from now on cannot be executed either */
@@ -629,8 +678,9 @@ static void test_sizes(void)
 
         start_xtrack();
         verify_all();
-        t_set_scanned(top - 0x1000, HV_XPAGE_SCANNED);
-        t_set_scanned(ram + 0x20000000, HV_XPAGE_SCANNED);
+        t_set_scanned(top - 0x1000, HV_XPAGE_SCANNED, top - 0x1000);
+        t_set_scanned(ram + 0x20000000, HV_XPAGE_SCANNED, ram + 0x20000000);
+        t_set_scanned(ram + 0x20000000, HV_XPAGE_XONLY, ram + 0x10000);
         check(hv_pt_scanned(top, &pa) < 0 && !hv_pt_is_ram(top),
               "memory past the end of the address space");
         verify_all();

@@ -3,30 +3,48 @@
  * Host-side model test for src/hv/hv_xtrack.c, with the real src/hv/hv_pmu.c and
  * src/hv/hv_xinsn.c linked in.
  *
- * The rule under test: whatever the guest does, what it reads from its memory as data is what
- * it wrote there, and no page that it may execute has an access to a PMUv3 register in it.
+ * The rule under test: whatever the guest does, its memory holds what it (or a device) wrote
+ * there, what it reads from it as data is that, and what the core executes is that with every
+ * access to a PMUv3 register replaced.
  *
- * So there are two copies of a few pages of memory. arena is the memory, which hv_xtrack.c
- * changes; ref is what the guest wrote, which only this file changes. A guest is played that
- * does things in random order: it executes pages, and it runs random instructions that read
- * and write them, from the page they access and from others, within a page and across two.
- * The instructions are random words that the decoder takes, with registers set up so that
- * they access where the test wants. A core is played too: an access that the state of the
- * page allows happens here, on both copies; one that it does not allow is a Data Abort for
+ * So there are several copies of a few pages of memory. arena is the guest's memory, which
+ * hv_xtrack.c is not to change but for the guest; ref is what the guest wrote, which only this
+ * file changes; pool is where hv_xtrack.c gets its shadow pages (its memalign()). A guest is
+ * played that does things in random order: it executes pages, and it runs random instructions
+ * that read and write them, from the page they access and from others, within a page and
+ * across two. The instructions are random words that the decoder takes, with registers set up
+ * so that they access where the test wants. A core is played too: an access that the state of
+ * the page allows happens here; one that it does not allow is a Data Abort for
  * hv_xtrack_dabort(), and what that does to the registers and to the memory is compared with
- * what the instruction does when this file carries it out (execute()) on ref.
+ * what the instruction does when this file carries it out (execute()) on ref. A device is
+ * played that writes into memory, with DC IVAC before, after, both or not at all.
+ *
+ * And the caches, as far as hv_xtrack.c has to look after them: poc_arena and poc_pool are
+ * memory as a device sees it, the point of coherency. A store of the core's goes to arena
+ * only, a device's to both, and DC CVAC (dc_cvac_range()) copies lines from the one to the
+ * other. ic_pending says that a shadow page has been written and cleaned and the instruction
+ * caches not dropped since; ic_owed that a page has stopped being execute-only and they have
+ * not been dropped since.
  *
  * After every step, for every page:
- *   - a page of data, and a page of code with nothing replaced, is byte for byte what the
- *     guest wrote;
- *   - a page of code has no access in it, and it is execute-only exactly if what the guest
- *     wrote there has one;
+ *   - the guest's page is byte for byte what the guest wrote, whatever the state;
+ *   - stage 2 points to the guest's page for data and for code with nothing replaced, and to a
+ *     shadow page for execute-only code; no page is left with an invalid entry;
+ *   - what the core executes there has no access in it, and is word for word what the guest
+ *     wrote with the accesses replaced; a page with an access is execute-only. Not for a page
+ *     that a device wrote into without DC IVAC: the core executes the shadow page as it was
+ *     until hv_xtrack.c next reads or writes the page for the guest;
  *   - read through hv_xtrack_dabort(), an execute-only page is byte for byte what the guest
- *     wrote.
+ *     wrote; that read finds what a device wrote without DC IVAC, and the page becomes data;
+ *   - an execute-only page is clean to the point of coherency, and so is its shadow page;
+ *   - records and execute-only pages go one to one, the shadow pages are all different, and
+ *     those in use and the free ones are the pool;
+ *   - nothing is owed to the instruction caches.
+ * And every change of state goes through an invalid entry (hv_pt_set_scanned() below).
  *
  * The Makefile drops the #include lines of hv_xtrack.c; this file stands in for them and for
- * the page tables: one state for each 4 KB page. The table of pages with replaced
- * instructions has room for XT_MAX_PAGES here, fewer than there are pages, so that it fills.
+ * the page tables: one state and one physical page for each 4 KB page. There is room for
+ * XT_MAX_PAGES shadow pages here, fewer than there are pages, so that they run out.
  *
  * With BROKEN defined to a number the Makefile has changed hv_xtrack.c on its way here: the
  * test must fail then (make xtrack-broken).
@@ -56,12 +74,14 @@ static u64 test_DCZID_EL0 = 4; /* blocks of 64 bytes */
 #define NR_PAGES  8
 #define PAGE      0x1000UL
 #define WORDS     1024 /* in a page */
+#define LINE      64UL /* as src/memory.c has it */
 
 #define MRS_PMCCNTR 0xd53b9d00 /* mrs x0, PMCCNTR_EL0 */
 #define MRS_PMCR    0xd53b9c00 /* mrs x0, PMCR_EL0 */
 #define MSR_PMCR    0xd51b9c00 /* msr PMCR_EL0, x0 */
 #define MRS_CNTVCT  0xd53be040 /* mrs x0, CNTVCT_EL0 */
 #define I_LDR       0xf9400020 /* ldr x0, [x1] */
+#define I_STR       0xf9000020 /* str x0, [x1] */
 #define I_LDXR      0xc85f7c20 /* ldxr x0, [x1] */
 #define I_STXR      0xc8027c20 /* stxr w2, x0, [x1] */
 #define I_LD1       0x4c407020 /* ld1 {v0.16b}, [x1] */
@@ -69,7 +89,15 @@ static u64 test_DCZID_EL0 = 4; /* blocks of 64 bytes */
 
 static u8 arena[NR_PAGES * PAGE] __attribute__((aligned(0x1000)));
 static u8 ref[NR_PAGES * PAGE] __attribute__((aligned(0x1000)));
+static u8 pool[XT_MAX_PAGES * PAGE] __attribute__((aligned(0x1000)));
+static u8 poc_arena[sizeof(arena)], poc_pool[sizeof(pool)];
 static int state[NR_PAGES];
+static u64 target[NR_PAGES]; /* where stage 2 points */
+static bool ic_pending, ic_owed;
+/* Pages that a device wrote into without DC IVAC, whose shadow page is out of date */
+static bool stale[NR_PAGES];
+/* ...since the last check: hv_xtrack.c may find one */
+static bool stale_possible;
 
 static u64 test_esr, test_far, test_spsr = 5;
 static u32 test_insn;
@@ -78,6 +106,7 @@ static int test_unmapped = -1; /* a page that stage 1 of the guest does not map 
 static u8 test_simd[32][16];
 static u64 test_civac;
 static bool test_xtrack_on = true;
+static bool test_no_memory;
 
 static unsigned long checks, failures;
 /* The step that is being checked, for whoever reads a failure */
@@ -101,20 +130,58 @@ static void check(bool ok, const char *fmt, ...)
 
 /* ---- what hv_xtrack.c uses of the hypervisor ---- */
 
-static void dc_cvau_range(void *addr, size_t size)
+static void *test_memalign(size_t align, size_t size)
 {
-    UNUSED(addr);
-    UNUSED(size);
+    check(align == PAGE && size == sizeof(pool), "memalign(0x%zx, 0x%zx): not the pool", align,
+          size);
+    return test_no_memory ? NULL : pool;
+}
+#define memalign(a, s) test_memalign(a, s)
+
+static bool in_pool(u64 a)
+{
+    return a >= (u64)pool && a < (u64)pool + sizeof(pool);
+}
+
+static bool in_arena(u64 a)
+{
+    return a >= (u64)arena && a < (u64)arena + sizeof(arena);
+}
+
+/* The line that holds a, from the cache to the point of coherency */
+static void clean_line(u64 a)
+{
+    a &= ~(LINE - 1);
+    if (in_arena(a)) {
+        memcpy(&poc_arena[a - (u64)arena], (void *)a, LINE);
+    } else if (in_pool(a)) {
+        memcpy(&poc_pool[a - (u64)pool], (void *)a, LINE);
+        ic_pending = true;
+    } else {
+        check(false,
+              "cache maintenance at 0x%lx, which is neither the guest's memory nor a "
+              "shadow page",
+              a);
+    }
+}
+
+/* As src/memory.c does it: a line at addr, and one every LINE bytes after it, up to addr + size */
+static void dc_cvac_range(void *addr, size_t size)
+{
+    for (u64 p = (u64)addr; p < (u64)addr + size; p += LINE)
+        clean_line(p);
 }
 
 static void dc_civac_range(void *addr, size_t size)
 {
-    UNUSED(size);
     test_civac = (u64)addr;
+    dc_cvac_range(addr, size);
 }
 
 static void ic_ialluis(void)
 {
+    ic_pending = false;
+    ic_owed = false;
 }
 
 static u64 hv_get_esr(void)
@@ -164,13 +231,18 @@ static bool hv_pt_xtrack_on(void)
     return test_xtrack_on;
 }
 
+static u64 guest_page(int n)
+{
+    return (u64)&arena[n * PAGE];
+}
+
 static int hv_pt_scanned(u64 ipa, u64 *pa)
 {
     int n = page_of(ipa);
 
-    if (n < 0)
+    if (n < 0 || state[n] == HV_XPAGE_INVALID)
         return -1;
-    *pa = (u64)&arena[n * PAGE];
+    *pa = target[n];
     return state[n];
 }
 
@@ -179,18 +251,44 @@ static bool is_code(int st)
     return st == HV_XPAGE_SCANNED || st == HV_XPAGE_XONLY;
 }
 
-static int hv_pt_set_scanned(u64 ipa, int st)
+static int hv_pt_set_scanned(u64 ipa, int st, u64 pa)
 {
     int n = page_of(ipa);
 
     if (n < 0)
         return -1;
-    /* Between data and code, a page is nobody's for a while: its content is being changed */
-    check(!(state[n] == HV_XPAGE_UNSCANNED && is_code(st)) &&
-              !(is_code(state[n]) && st == HV_XPAGE_UNSCANNED),
-          "page %d goes from state %d to %d without being taken from the guest first", n,
-          state[n], st);
+
+    if (st == HV_XPAGE_INVALID) {
+        check(state[n] != HV_XPAGE_INVALID, "page %d is made invalid twice", n);
+        /* Lines of the guest's page from before may be in the instruction caches */
+        if (state[n] == HV_XPAGE_XONLY)
+            ic_owed = true;
+        state[n] = st;
+        return 0;
+    }
+
+    /* Break-before-make: from a valid entry to another only through an invalid one */
+    check(state[n] == HV_XPAGE_INVALID,
+          "page %d goes from state %d to %d without an invalid entry in between", n, state[n], st);
+    if (st == HV_XPAGE_XONLY) {
+        u64 at = pa - (u64)pool;
+
+        check(in_pool(pa) && !(at & (PAGE - 1)),
+              "page %d is execute-only and executes 0x%lx, "
+              "which is not a shadow page",
+              n, pa);
+        check(!in_pool(pa) || !memcmp(&pool[at], &poc_pool[at], PAGE),
+              "page %d executes a shadow page that is not clean to the point of coherency", n);
+        check(!ic_pending,
+              "page %d executes a shadow page, and the instruction caches have not "
+              "been dropped since it was made",
+              n);
+    } else {
+        check(pa == guest_page(n), "page %d in state %d executes 0x%lx, not the guest's page", n,
+              st, pa);
+    }
     state[n] = st;
+    target[n] = pa;
     return 0;
 }
 
@@ -241,12 +339,19 @@ static u32 ref_word(int page, int i)
     return w;
 }
 
-static u32 arena_word(int page, int i)
+/* Word i of what the core executes in the page */
+static u32 exec_word(int page, int i)
 {
     u32 w;
 
-    memcpy(&w, &arena[page * PAGE + 4 * i], 4);
+    memcpy(&w, (const u8 *)target[page] + 4 * i, 4);
     return w;
+}
+
+/* What the core is to execute for a word that the guest wrote: this file's own word on it */
+static u32 replaced(u32 w)
+{
+    return hv_pmu_is_access(w) ? hv_pmu_patch_word(w) : w;
 }
 
 static bool has_access(int page)
@@ -289,7 +394,7 @@ static u32 a_plain_word(void)
     for (;;) {
         u32 w = rnd();
 
-        if (!hv_pmu_is_access(w) && !hv_pmu_original_word(w))
+        if (!hv_pmu_is_access(w) && (w & ~31U) != MRS_CNTVCT && !hv_pmu_unpatch_word(w))
             return w;
     }
 }
@@ -461,7 +566,8 @@ static u64 syndrome(const struct hv_xinsn *d)
 static struct {
     u64 native, carried, with_syndrome, retries, stops, two_pages, same_page;
     u64 loads, stores, atomics, cas, zva, simd, wback, literal;
-    u64 execs, exec_full, dma, stale;
+    u64 execs, exec_full, dma, dma_over_shadow, ivac_before, ivac_after, ivac_both, ivac_same;
+    u64 stale_read, stale_store, stale_left;
 } seen;
 
 static int data_abort(struct cpu *c, u32 insn, u64 pc, u64 far, u64 esr, bool el0)
@@ -537,7 +643,7 @@ static int run(u32 insn, u64 pc, struct cpu *c, bool el0, bool with_syndrome)
         }
 
         if (fault < 0) {
-            /* The core does it. The pages are readable, so they are what the guest wrote */
+            /* The core does it, into its caches. The pages are readable: what the guest wrote */
             execute(&d, c, pc, ref);
             if (wr)
                 memcpy(&arena[va - ARENA_IPA], &ref[va - ARENA_IPA], len);
@@ -619,8 +725,6 @@ static bool exec_page(int page)
 
     bool full = has_access(page) && nr_xonly() == XT_MAX_PAGES;
 
-    snprintf(doing, sizeof(doing), "page %d runs", page);
-
     test_esr = 0x8200000f; /* Instruction Abort from a lower EL, permission fault, level 3 */
     test_far = ipa_of(page, 4 * rnd_below(WORDS));
     test_spsr = rnd_below(2) ? 5 : 0;
@@ -630,7 +734,7 @@ static bool exec_page(int page)
     seen.execs++;
     if (full) {
         check(!ok && state[page] == HV_XPAGE_UNSCANNED,
-              "page %d runs although there is no room to record what is replaced in it", page);
+              "page %d runs although there is no shadow page left for it", page);
         seen.exec_full++;
         return false;
     }
@@ -655,24 +759,22 @@ static void read_through(int page, u8 *out)
         }
         int ret = data_abort(&c, I_LDR, ipa_of((page + 1) % NR_PAGES, 64), c.x[1],
                              0x9200000f | (syn ? BIT(24) | (3UL << 22) | BIT(15) : 0), false);
-        if (ret == HV_XTRACK_NONE && state[page] != HV_XPAGE_XONLY) {
-            /* The page has become readable on the way: nothing replaced was left in it */
-            memcpy(out + off, &arena[page * PAGE + off], 8);
-            continue;
-        }
         check(ret == HV_XTRACK_SKIP, "reading page %d at 0x%x: answer %d", page, off, ret);
         memcpy(out + off, &c.x[0], 8);
     }
 }
 
+static u64 stale_count; /* xt_stats.stale at the last check */
+
 static void verify(const char *what, u64 step)
 {
     static u8 got[PAGE];
+    bool possible = stale_possible;
 
     for (int p = 0; p < NR_PAGES; p++) {
         u8 *a = &arena[p * PAGE], *r = &ref[p * PAGE];
 
-        /* What a read gives first: it may find that something replaced is gone (DMA) */
+        /* What a read gives first: it finds what a device wrote without DC IVAC */
         if (state[p] == HV_XPAGE_XONLY) {
             read_through(p, got);
             for (u32 i = 0; i < PAGE; i++)
@@ -683,33 +785,95 @@ static void verify(const char *what, u64 step)
                     break;
                 }
         }
+        if (stale[p] && state[p] != HV_XPAGE_XONLY) {
+            stale[p] = false;
+            seen.stale_left++;
+        }
+        check(!stale[p],
+              "%s (step %lu): page %d was written by a device without DC IVAC, and a "
+              "read of all of it through EL2 does not find out",
+              what, step, p);
 
-        check(state[p] != HV_XPAGE_NONE, "%s (step %lu): page %d is left with no access", what,
-              step, p);
-        if (state[p] == HV_XPAGE_UNSCANNED || state[p] == HV_XPAGE_SCANNED)
-            for (u32 i = 0; i < PAGE; i++)
-                if (a[i] != r[i]) {
-                    check(false, "%s (step %lu): page %d, state %d, has 0x%02x at 0x%x, the guest "
-                                 "wrote 0x%02x",
-                          what, step, p, state[p], a[i], i, r[i]);
-                    break;
-                }
+        check(state[p] != HV_XPAGE_INVALID, "%s (step %lu): page %d is left with an invalid entry",
+              what, step, p);
+        for (u32 i = 0; i < PAGE; i++)
+            if (a[i] != r[i]) {
+                check(false,
+                      "%s (step %lu): page %d, state %d, has 0x%02x at 0x%x, the guest "
+                      "wrote 0x%02x",
+                      what, step, p, state[p], a[i], i, r[i]);
+                break;
+            }
+        if (state[p] != HV_XPAGE_XONLY)
+            check(target[p] == guest_page(p), "%s (step %lu): page %d in state %d executes 0x%lx",
+                  what, step, p, state[p], target[p]);
+
         if (is_code(state[p])) {
-            for (int i = 0; i < WORDS; i++)
-                if (hv_pmu_is_access(arena_word(p, i))) {
-                    check(false, "%s (step %lu): page %d may be executed and has the access 0x%08x "
-                                 "at word %d",
-                          what, step, p, arena_word(p, i), i);
+            for (int i = 0; i < WORDS; i++) {
+                u32 w = exec_word(p, i);
+
+                if (hv_pmu_is_access(w) || w != replaced(ref_word(p, i))) {
+                    check(false,
+                          "%s (step %lu): page %d, state %d, executes 0x%08x at word %d, "
+                          "the guest wrote 0x%08x",
+                          what, step, p, state[p], w, i, ref_word(p, i));
                     break;
                 }
-            check((state[p] == HV_XPAGE_XONLY) == has_access(p),
-                  "%s (step %lu): page %d is in state %d and what the guest wrote there has %s "
-                  "access",
-                  what, step, p, state[p], has_access(p) ? "an" : "no");
+            }
+            check(state[p] == HV_XPAGE_XONLY || !has_access(p),
+                  "%s (step %lu): page %d is code with an access in it and executes the guest's "
+                  "page",
+                  what, step, p);
+        }
+
+        if (state[p] == HV_XPAGE_XONLY) {
+            struct xt_rec *rec = xt_find(ipa_of(p, 0));
+
+            check(rec && rec->orig == guest_page(p) && target[p] == (u64)xt_shadow(rec),
+                  "%s (step %lu): the record of page %d does not say what stage 2 does", what, step,
+                  p);
+            check(!memcmp(a, &poc_arena[p * PAGE], PAGE),
+                  "%s (step %lu): page %d is execute-only, and a device would not read what the "
+                  "guest wrote: lines of it are not clean",
+                  what, step, p);
+            check(!in_pool(target[p]) ||
+                      !memcmp((void *)target[p], &poc_pool[target[p] - (u64)pool], PAGE),
+                  "%s (step %lu): the shadow page of page %d is not clean", what, step, p);
         }
     }
-    check(xt_nr_recs == (u32)nr_xonly(), "%s (step %lu): %u records for %d execute-only pages",
-          what, step, xt_nr_recs, nr_xonly());
+
+    /* The records, the shadow pages in use and the free ones */
+    u32 used = 0;
+
+    for (u32 i = 0; i < XT_MAX_PAGES; i++)
+        if (xt_recs[i].page) {
+            int p = page_of(xt_recs[i].page);
+
+            check(p >= 0 && state[p] == HV_XPAGE_XONLY,
+                  "%s (step %lu): a record for page %d, which is not execute-only", what, step, p);
+            used |= BIT(xt_recs[i].shadow);
+        }
+    for (u32 i = 0; i < xt_nr_free; i++) {
+        check(xt_free[i] < XT_MAX_PAGES && !(used & BIT(xt_free[i])),
+              "%s (step %lu): shadow page %u is free and in use, or free twice", what, step,
+              xt_free[i]);
+        used |= BIT(xt_free[i]);
+    }
+    check(xt_nr_recs == (u32)nr_xonly() && xt_nr_recs + xt_nr_free == XT_MAX_PAGES &&
+              used == BIT(XT_MAX_PAGES) - 1,
+          "%s (step %lu): %u records for %d execute-only pages, %u shadow pages free of %d", what,
+          step, xt_nr_recs, nr_xonly(), xt_nr_free, XT_MAX_PAGES);
+
+    check(!ic_pending && !ic_owed,
+          "%s (step %lu): the instruction caches are not dropped after a shadow page changed "
+          "(%d) or a page stopped being execute-only (%d)",
+          what, step, ic_pending, ic_owed);
+
+    /* A shadow page out of date is found only where there is one */
+    check(possible || xt_stats.stale == stale_count,
+          "%s (step %lu): a shadow page is found out of date, and no device wrote", what, step);
+    stale_count = xt_stats.stale;
+    stale_possible = false;
 }
 
 /* ---- the guest ---- */
@@ -850,7 +1014,8 @@ static void step_instruction(u64 step)
     snprintf(doing, sizeof(doing), "0x%08x at 0x%lx on 0x%lx, %u bytes, pages in states %d %d",
              insn, pc, va, len, state[page_of(va)], state[page_of(va + len - 1)]);
 
-    /* The condition for being stopped: a store into its own page that needs a record, and no room */
+    /* The condition for being stopped: a store into its own page that needs a shadow page, and none
+     * left */
     bool full = xt_nr_recs == XT_MAX_PAGES;
     static u8 before[sizeof(ref)];
 
@@ -863,13 +1028,54 @@ static void step_instruction(u64 step)
     }
 }
 
-/* A device writes into memory: not through stage 2, and nothing that looks like an access */
+/*
+ * The guest does DC IVAC on a line of the page, from the instruction at pc. On a page of code
+ * that is an abort, and the page becomes data; on data the core does it.
+ */
+static void ivac(int page, u64 pc)
+{
+    struct cpu c = {0};
+    u32 line = LINE * rnd_below(PAGE / LINE);
+    u64 at = ipa_of(page, line + rnd_below(LINE));
+
+    if (!is_code(state[page]))
+        return;
+
+    c.x[1] = at;
+    test_civac = 0;
+
+    int ret = data_abort(&c, I_DC_IVAC | 1, pc, at, 0x9200014f, false);
+
+    check(ret == HV_XTRACK_SKIP && test_civac == (u64)&arena[at - ARENA_IPA] &&
+              state[page] == HV_XPAGE_UNSCANNED,
+          "dc ivac on page %d at 0x%lx: answer %d, dc civac at 0x%lx, state %d", page, at, ret,
+          test_civac, state[page]);
+}
+
+/*
+ * A device writes into memory: not through stage 2, and nothing that looks like an access.
+ * Windows does DC IVAC on the buffer before, after, or both; or nobody does, and the next read
+ * or write of the page through EL2 is to find out.
+ */
 static void step_dma(void)
 {
     int page = rnd_below(NR_PAGES);
-    int n = 1 + rnd_below(3);
+    int other = (page + 1 + rnd_below(NR_PAGES - 1)) % NR_PAGES;
+    int n = 1 + rnd_below(3), how = rnd_below(6);
+    bool before = how == 1 || how == 3, after = how == 2 || how == 3;
+    bool shadow = state[page] == HV_XPAGE_XONLY, out_of_date = false;
+    int changed = -1;
 
-    snprintf(doing, sizeof(doing), "a device writes to page %d, state %d", page, state[page]);
+    snprintf(doing, sizeof(doing), "a device writes to page %d, state %d, DC IVAC %s", page,
+             state[page],
+             how == 1   ? "before"
+             : how == 2 ? "after"
+             : how == 3 ? "both"
+                        : "none");
+
+    if (before)
+        ivac(page, ipa_of(other, 0));
+
     for (int k = 0; k < n; k++) {
         int w = rnd_below(WORDS);
 
@@ -878,16 +1084,76 @@ static void step_dma(void)
             for (int i = 0; i < WORDS; i++)
                 if (hv_pmu_is_access(ref_word(page, (w + i) % WORDS))) {
                     w = (w + i) % WORDS;
-                    seen.stale += state[page] == HV_XPAGE_XONLY;
                     break;
                 }
 
         u32 word = a_plain_word();
 
+        if (state[page] == HV_XPAGE_XONLY && exec_word(page, w) != word) {
+            out_of_date = true;
+            changed = w;
+        }
         memcpy(&arena[page * PAGE + 4 * w], &word, 4);
+        memcpy(&poc_arena[page * PAGE + 4 * w], &word, 4);
         memcpy(&ref[page * PAGE + 4 * w], &word, 4);
     }
     seen.dma++;
+    seen.dma_over_shadow += shadow;
+
+    if (after)
+        ivac(page, ipa_of(other, 0));
+
+    if (before || after) {
+        check(!is_code(state[page]), "page %d is code after a device wrote with DC IVAC", page);
+        seen.ivac_before += how == 1;
+        seen.ivac_after += how == 2;
+        seen.ivac_both += how == 3;
+        /* What the core executes next is what the device wrote, replaced (verify()) */
+        exec_page(page);
+        return;
+    }
+    if (!out_of_date)
+        return;
+
+    /* The core executes the shadow page as it was: until EL2 next reads or writes the page */
+    stale[page] = true;
+    stale_possible = true;
+
+    struct cpu c = {0};
+    u64 stale_before = xt_stats.stale;
+    u32 off = (4 * changed) & ~7U;
+    bool syn = rnd_below(2);
+    int ret;
+
+    c.x[1] = ipa_of(page, off);
+    c.x[0] = rnd();
+    if (how == 4) {
+        /* A read from elsewhere: it gets what the device wrote, and the page becomes data */
+        ret = data_abort(&c, I_LDR, ipa_of(other, 64), c.x[1],
+                         0x9200000f | (syn ? BIT(24) | (3UL << 22) | BIT(15) : 0), false);
+        check(ret == HV_XTRACK_SKIP && c.x[0] == get_le(&ref[page * PAGE + off], 8) &&
+                  state[page] == HV_XPAGE_UNSCANNED && xt_stats.stale == stale_before + 1,
+              "a read of page %d at 0x%x after a device wrote without DC IVAC: answer %d, 0x%lx, "
+              "state %d",
+              page, off, ret, c.x[0], state[page]);
+        seen.stale_read++;
+    } else if (how == 5) {
+        /* A store from the page itself: it goes again, on data, and has not stored here */
+        static u8 arena_before[sizeof(arena)];
+
+        memcpy(arena_before, arena, sizeof(arena));
+        ret = data_abort(&c, I_STR, ipa_of(page, 4 * rnd_below(WORDS)), c.x[1],
+                         0x9200004f | (syn ? BIT(24) | (3UL << 22) | BIT(15) : 0), false);
+        check(ret == HV_XTRACK_RETRY && state[page] == HV_XPAGE_UNSCANNED &&
+                  xt_stats.stale == stale_before + 1 && !memcmp(arena_before, arena, sizeof(arena)),
+              "a store into page %d at 0x%x from within, after a device wrote without DC IVAC: "
+              "answer %d, state %d",
+              page, off, ret, state[page]);
+        seen.stale_store++;
+    }
+    /* Otherwise the reads of verify() find out */
+    if (state[page] != HV_XPAGE_XONLY)
+        stale[page] = false;
 }
 
 /* Things that hv_xtrack.c answers without carrying anything out */
@@ -910,16 +1176,14 @@ static void step_other(void)
                                    "page %d, state %d",
              page, st);
 
-    switch (rnd_below(7)) {
+    switch (rnd_below(8)) {
         case 0:
-            /* DC IVAC on a page of code: done as DC CIVAC, and the guest goes on behind it */
+            /* DC IVAC on a page of code, from another page or the page itself: it becomes data */
             if (!is_code(st))
                 return;
-            test_civac = 0;
-            ret = data_abort(&c, I_DC_IVAC | 1, ipa_of(other, 0), at, 0x9200014f, false);
-            check(ret == HV_XTRACK_SKIP && test_civac == (u64)&arena[at - ARENA_IPA],
-                  "dc ivac on page %d: answer %d, dc civac at 0x%lx", page, ret, test_civac);
-            break;
+            ivac(page, ipa_of(rnd_below(2) ? other : page, 0));
+            check(!memcmp(arena_before, arena, sizeof(arena)), "dc ivac changed memory");
+            return;
         case 1:
             /* A walk of the guest's stage 1 that stage 2 refuses: no telling which page */
             ret = data_abort(&c, I_LDR, ipa_of(other, 0), at, 0x920000cf, false);
@@ -957,6 +1221,23 @@ static void step_other(void)
             ret = data_abort(&c, I_STXR, ipa_of(page, 0), at, 0x9200004f, false);
             check(ret == HV_XTRACK_STOP, "stxr into page %d from within: answer %d", page, ret);
             break;
+        case 6: {
+            /*
+             * Translation faults: another core met the page with an invalid entry on its way
+             * from one state to another, and it is done now. Not for hv_xtrack_dabort(); a
+             * fetch, on any page of memory, is tried again
+             */
+            struct exc_info ctx = {.cpu_id = 1, .elr = at};
+
+            ret = data_abort(&c, I_LDR, ipa_of(other, 0), at, 0x92000007 | (rnd_below(2) << 6),
+                             false);
+            check(ret == HV_XTRACK_NONE, "a translation fault on page %d: answer %d", page, ret);
+            test_esr = 0x82000007 | (rnd_below(2) ? BIT(7) : 0);
+            test_far = at;
+            check(hv_xtrack_iabort(&ctx), "an instruction abort, translation fault, on page %d",
+                  page);
+            break;
+        }
         default:
             /* Faults that the page tables do not explain: what another core left in a TLB */
             if (st == HV_XPAGE_UNSCANNED)
@@ -1005,8 +1286,26 @@ static void fill(void)
             words[WORDS - 1] = an_access();
         }
         state[p] = HV_XPAGE_UNSCANNED;
+        target[p] = guest_page(p);
+        stale[p] = false;
     }
     memcpy(arena, ref, sizeof(arena));
+    /* Lines of the guest's pages may be anywhere, clean or not: start with some that are not */
+    memcpy(poc_arena, arena, sizeof(arena));
+    for (int i = 0; i < 64; i++)
+        poc_arena[rnd_below(sizeof(poc_arena))] ^= 0x5a;
+    ic_pending = ic_owed = false;
+    stale_possible = false;
+}
+
+/* hv_xtrack_init() and hv_xtrack_start(), as src/hv/hv.c and hv_pt_xtrack() call them */
+static void start(void)
+{
+    fill();
+    hv_pmu_init();
+    hv_xtrack_init();
+    check(hv_xtrack_start() == 0, "hv_xtrack_start() failed");
+    stale_count = xt_stats.stale;
 }
 
 /* The few things that are better said one by one */
@@ -1015,9 +1314,15 @@ static void test_directed(void)
     struct cpu c = {0};
     int ret;
 
+    /* No memory for the shadow pages: execution tracking does not start */
     fill();
     hv_pmu_init();
     hv_xtrack_init();
+    test_no_memory = true;
+    check(hv_xtrack_start() < 0, "execution tracking starts without its shadow pages");
+    test_no_memory = false;
+
+    start();
 
     /* Page 2 has no access, page 1 has */
     check(exec_page(2) && state[2] == HV_XPAGE_SCANNED, "page 2 runs: state %d", state[2]);
@@ -1031,9 +1336,13 @@ static void test_directed(void)
     test_far = 0x1000000000;
     check(!hv_xtrack_iabort(&ctx), "the guest executes device registers and is not stopped");
     test_esr = 0x82000007; /* translation fault */
+    check(!hv_xtrack_iabort(&ctx), "the guest executes device registers and is not stopped");
     test_far = ipa_of(3, 0);
+    check(hv_xtrack_iabort(&ctx) && state[3] == HV_XPAGE_UNSCANNED,
+          "a translation fault on page 3 is not tried again, or is taken for a first execution");
+    test_esr = 0x82000010; /* a synchronous external abort */
     check(!hv_xtrack_iabort(&ctx) && state[3] == HV_XPAGE_UNSCANNED,
-          "a translation fault on page 3 is taken for a first execution");
+          "an external abort on page 3 is tried again");
 
     /* The instruction cannot be read */
     c.x[1] = ipa_of(1, 0);
@@ -1068,6 +1377,24 @@ static void test_directed(void)
     test_xtrack_on = true;
 
     verify("the directed checks", 0);
+
+    /*
+     * DC IVAC on every line of a page of code, from that page: each makes the page data, the
+     * next instruction scans it again, and so on. Slow, but it does not go round in circles
+     */
+    snprintf(doing, sizeof(doing), "dc ivac on each line of page 1, from page 1");
+    for (u32 line = 0; line < PAGE; line += LINE) {
+        check(exec_page(1) && state[1] == HV_XPAGE_XONLY, "page 1 does not run again");
+        c.x[1] = ipa_of(1, line);
+        test_civac = 0;
+        ret = data_abort(&c, I_DC_IVAC | 1, ipa_of(1, 4 * rnd_below(WORDS)), c.x[1], 0x9200014f,
+                         false);
+        check(ret == HV_XTRACK_SKIP && state[1] == HV_XPAGE_UNSCANNED &&
+                  test_civac == (u64)&arena[PAGE + line],
+              "dc ivac at 0x%x of page 1 from within: answer %d, state %d", line, ret, state[1]);
+        seen.ivac_same++;
+    }
+    verify("dc ivac on every line", 0);
 }
 
 int main(int argc, char **argv)
@@ -1077,22 +1404,24 @@ int main(int argc, char **argv)
     test_directed();
 
     for (int round = 0; round < 4; round++) {
-        fill();
-        hv_pmu_init();
-        hv_xtrack_init();
+        start();
         for (u64 step = 0; step < steps / 4 && failures < 30; step++) {
             u32 what = rnd_below(100);
 
-            if (what < 12)
+            if (what < 12) {
+                snprintf(doing, sizeof(doing), "a page runs");
                 exec_page(rnd_below(NR_PAGES));
-            else if (what < 88)
+            } else if (what < 86) {
                 step_instruction(step);
-            else if (what < 92)
+            } else if (what < 92) {
                 step_dma();
-            else
+            } else {
                 step_other();
-            verify(what < 12 ? "a page run" : what < 88 ? "an instruction" : what < 92 ? "DMA"
-                                                                                       : "other",
+            }
+            verify(what < 12   ? "a page run"
+                   : what < 86 ? "an instruction"
+                   : what < 92 ? "DMA"
+                               : "other",
                    step);
         }
     }
@@ -1103,14 +1432,19 @@ int main(int argc, char **argv)
            seen.native, seen.carried, seen.with_syndrome, seen.two_pages, seen.same_page,
            seen.loads, seen.stores, seen.atomics, seen.cas, seen.zva, seen.simd, seen.wback,
            seen.literal, seen.retries, seen.stops);
-    printf("xtrack-model: %lu pages run (%lu found the table full), %lu times a device wrote (%lu "
-           "over something replaced)\n",
-           seen.execs, seen.exec_full, seen.dma, seen.stale);
+    printf("xtrack-model: %lu pages run (%lu found no shadow page left); %lu times a device wrote "
+           "(%lu into an execute-only page), with DC IVAC before %lu, after %lu, both %lu; "
+           "without, found by a read %lu, by a store %lu, by the reads of the checks %lu; %lu dc "
+           "ivac from the page itself\n",
+           seen.execs, seen.exec_full, seen.dma, seen.dma_over_shadow, seen.ivac_before,
+           seen.ivac_after, seen.ivac_both, seen.stale_read, seen.stale_store, seen.stale_left,
+           seen.ivac_same);
     /* The random guest has been everywhere it is meant to go */
     check(seen.native && seen.carried && seen.with_syndrome && seen.two_pages && seen.same_page &&
               seen.loads && seen.stores && seen.atomics && seen.cas && seen.zva && seen.simd &&
               seen.wback && seen.literal && seen.retries && seen.stops && seen.exec_full &&
-              seen.stale,
+              seen.dma_over_shadow && seen.ivac_before && seen.ivac_after && seen.ivac_both &&
+              seen.stale_read && seen.stale_store && seen.stale_left && seen.ivac_same,
           "the random guest left something out");
     hv_xtrack_report();
 

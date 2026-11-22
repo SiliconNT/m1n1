@@ -168,9 +168,8 @@ void hv_pmu_init(void);
 bool hv_pmu_is_access(u32 insn);
 u32 hv_pmu_patch_word(u32 insn);
 u32 hv_pmu_unpatch_word(u32 insn);
-u32 hv_pmu_original_word(u32 insn);
 u32 hv_pmu_count_accesses(const u32 *words, u32 count);
-u32 hv_pmu_patch_range(u32 *words, u32 count, u64 *map);
+u32 hv_pmu_patch_range(const u32 *from, u32 *to, u32 count);
 bool hv_pmu_hvc(struct exc_info *ctx, u16 imm);
 void hv_pmu_report(void);
 
@@ -180,22 +179,23 @@ bool hv_dbg_handle_msr(struct exc_info *ctx, u64 iss);
 void hv_dbg_report(void);
 
 /*
- * Execution tracking: a page of the guest is scanned before it first executes, and what was
- * replaced in it is kept from being read (hv_xtrack.c)
+ * Execution tracking: a page of the guest is scanned before it first executes, and the core
+ * executes a copy of it in which what had to be replaced is replaced (hv_xtrack.c)
  */
 int hv_pt_xtrack(void);
 bool hv_pt_xtrack_on(void);
-#define HV_XPAGE_UNSCANNED 0 // data: read and written, not executed
-#define HV_XPAGE_SCANNED   1 // code, nothing replaced: read and executed, not written
-#define HV_XPAGE_NONE      2 // no access at all, while its content is being changed
-#define HV_XPAGE_XONLY     3 // code with replaced instructions: executed only
+#define HV_XPAGE_UNSCANNED 0 // data: read and written, not executed; the guest's page
+#define HV_XPAGE_SCANNED   1 // code, nothing replaced: read and executed; the guest's page
+#define HV_XPAGE_INVALID   2 // an invalid entry, while the page goes from one state to another
+#define HV_XPAGE_XONLY     3 // code with replaced instructions: executed only; a shadow page
 int hv_pt_scanned(u64 ipa, u64 *pa);
-int hv_pt_set_scanned(u64 ipa, int state);
+int hv_pt_set_scanned(u64 ipa, int state, u64 pa);
 #define HV_XTRACK_NONE  0
 #define HV_XTRACK_RETRY 1
 #define HV_XTRACK_STOP  2
 #define HV_XTRACK_SKIP  3
 void hv_xtrack_init(void);
+int hv_xtrack_start(void);
 bool hv_xtrack_iabort(struct exc_info *ctx);
 int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write);
 void hv_xtrack_report(void);

@@ -253,7 +253,7 @@ static void test_which_words(void)
 
 static void test_patch_range(void)
 {
-    static u32 page[PAGE_WORDS], orig[PAGE_WORDS];
+    static u32 page[PAGE_WORDS], orig[PAGE_WORDS], copy[PAGE_WORDS], again[PAGE_WORDS];
     u64 x = 12345;
 
     for (int i = 0; i < PAGE_WORDS; i++) {
@@ -273,40 +273,37 @@ static void test_patch_range(void)
     page[PAGE_WORDS - 1] = MSR(PMINTENCLR_EL1, 3);
     memcpy(orig, page, sizeof(page));
 
-    /* Counting changes nothing; replacing marks every word that it replaces */
-    static u64 map[PAGE_WORDS / 64 + 1];
-
-    memset(map, 0, sizeof(map));
+    /* Counting changes nothing; the copy has every access replaced, and the page stays as it was */
     CHECK(hv_pmu_count_accesses(page, PAGE_WORDS) == 5 && !memcmp(orig, page, sizeof(page)),
           "counting the accesses");
-    CHECK(hv_pmu_patch_range(page, PAGE_WORDS, map) == 5, "first scan");
+    memset(copy, 0x5a, sizeof(copy));
+    CHECK(hv_pmu_patch_range(page, copy, PAGE_WORDS) == 5, "first scan");
+    CHECK(!memcmp(orig, page, sizeof(page)), "the page that was copied from has changed");
     for (int i = 0; i < PAGE_WORDS; i++) {
         bool was = i == 0 || i == 100 || i == 101 || i == 2000 || i == PAGE_WORDS - 1;
-        bool marked = map[i / 64] & (1UL << (i % 64));
 
-        CHECK(marked == was, "word %d is %smarked", i, marked ? "" : "not ");
+        /* The guest has a read of CNTVCT_EL0 of its own at 102, which is copied as it is */
         if (i == 0)
-            CHECK(page[i] == MRS(CNTVCT_EL0, 9), "word 0 is 0x%08x", page[i]);
+            CHECK(copy[i] == MRS(CNTVCT_EL0, 9), "word 0 is 0x%08x", copy[i]);
         else if (was)
-            CHECK(page[i] != orig[i] && hv_pmu_unpatch_word(page[i]) == orig[i], "word %d", i);
+            CHECK(copy[i] != orig[i] && hv_pmu_unpatch_word(copy[i]) == orig[i], "word %d", i);
         else
-            CHECK(page[i] == orig[i], "word %d changed", i);
-        /* What a replaced word was. The guest has a read of CNTVCT_EL0 of its own at 102 */
-        if (was)
-            CHECK(hv_pmu_original_word(page[i]) == orig[i], "word %d was 0x%08x, not 0x%08x", i,
-                  orig[i], hv_pmu_original_word(page[i]));
+            CHECK(copy[i] == orig[i], "word %d is not copied as it is", i);
     }
-    CHECK(hv_pmu_original_word(page[1]) == 0 && hv_pmu_original_word(page[2001]) == 0,
-          "a word that is nothing an access becomes has an original");
-    CHECK(hv_pmu_count_accesses(page, PAGE_WORDS) == 0, "accesses left after the scan");
-    memset(map, 0, sizeof(map));
-    CHECK(hv_pmu_patch_range(page, PAGE_WORDS, map) == 0 && !map[0] && !map[1], "second scan");
-    CHECK(hv_pmu_patch_range(page, 0, map) == 0, "no words");
+    CHECK(hv_pmu_count_accesses(copy, PAGE_WORDS) == 0, "accesses left in the copy");
+    /* What an access becomes is not replaced again */
+    memset(again, 0x5a, sizeof(again));
+    CHECK(hv_pmu_patch_range(copy, again, PAGE_WORDS) == 0 && !memcmp(copy, again, sizeof(copy)),
+          "second scan");
+    CHECK(hv_pmu_patch_range(page, again, 0) == 0 && !memcmp(copy, again, sizeof(copy)),
+          "no words");
 
     /* Only the words it is given */
-    memcpy(page, orig, sizeof(page));
-    CHECK(hv_pmu_patch_range(page + 1, 99, map) == 0, "words 1..99");
-    CHECK(page[0] == orig[0] && page[100] == orig[100], "the words outside");
+    memset(copy, 0x5a, sizeof(copy));
+    CHECK(hv_pmu_patch_range(page + 1, copy + 1, 99) == 0, "words 1..99");
+    CHECK(copy[0] == 0x5a5a5a5a && copy[100] == 0x5a5a5a5a && copy[1] == orig[1] &&
+              copy[99] == orig[99],
+          "the words outside, or the words inside");
 }
 
 /* ---- the guest ---- */

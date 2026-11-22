@@ -33,9 +33,10 @@
  * untouched, as after a trapped access. HVC is undefined at EL0 (Arm DDI 0487 M.d, rule
  * RZVTPR), so these stay what they are on this core when code at EL0 executes them: undefined.
  *
- * When a page is scanned is decided in hv_xtrack.c, which also keeps the guest from reading
- * what was replaced. This file is the part that does not depend on page tables: which words,
- * what they become, what they were, and what the answers are.
+ * When a page is scanned is decided in hv_xtrack.c, which also does the replacing in a copy
+ * of the page that only the core executes, so that the guest never reads what was replaced.
+ * This file is the part that does not depend on page tables: which words, what they become,
+ * and what the answers are.
  *
  * The answers: the control registers keep what is written to them, as far as a PMU with a
  * cycle counter and no event counters (PMCR_EL0.N = 0) has the bits. Writes of PMCCNTR_EL0
@@ -201,18 +202,6 @@ u32 hv_pmu_unpatch_word(u32 insn)
     return orig;
 }
 
-/*
- * What a word was before hv_pmu_patch_word() made it what it is now, or 0 if it is nothing
- * that makes. Only for a word that is known to have been replaced: a read of CNTVCT_EL0 does
- * not say whether the guest wrote it itself.
- */
-u32 hv_pmu_original_word(u32 insn)
-{
-    if ((insn & MRS_RT_MASK) == MRS_CNTVCT)
-        return MRS_PMCCNTR | (insn & 31);
-    return hv_pmu_unpatch_word(insn);
-}
-
 /* How many of count words are accesses. Nothing is changed */
 u32 hv_pmu_count_accesses(const u32 *words, u32 count)
 {
@@ -231,23 +220,25 @@ u32 hv_pmu_count_accesses(const u32 *words, u32 count)
 }
 
 /*
- * Replace the accesses in count words, and set bit i of map (64 bits to an entry) for each
- * word i that was one. Returns how many there were. Words that are already what an access
- * becomes, put there by the guest, are left alone and not marked.
+ * Copy count words from from to to, with every access replaced. from is not changed. Returns
+ * how many accesses there were. Words that are already what an access becomes, put there by
+ * the guest, are copied as they are.
  */
-u32 hv_pmu_patch_range(u32 *words, u32 count, u64 *map)
+u32 hv_pmu_patch_range(const u32 *from, u32 *to, u32 count)
 {
     u32 n = 0;
 
     for (u32 i = 0; i < count; i++) {
-        if ((words[i] & SYSINSN_MASK) != SYSINSN_OP0_3)
+        u32 word = from[i];
+
+        to[i] = word;
+        if ((word & SYSINSN_MASK) != SYSINSN_OP0_3)
             continue;
-        if (!hv_pmu_is_access(words[i]))
+        if (!hv_pmu_is_access(word))
             continue;
-        if (hv_pmu_is_ccntr_read(words[i]))
+        if (hv_pmu_is_ccntr_read(word))
             pmu_stats.ccntr++;
-        words[i] = hv_pmu_patch_word(words[i]);
-        map[i / 64] |= BIT(i % 64);
+        to[i] = hv_pmu_patch_word(word);
         n++;
     }
 

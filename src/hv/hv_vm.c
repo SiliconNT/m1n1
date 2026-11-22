@@ -43,9 +43,7 @@ extern uint64_t ram_base;
 #define PTE_XN_ALL (0b10L << 53)
 /* One of the bits a descriptor leaves to software: this page has been scanned, see hv_xtrack.c */
 #define PTE_SW_SCANNED BIT(56)
-/* ...or nobody has access to it for the moment: its content is being changed */
-#define PTE_SW_NONE BIT(57)
-/* ...or it is execute-only: scanned, executable, and neither read nor written */
+/* ...and it is execute-only: executable, neither read nor written, and a shadow page */
 #define PTE_SW_XONLY BIT(58)
 
 #define PTE_VALID BIT(0)
@@ -138,9 +136,14 @@ static u64 *hv_Ltop;
 /* What every hardware mapping that has not been scanned carries in XN; 0 while tracking is off */
 static u64 hv_pt_xn;
 
+/* The page that hv_pt_set_scanned() has given an invalid entry, on its way to another state */
+#define HV_PT_NO_PAGE (~0UL)
+static u64 hv_pt_switching;
+
 void hv_pt_init(void)
 {
     hv_pt_xn = 0;
+    hv_pt_switching = HV_PT_NO_PAGE;
 
     const uint64_t pa_bits[] = {32, 36, 40, 42, 44, 48, 52};
     uint64_t pa_range = FIELD_GET(ID_AA64MMFR0_PARange, mrs(ID_AA64MMFR0_EL1));
@@ -488,10 +491,14 @@ static void hv_pt_xn_l2(u64 *l2, u64 base)
 /*
  * Start tracking execution: from now on no hardware mapping is executable, at EL1 or at EL0,
  * until hv_pt_set_scanned() says so, and the mappings that exist already are changed to match.
- * There is no way back short of hv_pt_init().
+ * There is no way back short of hv_pt_init(). hv_xtrack.c sets aside the memory it needs
+ * first, before there is a guest to stop (-1 if it cannot).
  */
 int hv_pt_xtrack(void)
 {
+    if (hv_xtrack_start() < 0)
+        return -1;
+
     hv_pt_xn = PTE_XN_ALL;
 
     for (u64 i = 0; i < ENTRIES_PER_L1_TABLE; i++)
@@ -511,9 +518,10 @@ bool hv_pt_xtrack_on(void)
 /*
  * The state of the page of memory at this IPA while execution is tracked: HV_XPAGE_SCANNED
  * (executable, read-only), HV_XPAGE_UNSCANNED (writable, not executable), HV_XPAGE_XONLY
- * (executable, and no data access), HV_XPAGE_NONE (no access of any kind, for as long as
- * hv_xtrack.c takes to change what is in it), or -1 if there is no memory there: device
- * registers are not memory. *pa is where the page is.
+ * (executable, and no data access), or -1 if there is no memory there: device registers are
+ * not memory, and neither is a page while its entry is invalid (HV_XPAGE_INVALID). *pa is the
+ * physical page that the entry points to, the one that the core executes: for HV_XPAGE_XONLY
+ * that is a shadow page of hv_xtrack.c, not the guest's page.
  */
 int hv_pt_scanned(u64 ipa, u64 *pa)
 {
@@ -529,30 +537,57 @@ int hv_pt_scanned(u64 ipa, u64 *pa)
     *pa = pte & PTE_TARGET_MASK;
     if (pte & PTE_SW_XONLY)
         return HV_XPAGE_XONLY;
-    if (pte & PTE_SW_NONE)
-        return HV_XPAGE_NONE;
     return pte & PTE_SW_SCANNED ? HV_XPAGE_SCANNED : HV_XPAGE_UNSCANNED;
 }
 
-int hv_pt_set_scanned(u64 ipa, int state)
+/*
+ * Put the page of memory at this IPA into a state, with its entry pointing to the physical
+ * page pa (which HV_XPAGE_INVALID does not use). A page goes from one state to another through
+ * an invalid entry, with the TLBs of all cores told: break-before-make, which Arm DDI 0487 M.d
+ * asks for when an entry of tables that several cores use changes the page it points to
+ * (D8.17.1, rules RWHZWS and RDDMVT). An entry that gives no access at all would not do: one
+ * that makes a permission fault may be held in a TLB (D8.15.1.5, rule RJVXRH). So it is
+ * HV_XPAGE_INVALID for a valid page, then another state for that page and no other. Returns
+ * -1, with nothing changed, if it is not so or there is no memory at ipa.
+ */
+int hv_pt_set_scanned(u64 ipa, int state, u64 pa)
 {
-    u64 pa;
+    u64 attrs, was;
 
     ipa &= ~MASK(VADDR_L3_OFFSET_BITS);
-    if (hv_pt_scanned(ipa, &pa) < 0)
+
+    if (state == HV_XPAGE_INVALID) {
+        if (hv_pt_switching != HV_PT_NO_PAGE || hv_pt_scanned(ipa, &was) < 0)
+            return -1;
+        if (hv_map(ipa, 0, PAGE_SIZE, 0) < 0)
+            return -1;
+        hv_pt_switching = ipa;
+        hv_pt_flush_tlb();
+        return 0;
+    }
+
+    if (ipa != hv_pt_switching || (pa & MASK(VADDR_L3_OFFSET_BITS)))
         return -1;
 
     /* hv_map() puts the XN bits on a mapping that does not say PTE_SW_SCANNED */
-    u64 attrs = PTE_ATTRIBUTES;
-    if (state == HV_XPAGE_SCANNED)
-        attrs = PTE_ATTRIBUTES_RO | PTE_SW_SCANNED;
-    else if (state == HV_XPAGE_NONE)
-        attrs = PTE_ATTRIBUTES_NONE | PTE_SW_NONE;
-    else if (state == HV_XPAGE_XONLY)
-        attrs = PTE_ATTRIBUTES_NONE | PTE_SW_SCANNED | PTE_SW_XONLY;
+    switch (state) {
+        case HV_XPAGE_UNSCANNED:
+            attrs = PTE_ATTRIBUTES;
+            break;
+        case HV_XPAGE_SCANNED:
+            attrs = PTE_ATTRIBUTES_RO | PTE_SW_SCANNED;
+            break;
+        case HV_XPAGE_XONLY:
+            attrs = PTE_ATTRIBUTES_NONE | PTE_SW_SCANNED | PTE_SW_XONLY;
+            break;
+        default:
+            return -1;
+    }
     if (hv_map(ipa, pa | attrs | PTE_VALID, PAGE_SIZE, 1) < 0)
         return -1;
 
+    /* An invalid entry that becomes valid needs no TLB invalidation (D8.17); the barriers do */
+    hv_pt_switching = HV_PT_NO_PAGE;
     hv_pt_flush_tlb();
     return 0;
 }
@@ -663,7 +698,8 @@ u64 hv_pt_walk(u64 addr)
  * Where EL2 finds the instruction at this address of the guest, or 0. Stage 1 as the guest
  * has it, and stage 2 from the tables here: the address translation instructions for both
  * stages ask for the read permission of stage 2, which a page that is execute-only does not
- * have (hv_xtrack.c), and the instruction is in it all the same.
+ * have (hv_xtrack.c), and the instruction is in it all the same. It is the copy that the core
+ * executes: for an execute-only page the shadow page, which is what EL2 has to carry out.
  */
 u64 hv_translate_insn(u64 addr)
 {
@@ -1463,7 +1499,13 @@ bool hv_handle_dabort(struct exc_info *ctx)
                 // It has said why
                 return false;
             default:
-                printf("HV: Data abort on mapped page (0x%lx -> 0x%lx)\n", far, pte);
+                /*
+                 * A translation fault (DFSC 0b0001xx, D24.2.45) on a page that is mapped now:
+                 * another core had it through an invalid entry on the way from one state to
+                 * another (hv_pt_set_scanned()), and is done. Nothing to say about that.
+                 */
+                if ((FIELD_GET(ESR_ISS_DABORT_DFSC, esr) & 0x3c) != 0x04)
+                    printf("HV: Data abort on mapped page (0x%lx -> 0x%lx)\n", far, pte);
                 // Try again, this is usually a race
                 ctx->elr -= 4;
                 return true;
