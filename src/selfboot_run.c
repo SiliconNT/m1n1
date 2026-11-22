@@ -47,6 +47,9 @@
 /* No host: not a port that usb_iodev_vuart_setup() of src/usb.c takes */
 #define NO_HOST IODEV_NUM
 
+/* The pages of stage 2 in this tree (src/hv/hv_vm.c) */
+#define STAGE2_PAGE 0x1000UL
+
 /* What follows hv_init() in HV.init(), as far as the M4 has it */
 static void selfboot_regs(void)
 {
@@ -121,6 +124,22 @@ static int selfboot_map(const struct selfboot_layout *l, iodev_id_t host)
             return -1;
         }
 
+    /*
+     * Without a host the guest has no UART: the UART is taken out again from the range it
+     * lies in, and the guest's device tree does not name it (selfboot_enter()). SiliconNT
+     * docs/DESIGN.md, "开发模式": the UART is for a debugger, on the host.
+     */
+    if (host == NO_HOST) {
+        if (adt_path_offset_trace(adt, UART, path) < 0)
+            return 0;
+        if (adt_get_reg(adt, path, "reg", 0, &uart, &size) < 0 ||
+            hv_unmap(uart, ALIGN_UP(size, STAGE2_PAGE)) < 0) {
+            printf("selfboot: " UART " cannot be taken from the guest\n");
+            return -1;
+        }
+        return 0;
+    }
+
     /* The virtual UART in place of the real one, after the range it lies in */
     if (adt_path_offset_trace(adt, UART, path) < 0 ||
         adt_get_reg(adt, path, "reg", 0, &uart, NULL) < 0 ||
@@ -180,6 +199,9 @@ static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
 
     /* The device tree and the boot arguments: load_firmware() and HV.start() */
     if (selfboot_adt((void *)l->adt_base, cur_boot_args.devtree_size, l) < 0)
+        return -1;
+    /* Without a host the guest has no UART (selfboot_map()), and the firmware no serial port */
+    if (host == NO_HOST && selfboot_adt_unname((void *)l->adt_base, UART) < 0)
         return -1;
     memset((void *)l->bootargs, 0, SELFBOOT_BOOTARGS_SIZE);
     selfboot_boot_args((struct boot_args *)l->bootargs, &cur_boot_args, l);
@@ -269,5 +291,5 @@ int selfboot_run_loaded(u64 phys_base, u64 image_size, u64 disk_size, int host_i
         selfboot_check_disk((void *)l.disk_base, disk_size) < 0)
         return -1;
 
-    return selfboot_enter(&l, host_iodev);
+    return selfboot_enter(&l, host_iodev == SELFBOOT_NO_HOST ? NO_HOST : host_iodev);
 }

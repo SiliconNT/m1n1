@@ -30,6 +30,9 @@
 
 #define SMC_ENDPOINT 0x20
 
+/* How long an answer may take: SMC_TIMEOUT_MS of Linux, drivers/mfd/macsmc.c */
+#define SMC_TIMEOUT_USEC 500000
+
 struct smc_dev {
     asc_dev_t *asc;
     rtkit_dev_t *rtkit;
@@ -43,27 +46,37 @@ struct smc_dev {
 
 static void smc_handle_msg(smc_dev_t *smc, u64 msg)
 {
-    if (!smc->shmem)
-        smc->shmem = (void *)msg;
-    else {
-        u8 result = FIELD_GET(SMC_RESULT_RESULT, msg);
-        u8 id = FIELD_GET(SMC_RESULT_ID, msg);
-        if (result == SMC_NOTIFICATION) {
-            printf("SMC: Notification: 0x%08lx\n", FIELD_GET(SMC_RESULT_VALUE, msg));
-            return;
-        }
-        smc->outstanding[id] = false;
-        smc->ret[id] = msg;
+    u8 result = FIELD_GET(SMC_RESULT_RESULT, msg);
+    u8 id = FIELD_GET(SMC_RESULT_ID, msg);
+
+    /*
+     * A notification can come at any time, also before the answer to SMC_INITIALIZE, which
+     * is the address of the shared memory: an SMC that was running before may have them
+     * turned on (SiliconNT docs/findings/0067)
+     */
+    if (result == SMC_NOTIFICATION) {
+        printf("SMC: Notification: 0x%08lx\n", FIELD_GET(SMC_RESULT_VALUE, msg));
+        return;
     }
+    if (!smc->shmem) {
+        smc->shmem = (void *)msg;
+        return;
+    }
+    smc->outstanding[id] = false;
+    smc->ret[id] = msg;
 }
 
-static int smc_work(smc_dev_t *smc)
+/* Takes one message; -1 if the SMC is gone, or if nothing came before the timeout */
+static int smc_work(smc_dev_t *smc, u64 timeout)
 {
     int ret;
     struct rtkit_message msg;
 
     while ((ret = rtkit_recv(smc->rtkit, &msg)) == 0)
-        ;
+        if (timeout_expired(timeout)) {
+            printf("SMC: no answer within %d ms\n", SMC_TIMEOUT_USEC / 1000);
+            return -1;
+        }
 
     if (ret < 0) {
         printf("SMC: rtkit_recv failed!\n");
@@ -98,9 +111,13 @@ static int smc_cmd(smc_dev_t *smc, u64 message)
 
     message |= FIELD_PREP(SMC_MSG_ID, id);
 
+    u64 timeout = timeout_calculate(SMC_TIMEOUT_USEC);
     smc_send(smc, message);
     while (smc->outstanding[id])
-        smc_work(smc);
+        if (smc_work(smc, timeout) < 0) {
+            smc->outstanding[id] = false;
+            return -1;
+        }
 
     u64 result = smc->ret[id];
     u32 ret = FIELD_GET(SMC_RESULT_RESULT, result);
@@ -151,10 +168,11 @@ smc_dev_t *smc_init(void)
     u64 initialize =
         FIELD_PREP(SMC_MSG_TYPE, SMC_INITIALIZE) | FIELD_PREP(SMC_MSG_ID, smc->msgid++);
 
+    u64 timeout = timeout_calculate(SMC_TIMEOUT_USEC);
     smc_send(smc, initialize);
 
     while (!smc->shmem) {
-        int ret = smc_work(smc);
+        int ret = smc_work(smc, timeout);
         if (ret < 0)
             goto out_rtkit;
     }

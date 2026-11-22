@@ -211,6 +211,16 @@ struct virtio_conf;
 void hv_map_virtio(u64 base, struct virtio_conf *conf);
 void virtio_put_buffer(u64 base, int qu, u32 id, u32 len);
 
+/*
+ * Without a host (hv_stop.c): whether there is one, and what is done instead of telling it.
+ * hv_stop_if_no_host() returns at once if there is a host, and does not return if not.
+ */
+bool hv_has_host(void);
+void hv_stop_if_no_host(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type);
+/* Restarting and powering off the machine (hv_power.c): they return only if it did not happen */
+void hv_power_reset(void);
+void hv_power_off(void);
+
 /* Exceptions */
 void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type, void *extra);
 void hv_set_time_stealing(bool enabled, bool reset);

@@ -28,9 +28,12 @@ while IFS='@' read -r name file expr test; do
     elif [ "$test" = aicmap ]; then
         gcc $CFLAGS -o "$work/t" aicmap_test.c model.c "$work/hv_layout.c" 2>"$work/cc.log"
     else
-        other=hv_layout.c; [ "$file" = hv_layout.c ] && other=selfboot_run.c
-        gcc $CFLAGS -o "$work/t" run_test.c model.c build/selfboot.c build/selfboot_files.c \
-            "$work/$file" "build/$other" 2>"$work/cc.log"
+        # The files of run_test.c, with the broken one in place of its copy
+        files=""
+        for f in selfboot.c selfboot_files.c selfboot_run.c hv_layout.c; do
+            if [ "$f" = "$file" ]; then files="$files $work/$f"; else files="$files build/$f"; fi
+        done
+        gcc $CFLAGS -o "$work/t" run_test.c model.c $files 2>"$work/cc.log"
     fi || { echo "$name: does not compile"; cat "$work/cc.log"; bad=1; continue; }
     # In a shell of its own, which is what says so if the test is killed for reading where
     # nothing is: that is a way of failing too, and goes into the log
@@ -78,6 +81,14 @@ aicmap-no-version@hv_layout.c@s/map->version = HV_AICMAP_VERSION;/map->version =
 selfboot-table-size-untold@selfboot_run.c@/l->aicmap_size = aicmap_size;/d@run
 selfboot-table-refusal-ignored@selfboot_run.c@s/    if (aicmap_size < 0)/    if (0)/@run
 selfboot-table-not-written@selfboot_run.c@s/aicmap_size = hv_aicmap((struct hv_aicmap \*)l->aicmap);/aicmap_size = 8;/@run
+nohost-vuart@selfboot_run.c@s/    if (host == NO_HOST) {/    if (0) {/@run
+nohost-uart-left@selfboot_run.c@s/hv_unmap(uart, ALIGN_UP(size, STAGE2_PAGE)) < 0) {/0) {/@run
+nohost-uart-part-left@selfboot_run.c@s/hv_unmap(uart, ALIGN_UP(size, STAGE2_PAGE))/hv_unmap(uart, STAGE2_PAGE)/@run
+nohost-uart-named@selfboot_run.c@s/    if (host == NO_HOST && selfboot_adt_unname/    if (0 \&\& selfboot_adt_unname/@run
+host-uart-unnamed@selfboot_run.c@s/    if (host == NO_HOST && selfboot_adt_unname/    if (selfboot_adt_unname/@run
+loaded-no-host-ignored@selfboot_run.c@s/host_iodev == SELFBOOT_NO_HOST ? NO_HOST : host_iodev/host_iodev/@run
+unname-part-of-it@selfboot.c@s/memset(copy_of(dest, prop)->value, 0, prop->size);/memset(copy_of(dest, prop)->value, 0, 1);/@run
+unname-m1n1-tree@selfboot.c@s/memset(copy_of(dest, prop)->value, 0, prop->size);/memset((void *)prop->value, 0, prop->size);/@run
 EOF
 [ $bad = 0 ] && echo "broken: all $n failed, as they must"
 exit $bad

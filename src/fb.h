@@ -36,6 +36,14 @@ static inline rgb_t int2rgb(u32 c)
 }
 
 void fb_init(bool clear);
+/*
+ * SiliconNT: the console once more after fb_shutdown(), for the hypervisor to show why it has
+ * stopped its guest when there is no host (src/hv/hv_stop.c). Nothing is taken from the heap,
+ * which may have no room left by then: what is printed is drawn on the framebuffer itself,
+ * which is slower. The screen is cleared. Returns false if m1n1 has not had a framebuffer
+ * console since it started, so that nothing is mapped for one.
+ */
+bool fb_init_unbuffered(void);
 void fb_shutdown(bool restore_logo);
 void fb_reinit(void);
 void fb_update(void);

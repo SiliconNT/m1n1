@@ -24,9 +24,10 @@
  * w3 (DEN 0028 2.6); an error is -1 in all of x0, which is what both a 32-bit and a 64-bit
  * caller expect (5.1, 5.2).
  *
- * SYSTEM_RESET and SYSTEM_OFF do not reset or power off the machine: the guest is stopped for
- * good and the host of the hypervisor is told, which is where a machine that is run from
- * another one over USB wants to end up. CPU_ON and CPU_OFF are not written yet. A guest that
+ * SYSTEM_RESET and SYSTEM_OFF stop the guest for good (hv_exc_proxy()). With a host, the host
+ * of the hypervisor is told, and the machine does not restart or power off: that is where a
+ * machine that is run from another one over USB wants to end up. Without one, the machine
+ * restarts or powers off (hv_stop.c). CPU_ON and CPU_OFF are not written yet. A guest that
  * calls one of them is stopped the same way, because no answer it could be given is true.
  *
  * An hvc with another immediate is not PSCI ("the immediate value used with an SMC (or HVC)

@@ -460,6 +460,49 @@ static void test_adt_takes_a_spare_entry_that_is_free(void)
     default_tree();
 }
 
+/*
+ * Without a host the guest's tree does not name /arm-io/uart0 (src/selfboot_run.c): the value
+ * of the property "name" of a node becomes zeroes, and nothing else changes, m1n1's tree least
+ * of all. Here the node is /cpus/cpu0, which has a node before it and one after it.
+ */
+static void test_adt_unname(void)
+{
+    struct selfboot_layout l = r21_layout();
+    static u8 before[sizeof(tree)], copy[sizeof(guest_tree)];
+    const struct adt_property *name =
+        adt_get_property(adt, adt_path_offset(adt, "/cpus/cpu0"), "name");
+    size_t value = 32 + ((const u8 *)name->value - tree);
+    void *m1n1_tree = adt;
+
+    memcpy(before, tree, sizeof(tree));
+    memset(guest_tree, 0xee, sizeof(guest_tree));
+    CHECK_EQ(selfboot_adt(guest_tree + 32, tree_size, &l), 0);
+    memcpy(copy, guest_tree, sizeof(copy));
+    CHECK_EQ(name->size, 5);
+
+    CHECK_EQ(selfboot_adt_unname(guest_tree + 32, "/cpus/cpu0"), 0);
+    for (size_t i = 0; i < sizeof(guest_tree); i++) {
+        if (i >= value && i < value + name->size)
+            CHECK_EQ(guest_tree[i], 0);
+        else
+            CHECK_EQ(guest_tree[i], copy[i]);
+    }
+    CHECK(!memcmp(before, tree, sizeof(tree)));
+
+    /* Looked for by its path, as the firmware does (AppleDTLib.c), it is not there */
+    adt = guest_tree + 32;
+    CHECK(adt_path_offset(adt, "/cpus/cpu0") < 0);
+    CHECK(adt_path_offset(adt, "/chosen/memory-map") >= 0);
+    adt = m1n1_tree;
+    CHECK(adt_path_offset(adt, "/cpus/cpu0") >= 0);
+
+    /* A node that is not there: nothing to do */
+    memcpy(copy, guest_tree, sizeof(copy));
+    CHECK_EQ(selfboot_adt_unname(guest_tree + 32, "/arm-io/uart0"), 0);
+    CHECK(!memcmp(copy, guest_tree, sizeof(copy)));
+    default_tree();
+}
+
 static void test_adt_refuses_a_tree_without_what_it_needs(void)
 {
     struct selfboot_layout l = r21_layout();
@@ -496,6 +539,7 @@ int main(int argc, char **argv)
     test_boot_args();
     test_adt(argc > 1 ? argv[1] : NULL);
     test_adt_takes_a_spare_entry_that_is_free();
+    test_adt_unname();
     test_adt_refuses_a_tree_without_what_it_needs();
 
     printf("%d checks, %d failed\n", checks, failed);

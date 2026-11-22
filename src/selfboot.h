@@ -91,6 +91,13 @@ int selfboot_adt(void *dest, u32 size, const struct selfboot_layout *l);
  * gets the name and the range. selfboot_adt() adds RAMDisk and AICToGIC with it.
  */
 int selfboot_adt_add_range(void *dest, const char *name, u64 base, u64 bytes);
+/*
+ * The node at `path` of that copy loses its name: the value of its property "name" becomes
+ * zeroes, of the same length, so that the tree keeps its size and nothing in it moves, and
+ * nothing that looks for the node by its path finds it. Nothing is done if m1n1's tree has no
+ * such node.
+ */
+int selfboot_adt_unname(void *dest, const char *path);
 
 /*
  * The rest is selfboot_run.c: the part that touches the machine. It does what the host does
@@ -125,8 +132,11 @@ int selfboot_run(const char *part_uuid);
 /*
  * The same, for the proxy, when a host has put the two files where the layout above
  * phys_base has them: nothing is read. host_iodev is the port m1n1 talks to the host over;
- * it stays a console, and what the guest writes to its UART goes there too.
+ * it stays a console, and what the guest writes to its UART goes there too. Or it is
+ * SELFBOOT_NO_HOST: the host is not staying, and the guest runs as if m1n1 had read the files
+ * itself (SiliconNT docs/findings/0068, how R37 tests a machine without a host).
  */
+#define SELFBOOT_NO_HOST (-1)
 int selfboot_run_loaded(u64 phys_base, u64 image_size, u64 disk_size, int host_iodev);
 
 #endif

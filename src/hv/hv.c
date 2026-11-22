@@ -600,11 +600,11 @@ void hv_tick(struct exc_info *ctx)
     hv_wdt_pet();
     iodev_handle_events(uartproxy_iodev);
     /*
-     * Only a port the proxy listens on has a host behind it. Without one, as when m1n1 has
-     * started the guest by itself (selfboot_run.c), uartproxy_iodev is the UART, and a byte
-     * there is not a host that wants the guest stopped.
+     * Only a port the proxy listens on has a host behind it (hv_stop.c). Without one, as when
+     * m1n1 has started the guest by itself (selfboot_run.c), uartproxy_iodev is the UART, and
+     * a byte there is not a host that wants the guest stopped.
      */
-    if ((iodev_get_usage(uartproxy_iodev) & USAGE_UARTPROXY) && iodev_can_read(uartproxy_iodev)) {
+    if (hv_has_host() && iodev_can_read(uartproxy_iodev)) {
         printf("HV: User interrupt\n");
         iodev_console_flush();
         if (hv_pinned_cpu == -1 || hv_pinned_cpu == smp_id())

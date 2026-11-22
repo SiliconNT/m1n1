@@ -250,6 +250,22 @@ int selfboot_adt(void *dest, u32 size, const struct selfboot_layout *l)
     return selfboot_adt_add_range(dest, AICTOGIC, l->aicmap, l->aicmap_size);
 }
 
+int selfboot_adt_unname(void *dest, const char *path)
+{
+    int node = adt_path_offset(adt, path);
+    const struct adt_property *prop;
+
+    if (node < 0)
+        return 0;
+    prop = adt_get_property(adt, node, "name");
+    if (!prop) {
+        printf("selfboot: %s has no property name\n", path);
+        return -1;
+    }
+    memset(copy_of(dest, prop)->value, 0, prop->size);
+    return 0;
+}
+
 int selfboot_adt_add_range(void *dest, const char *name, u64 base, u64 bytes)
 {
     int node = adt_path_offset(adt, MEMORY_MAP);

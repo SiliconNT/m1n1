@@ -118,7 +118,7 @@ bool asc_can_send(asc_dev_t *asc)
 bool asc_send(asc_dev_t *asc, const struct asc_message *msg)
 {
     if (poll32(asc->base + ASC_MBOX_A2I_CONTROL, ASC_MBOX_CONTROL_FULL, 0, 200000)) {
-        printf("asc: A2I mailbox full for 200ms. Is the ASC stuck?");
+        printf("asc: A2I mailbox full for 200ms. Is the ASC stuck?\n");
         return false;
     }
 

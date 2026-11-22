@@ -493,9 +493,38 @@ bool rtkit_start_ep(rtkit_dev_t *rtk, u8 ep)
     return true;
 }
 
+/*
+ * A message for the management endpoint, before the timeout. What comes for other endpoints
+ * meanwhile is dropped: a coprocessor that was running before rtkit_boot(), as iBoot leaves
+ * the SMC, may still be sending it (SiliconNT docs/findings/0067).
+ */
+static bool rtkit_recv_mgmt(rtkit_dev_t *rtk, struct asc_message *msg, u64 timeout)
+{
+    while (!timeout_expired(timeout)) {
+        if (!asc_recv(rtk->asc, msg))
+            continue;
+        if (msg->msg1 == RTKIT_EP_MGMT)
+            return true;
+        rtkit_printf("dropping a message for endpoint 0x%x while booting: %lx\n", msg->msg1,
+                     msg->msg0);
+    }
+    return false;
+}
+
 bool rtkit_boot(rtkit_dev_t *rtk)
 {
     struct asc_message msg;
+    u64 timeout;
+    u32 msgtype;
+
+    /*
+     * What a coprocessor that was running already has left in the mailbox is no answer to what
+     * is sent here. A mailbox that never says it is empty is given up on after a second.
+     */
+    timeout = timeout_calculate(USEC_PER_SEC);
+    while (asc_recv(rtk->asc, &msg) && !timeout_expired(timeout))
+        rtkit_printf("dropping a message that was waiting for endpoint 0x%x: %lx\n", msg.msg1,
+                     msg.msg0);
 
     /* boot the IOP if it isn't already */
     asc_cpu_start(rtk->asc);
@@ -508,23 +537,17 @@ bool rtkit_boot(rtkit_dev_t *rtk)
         return false;
     }
 
-    if (!asc_recv_timeout(rtk->asc, &msg, USEC_PER_SEC)) {
-        rtkit_printf("did not receive HELLO\n");
-        return false;
-    }
-
-    if (msg.msg1 != RTKIT_EP_MGMT) {
-        rtkit_printf("expected HELLO but got message for EP 0x%x", msg.msg1);
-        return false;
-    }
-
-    u32 msgtype;
-    msgtype = FIELD_GET(MGMT_TYPE, msg.msg0);
-    if (msgtype != MGMT_MSG_HELLO) {
-        rtkit_printf("expected HELLO but got message with type 0x%02x", msgtype);
-
-        return false;
-    }
+    /* Within a second, as Linux waits for each step (drivers/soc/apple/rtkit.c) */
+    timeout = timeout_calculate(USEC_PER_SEC);
+    do {
+        if (!rtkit_recv_mgmt(rtk, &msg, timeout)) {
+            rtkit_printf("did not receive HELLO\n");
+            return false;
+        }
+        msgtype = FIELD_GET(MGMT_TYPE, msg.msg0);
+        if (msgtype != MGMT_MSG_HELLO)
+            rtkit_printf("expected HELLO, dropping a management message of type 0x%02x\n", msgtype);
+    } while (msgtype != MGMT_MSG_HELLO);
 
     u32 min_ver, max_ver, want_ver;
     min_ver = FIELD_GET(MGMT_MSG_HELLO_MINVER, msg.msg0);
@@ -555,15 +578,8 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     bool has_oslog = false;
     bool got_epmap = false;
     while (!got_epmap) {
-        if (!asc_recv_timeout(rtk->asc, &msg, USEC_PER_SEC)) {
+        if (!rtkit_recv_mgmt(rtk, &msg, timeout_calculate(USEC_PER_SEC))) {
             rtkit_printf("couldn't receive message while waiting for endpoint map\n");
-            return false;
-        }
-
-        if (msg.msg1 != RTKIT_EP_MGMT) {
-            rtkit_printf("expected management message while waiting for endpoint map but got "
-                         "message for endpoint 0x%x\n",
-                         msg.msg1);
             return false;
         }
 
@@ -634,6 +650,7 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     if (has_oslog && !rtkit_start_ep(rtk, RTKIT_EP_OSLOG))
         return false;
 
+    timeout = timeout_calculate(USEC_PER_SEC);
     while (rtk->iop_power != RTKIT_POWER_ON) {
         struct rtkit_message rtk_msg;
         int ret = rtkit_recv(rtk, &rtk_msg);
@@ -642,6 +659,10 @@ bool rtkit_boot(rtkit_dev_t *rtk)
                          rtk_msg.ep, rtk_msg.msg);
         else if (ret < 0)
             return false;
+        else if (rtk->iop_power != RTKIT_POWER_ON && timeout_expired(timeout)) {
+            rtkit_printf("did not say that it is on\n");
+            return false;
+        }
     }
 
     /* this enables syslog */

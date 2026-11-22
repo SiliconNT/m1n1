@@ -37,6 +37,9 @@ void hv_do_panic(void)
         printf("\n");
     }
 
+    /* Without a host nobody would answer below: the guest is stopped for good (hv_stop.c) */
+    hv_stop_if_no_host(NULL, START_HV, HV_PANIC);
+
     printf("Attempting to enter proxy\n");
     iodev_console_flush();
 

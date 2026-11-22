@@ -563,8 +563,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = hv_pt_xtrack();
             break;
         case P_SELFBOOT_RUN:
-            reply->retval = selfboot_run_loaded(request->args[0], request->args[1],
-                                                request->args[2], uartproxy_iodev);
+            /* args[3]: the host is not staying, and does not wait for this reply */
+            reply->retval =
+                selfboot_run_loaded(request->args[0], request->args[1], request->args[2],
+                                    request->args[3] ? SELFBOOT_NO_HOST : (int)uartproxy_iodev);
             break;
         case P_HV_AICMAP:
             reply->retval = hv_aicmap((struct hv_aicmap *)request->args[0]);

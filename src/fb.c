@@ -77,7 +77,9 @@ struct image orig_logo;
 
 void fb_update(void)
 {
-    memcpy128(fb.hwptr, fb.ptr, fb.size);
+    /* Without a copy in the heap (fb_init_unbuffered()) everything is on the screen already */
+    if (fb.ptr != fb.hwptr)
+        memcpy128(fb.hwptr, fb.ptr, fb.size);
 }
 
 static void fb_clear_font_row(u32 row)
@@ -401,7 +403,7 @@ void fb_clear_direct(void)
     memset64((void *)cur_boot_args.video.base, 0, fb_size);
 }
 
-void fb_init(bool clear)
+static void fb_setup(bool clear, bool unbuffered)
 {
     void *custom_128, *custom_256;
     fb.hwptr = (void *)cur_boot_args.video.base;
@@ -412,11 +414,16 @@ void fb_init(bool clear)
     fb.size = cur_boot_args.video.stride * cur_boot_args.video.height;
     printf("fb init: %dx%d (%d) [s=%d] @%p\n", fb.width, fb.height, fb.depth, fb.stride, fb.hwptr);
 
-    mmu_add_mapping(cur_boot_args.video.base, cur_boot_args.video.base, ALIGN_UP(fb.size, 0x4000),
-                    MAIR_IDX_NORMAL_NC, PERM_RW);
+    if (unbuffered) {
+        /* Mapped by the fb_init() of when m1n1 started */
+        fb.ptr = fb.hwptr;
+    } else {
+        mmu_add_mapping(cur_boot_args.video.base, cur_boot_args.video.base,
+                        ALIGN_UP(fb.size, 0x4000), MAIR_IDX_NORMAL_NC, PERM_RW);
 
-    fb.ptr = malloc(fb.size);
-    memcpy(fb.ptr, fb.hwptr, fb.size);
+        fb.ptr = malloc(fb.size);
+        memcpy(fb.ptr, fb.hwptr, fb.size);
+    }
 
     // This is the touchbar, make everything tiny
     if (chip_id == T8012) {
@@ -455,7 +462,7 @@ void fb_init(bool clear)
     console.initialized = true;
     console.active = false;
 
-    if (!orig_logo.ptr) {
+    if (!unbuffered && !orig_logo.ptr) {
         orig_logo = *logo;
         orig_logo.ptr = malloc(orig_logo.width * orig_logo.height * 4);
         fb_unblit_image((fb.width - orig_logo.width) / 2, (fb.height - orig_logo.height) / 2,
@@ -488,6 +495,19 @@ void fb_init(bool clear)
            console.cursor.max_col);
 }
 
+void fb_init(bool clear)
+{
+    fb_setup(clear, false);
+}
+
+bool fb_init_unbuffered(void)
+{
+    if (!fb.hwptr || fb.hwptr != (void *)cur_boot_args.video.base)
+        return false;
+    fb_setup(true, true);
+    return true;
+}
+
 void fb_set_active(bool active)
 {
     console.active = active;
@@ -507,7 +527,8 @@ void fb_shutdown(bool restore_logo)
         free(orig_logo.ptr);
         orig_logo.ptr = NULL;
     }
-    free(fb.ptr);
+    if (fb.ptr != fb.hwptr)
+        free(fb.ptr);
     console.initialized = false;
 }
 

@@ -62,6 +62,9 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
     ctx->sp_phys = hv_translate(from_el == 0 ? ctx->sp[0] : ctx->sp[1], false, false, NULL);
     ctx->extra = extra;
 
+    /* Without a host nobody would answer below: the guest is stopped for good (hv_stop.c) */
+    hv_stop_if_no_host(ctx, reason, type);
+
     struct uartproxy_msg_start start = {
         .reason = reason,
         .code = type,

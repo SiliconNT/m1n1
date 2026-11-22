@@ -61,6 +61,8 @@
 static const u32 table_lines[] = {5, UART_IRQ, 1505};
 /* hv_map_vuart() of src/hv/hv_vuart.c takes the first 4 KB of the UART */
 #define VUART_SIZE 0x1000UL
+/* What its reg says: all of it, which the guest does not have without a host */
+#define UART_SIZE 0x4000UL
 
 /* HCR_EL2 as hv_init() of this tree leaves it, and as it was when the firmware ran in R21 */
 #define HCR_AFTER_HV_INIT 0x00032480002031UL
@@ -96,6 +98,8 @@ static u64 one_more_device[2];
 /* Whether /arm-io has an AIC; a device with this many lines more, 0 to n - 1 */
 static bool with_aic;
 static u32 many_lines;
+/* Whether /arm-io has uart0 */
+static bool with_uart;
 
 /* The ranges of /arm-io are those of R21 (r21_mmio of model.c) */
 static void make_tree(void)
@@ -103,7 +107,7 @@ static void make_tree(void)
     u8 *p = tree;
     char name[32];
     u64 ranges[R21_MMIO_COUNT + 1][3];
-    u64 uart_reg[2] = {UART_BASE - R21_BUS_OFFSET, 0x4000};
+    u64 uart_reg[2] = {UART_BASE - R21_BUS_OFFSET, UART_SIZE};
     unsigned n_ranges = R21_MMIO_COUNT;
 
     for (unsigned i = 0; i < R21_MMIO_COUNT; i++) {
@@ -136,7 +140,7 @@ static void make_tree(void)
     p = put_range(p, "SEPFW", 0x10005a6c000, 0x5d0000);
     p = put_range(p, "TrustCache", 0x10006138000, 0x74000);
 
-    p = put_node(p, with_ranges ? 4 : 3, 2 + with_aic + !!many_lines);
+    p = put_node(p, with_ranges ? 4 : 3, 1 + with_uart + with_aic + !!many_lines);
     p = put_name(p, "arm-io");
     p = put_prop(p, "#address-cells", &arm_io_cells, 4);
     p = put_prop(p, "#size-cells", &(u32){2}, 4);
@@ -147,11 +151,13 @@ static void make_tree(void)
         p = put_name(p, "aic");
         p = put_prop(p, "AAPL,phandle", &(u32){AIC_PHANDLE}, 4);
     }
-    p = put_node(p, 4, 0);
-    p = put_name(p, "uart0");
-    p = put_prop(p, "reg", uart_reg, sizeof(uart_reg));
-    p = put_prop(p, "interrupt-parent", &(u32){AIC_PHANDLE}, 4);
-    p = put_prop(p, "interrupts", &(u32){UART_IRQ}, 4);
+    if (with_uart) {
+        p = put_node(p, 4, 0);
+        p = put_name(p, "uart0");
+        p = put_prop(p, "reg", uart_reg, sizeof(uart_reg));
+        p = put_prop(p, "interrupt-parent", &(u32){AIC_PHANDLE}, 4);
+        p = put_prop(p, "interrupts", &(u32){UART_IRQ}, 4);
+    }
     p = put_node(p, 3, 0);
     p = put_name(p, "dev");
     p = put_prop(p, "interrupt-parent", &(u32){AIC_PHANDLE}, 4);
@@ -477,6 +483,7 @@ static void reset(void)
     one_more_device[0] = one_more_device[1] = 0;
     with_aic = true;
     many_lines = 0;
+    with_uart = true;
     make_tree();
 
     memset(&m4_aic, 0, sizeof(m4_aic));
@@ -554,11 +561,13 @@ static int final_map(struct seg *out, int max)
 /*
  * The "PT[...]" lines of R21, with guest RAM starting at phys_base. Where the host had the
  * registers it answers itself (RVBAR, CPU STATE HACK, PMGR HACK, CPU_START) there is the
- * device; of the UART the hypervisor takes the 4 KB that hv_map_vuart() maps.
+ * device; of the UART the hypervisor takes the 4 KB that hv_map_vuart() maps. Without a host
+ * the guest has no UART at all: all of its registers are taken out (SiliconNT docs/DESIGN.md,
+ * "开发模式").
  */
-static void check_map(u64 phys_base)
+static void check_map(u64 phys_base, bool host)
 {
-    const struct seg want[] = {
+    struct seg want[] = {
         {0x200000000, UART_BASE, HW},
         {UART_BASE, UART_BASE + VUART_SIZE, VUART},
         {UART_BASE + VUART_SIZE, 0x5a0000000, HW},
@@ -575,11 +584,17 @@ static void check_map(u64 phys_base)
         {0x103dd680000, 0x103e6da4000, HW},
         {0x103ffda4000, 0x10400000000, HW},
     };
+    size_t n_want = COUNT(want);
     struct seg got[32];
     int n = final_map(got, COUNT(got));
 
-    CHECK_EQ(n, COUNT(want));
-    for (int i = 0; i < n && i < (int)COUNT(want); i++) {
+    if (!host) {
+        want[1] = (struct seg){UART_BASE + UART_SIZE, 0x5a0000000, HW};
+        memmove(&want[2], &want[3], (n_want - 3) * sizeof(want[0]));
+        n_want--;
+    }
+    CHECK_EQ(n, n_want);
+    for (int i = 0; i < n && i < (int)n_want; i++) {
         CHECK_EQ(got[i].start, want[i].start);
         CHECK_EQ(got[i].end, want[i].end);
         CHECK_EQ(got[i].kind, want[i].kind);
@@ -619,6 +634,29 @@ static bool all_bytes(u64 start, u64 end, u8 value)
         if (*p != value)
             return false;
     return true;
+}
+
+/*
+ * /arm-io/uart0 in the guest's tree: there with a host. Without one its name is zeroes, of the
+ * length it had, so that the firmware, which finds the node by its path, does not, and the
+ * rest of the tree is m1n1's (SiliconNT docs/DESIGN.md, "开发模式")
+ */
+static void check_uart_in_tree(const struct where *w, bool host)
+{
+    int node = adt_path_offset(adt, "/arm-io/uart0");
+    const struct adt_property *name = adt_get_property(adt, node, "name");
+    size_t at = (const u8 *)name->value - tree;
+    const u8 *guest = (const u8 *)w->adt;
+    void *m1n1_tree = adt;
+    int found;
+
+    adt = (void *)w->adt;
+    found = adt_path_offset(adt, "/arm-io/uart0");
+    adt = m1n1_tree;
+    CHECK(host ? found == node : found < 0);
+    for (size_t i = at; i < at + name->size; i++)
+        CHECK_EQ(guest[i], host ? tree[i] : 0);
+    CHECK(!memcmp(guest + at + name->size, tree + at + name->size, 0x4000));
 }
 
 /* Guest memory when the guest is entered */
@@ -718,11 +756,15 @@ static void check_registers(void)
           first(EV_HV_INIT) < first(EV_MSR));
 }
 
-/* The guest was entered, once, as the last thing, with everything in place */
+/*
+ * The guest was entered, once, as the last thing, with everything in place. host_iodev: the
+ * port of the host, or -1 for none
+ */
 static void check_entry(const struct where *w, int host_iodev)
 {
     const struct event *start = the(EV_HV_START), *vuart = the(EV_MAP_VUART);
     bool left[IODEV_MAX] = {false};
+    bool host = host_iodev >= 0;
 
     CHECK_EQ(count(EV_HV_INIT), 1);
     CHECK_EQ(count(EV_HV_START), 1);
@@ -733,15 +775,22 @@ static void check_entry(const struct where *w, int host_iodev)
     CHECK_EQ(start->c, 0);
 
     check_registers();
-    check_map(w->phys_base);
+    check_map(w->phys_base, host);
+    check_uart_in_tree(w, host);
 
-    /* The virtual UART: where /arm-io/uart0 is, with its interrupt */
-    CHECK_EQ(vuart->a, UART_BASE);
-    CHECK_EQ(vuart->b, UART_IRQ);
-    if (host_iodev < 0)
-        CHECK(vuart->c < IODEV_USB0 || vuart->c >= IODEV_USB0 + USB_IODEV_COUNT);
-    else
+    if (host) {
+        /* The virtual UART: where /arm-io/uart0 is, with its interrupt, for the host's port */
+        CHECK_EQ(vuart->a, UART_BASE);
+        CHECK_EQ(vuart->b, UART_IRQ);
         CHECK_EQ(vuart->c, host_iodev);
+    } else {
+        /* None, and all of the UART taken from the guest, once */
+        CHECK_EQ(count(EV_MAP_VUART), 0);
+        CHECK_EQ(count(EV_UNMAP), 3);
+        for (int i = 0; i < n_events; i++)
+            if (events[i].ev == EV_UNMAP && events[i].a == UART_BASE)
+                CHECK(events[i].c == UART_SIZE && i > last(EV_MAP_HW));
+    }
 
     /* Execution tracking: once, when every mapping is there, so that the memory is taken
      * apart into pages before the guest runs */
@@ -1008,6 +1057,47 @@ static void test_loaded_by_a_host(void)
     check_entry(&w, IODEV_USB0);
 }
 
+/*
+ * The same, with the host saying that it is not staying (P_SELFBOOT_RUN with no host, R37):
+ * the guest is set up as m1n1 sets it up when it has read the two files itself
+ */
+static void test_loaded_without_a_host(void)
+{
+    struct where w = where(R21_PHYS_BASE);
+
+    reset();
+    put_files(&w);
+    CHECK_EQ(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, SELFBOOT_NO_HOST), 0);
+    CHECK_EQ(count(EV_NVME_INIT) + count(EV_NVME_SHUTDOWN) + count(EV_READ_FILE), 0);
+    CHECK_EQ(count(EV_HEAP_LIMIT), 0);
+    check_entry(&w, -1);
+}
+
+/*
+ * A machine without /arm-io/uart0. Without a host there is nothing to take from the guest, and
+ * it is entered; a host would have no UART to talk to the guest's debugger over, and it is not
+ */
+static void test_no_uart(void)
+{
+    struct where w = where(R21_PHYS_BASE);
+
+    reset();
+    with_uart = false;
+    make_tree();
+    CHECK_EQ(selfboot_run(PART_UUID), 0);
+    CHECK_EQ(count(EV_HV_START), 1);
+    CHECK_EQ(count(EV_MAP_VUART), 0);
+    CHECK_EQ(count(EV_UNMAP), 2);
+    CHECK(!memcmp(tree, tree_before, sizeof(tree)));
+    CHECK_EQ(stray, 0);
+
+    reset();
+    with_uart = false;
+    make_tree();
+    put_files(&w);
+    check_not_entered(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
+}
+
 static void test_loaded_refuses(void)
 {
     struct where w = where(R21_PHYS_BASE);
@@ -1110,6 +1200,8 @@ int main(void)
     test_no_table();
     test_mappings_that_fail();
     test_loaded_by_a_host();
+    test_loaded_without_a_host();
+    test_no_uart();
     test_loaded_refuses();
     test_a_machine_with_something_at_the_gic();
 
