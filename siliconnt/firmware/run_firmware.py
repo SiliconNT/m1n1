@@ -89,10 +89,18 @@ apart into 4 KB pages before the guest runs.
 
 Without a host nobody answers what the hypervisor cannot deal with by itself, so with
 --loader m1n1 this script does not answer either: the first event that reaches it ends the
-run, and the "Run ended:" line says that the guest would have hung there. The one event
-that is expected is the one the script asks for, by the timer or Ctrl-C. After the guest
-has been left the script reports how far the top of m1n1's heap has moved, and looks up in
-the stage 2 tables whether what m1n1 mapped is what it was to map.
+run, and the "Run ended:" line says what the machine would have done without a host. The one
+event that is expected is the one the script asks for, by the timer or Ctrl-C. After the
+guest has been left the script reports how far the top of m1n1's heap has moved, and looks
+up in the stage 2 tables whether what m1n1 mapped is what it was to map.
+
+With --no-host as well, the script says in the command that it is not staying, and leaves
+once the command is sent. m1n1 then runs the guest as if it had read the two files from its
+SSD itself, with no host: no virtual UART, no serial port for the firmware; PSCI SYSTEM_RESET
+and SYSTEM_OFF restart and power off the machine, and anything else the hypervisor cannot
+deal with is shown on its screen (src/hv/hv_stop.c). What happens is seen on the machine
+only. This is how a machine without a host is tested next to one (SiliconNT
+docs/findings/0068).
 
 With --bugcheck the script looks, when the guest has stopped and before it leaves it, for
 what the Windows kernel has recorded of a bug check: the stop code and its four parameters,
@@ -120,6 +128,10 @@ parser.add_argument("--loader", choices=("host", "m1n1"), default="host",
                     help="who lays out guest memory, sets up the hypervisor and enters the "
                          "firmware: this script (default), or m1n1 with the code it runs when "
                          "it starts without a host; the script then only uploads the two files")
+parser.add_argument("--no-host", action="store_true",
+                    help="with --loader m1n1: tell m1n1 that this script is not staying, and "
+                         "leave once the command is sent; m1n1 runs the guest as it does when "
+                         "it starts without a host")
 parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "build" / "m1n1.bin",
                     help="the raw m1n1.bin that is supposed to be running on the target")
 parser.add_argument("--serial", default=os.environ.get("M1N1SECDEVICE", "/dev/m1n1-sec"),
@@ -163,6 +175,11 @@ if args.loader == "m1n1" and not args.disk:
     parser.error("--loader m1n1: m1n1 does not start the firmware without a boot disk (--disk)")
 if args.loader == "m1n1" and args.xtrack == "off":
     parser.error("--loader m1n1: m1n1 always turns execution tracking on")
+if args.no_host and args.loader != "m1n1":
+    parser.error("--no-host: only m1n1 can go on without a host (--loader m1n1)")
+if args.no_host and (args.wait_debugger or args.bugcheck):
+    parser.error("--no-host: without a host there is no serial port for a debugger, and "
+                 "nobody to look at the guest when it stops")
 
 PAGE = 0x4000
 
@@ -752,10 +769,23 @@ def check_stage2(io_ranges):
               "heap not mapped, the UART a hook")
     return problems
 
+def m1n1_hands_over_for_good():
+    """--no-host: P_SELFBOOT_RUN with no host. Nothing comes back that this script could see:
+    the reply only if m1n1 does not enter the guest, which it says on its screen as well,
+    and m1n1's console leaves the USB port before the guest runs (selfboot_enter())."""
+    print(f"Handing over to m1n1 (P_SELFBOOT_RUN) for good: guest RAM from "
+          f"0x{layout.phys_base:x}, image 0x{len(image):x} bytes, disk 0x{len(disk):x} bytes, "
+          "no host")
+    p.selfboot_run(layout.phys_base, len(image), len(disk), no_host=True)
+    # Out of this machine before the port is closed
+    iface.dev.flush()
+    print("Sent. This script does not stay: from here on what happens is on the machine's "
+          "screen. If m1n1 did not enter the guest it says why there, and waits for a host.")
+
 def m1n1_loads():
     """Uploads the two files, hands over to m1n1 and waits until the guest has been left.
     Returns the exit code of the script: 1 if m1n1 did not enter the guest, 2 if stage 2 is
-    not what it should be."""
+    not what it should be. With --no-host it leaves once the command is sent, and returns 0."""
     class run:
         stopping = False   # an event has arrived: the run is ending
         over = False       # the command has returned
@@ -769,6 +799,9 @@ def m1n1_loads():
 
     load_image(image, layout.image_base)
     load_disk(disk, layout.disk_base)
+    if args.no_host:
+        m1n1_hands_over_for_good()
+        return 0
 
     def guest_event(reason, code, info):
         run.stopping = True
@@ -787,7 +820,7 @@ def m1n1_loads():
             why = GUEST_STOPS[name]
         else:
             why = ("the hypervisor could not deal with this by itself; without a host the "
-                   "guest would hang here")
+                   "machine would stop here and show why on its screen")
         print(f"Run ended: {why} ({event})")
         guest_ran(run.entering)
         # First, before anything that has not been done on the machine before: this needs
@@ -879,7 +912,7 @@ if args.loader == "m1n1":
         code = m1n1_loads()
     finally:
         reader.stop()
-    if code != 1:
+    if code != 1 and not args.no_host:
         print("Hypervisor exited.")
     sys.exit(code)
 

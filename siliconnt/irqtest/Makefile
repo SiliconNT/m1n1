@@ -32,6 +32,14 @@
 #   make qemu-xi-broken     ...against hv_xtrack.c with one thing wrong in it at a time
 #                      (../xtrack-broken.mk): xitest, or pmutest for QEMU_BROKEN_PMU, must
 #                      fail on each of QEMU_BROKEN
+#   make build/stoptest.bin  a guest that only does what the hypervisor stops it for, with
+#                      the header of a firmware image: for run_firmware.py --loader m1n1
+#                      [--no-host] (R37)
+#   make qemu-nohost   stoptest.bin under an EL2 of its own that links the real code for a
+#                      guest that has to be stopped (nohost-qemu.c), with a host and without
+#                      one, for hvc #1, SYSTEM_OFF and SYSTEM_RESET
+#   make qemu-nohost-broken ...against hv_stop.c with one thing wrong in it at a time
+#                      (../nohost-model/broken.mk): it must fail on each of QEMU_NOHOST_BROKEN
 
 ARCH ?= aarch64-linux-gnu-
 QEMU ?= qemu-system-aarch64
@@ -50,7 +58,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken clean
+.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken qemu-nohost qemu-nohost-broken clean
 .SECONDARY:
 
 all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin
@@ -285,6 +293,88 @@ endef
 qemu-xi-broken: $(foreach n,$(QEMU_BROKEN),build/$(call broken_guest,$(n))-el2-broken-$(n).elf)
 	@$(foreach n,$(QEMU_BROKEN),$(call XI_BROKEN_RUN,$(n),$(call broken_guest,$(n))))
 	@echo "qemu-xi-broken: all $(words $(QEMU_BROKEN)) failed, as they must"
+
+# ---- a guest that the hypervisor stops, with a host and without one (nohost-qemu.c) ----
+
+build/stoptest.o: stoptest.S
+	@mkdir -p build
+	$(CC) -c -Wall -Werror -o $@ $<
+
+build/stoptest.elf: build/stoptest.o
+	$(LD) -Ttext=0 -e 0 --build-id=none -o $@ $<
+
+build/stoptest.bin: build/stoptest.elf
+	$(OBJCOPY) -O binary $< $@
+
+build/stoptest-el2-head.o: xtrack-qemu-head.S build/stoptest.bin
+	$(CC) -c -Wall -Werror -DIMAGE='"build/stoptest.bin"' -o $@ $<
+
+# The real files of m1n1 with its headers, as its Makefile compiles them (BASE_CFLAGS), but
+# not position independent: this EL2 is linked where it runs
+M1N1_CFLAGS := -O2 -Wall -Wundef -Werror=strict-prototypes -fno-common -fno-PIE -fno-pic \
+	-Werror=implicit-function-declaration -Werror=implicit-int -Wno-multichar -ffreestanding \
+	-nostdinc -isystem $(shell $(CC) -print-file-name=include) -isystem ../../sysinc \
+	-I../../src -I../../src/hv -fno-stack-protector -mstrict-align \
+	-march=armv8.2-a -mgeneral-regs-only
+NOHOST_M1N1 := hv/hv_psci.c hv/hv_stop.c hv/hv_power.c smc.c rtkit.c asc.c spmi.c wdt.c \
+	iodev.c vsprintf.c string.c
+NOHOST_OBJS := $(foreach f,$(NOHOST_M1N1),build/m1n1-$(basename $(notdir $(f))).o) build/fake_adt.o
+
+$(foreach f,$(NOHOST_M1N1),$(eval build/m1n1-$(basename $(notdir $(f))).o: ../../src/$(f) ; \
+	@mkdir -p build && $$(CC) -c $$(M1N1_CFLAGS) -o $$@ $$<))
+
+build/fake_adt.o: ../nohost-model/fake_adt.c ../nohost-model/fake_adt.h
+	@mkdir -p build
+	$(CC) -c $(M1N1_CFLAGS) -Werror -o $@ $<
+
+# build/nohost-qemu-<host or nohost>-<STOP_ARG of stoptest.S>
+build/nohost-qemu-host-%.o: nohost-qemu.c ../nohost-model/fake_adt.h
+	@mkdir -p build
+	$(CC) -c $(M1N1_CFLAGS) -Werror -DHOST=1 -DSTOP_ARG=$* -o $@ $<
+
+build/nohost-qemu-nohost-%.o: nohost-qemu.c ../nohost-model/fake_adt.h
+	@mkdir -p build
+	$(CC) -c $(M1N1_CFLAGS) -Werror -DHOST=0 -DSTOP_ARG=$* -o $@ $<
+
+build/nohost-qemu-%.elf: build/stoptest-el2-head.o build/nohost-qemu-%.o $(NOHOST_OBJS)
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none --no-warn-rwx-segments -o $@ $^
+
+# QEMU ends by itself where a host is told; without one the core stays in EL2, and QEMU is
+# stopped after a while. check_nohost_qemu.sh says what each run is to show.
+NOHOST_RUNS := host-0 host-1 host-2 nohost-0 nohost-1 nohost-2
+define NOHOST_RUN
+{ timeout 10 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel $(2) > $(3) 2>&1; \
+bash check_nohost_qemu.sh $(1) $(3) $$?; }
+endef
+
+qemu-nohost: $(NOHOST_RUNS:%=build/nohost-qemu-%.elf) build/stoptest.bin
+	@$(foreach c,$(NOHOST_RUNS),$(call NOHOST_RUN,$(c),build/nohost-qemu-$(c).elf,build/nohost-qemu-$(c).log) &&) true
+	@echo "qemu-nohost: all $(words $(NOHOST_RUNS)) as they should be"
+
+# hv_stop.c with one thing wrong in it (../nohost-model/broken.mk), in the run that shows it
+include ../nohost-model/broken.mk
+QEMU_NOHOST_BROKEN := always-host returns no-replay no-off
+nohost_broken_run = $(if $(filter no-off,$(1)),nohost-1,nohost-0)
+
+build/hv_stop-broken-%.c: ../../src/hv/hv_stop.c ../nohost-model/broken.mk
+	@mkdir -p build
+	sed -e '$(BREAK_$*)' $< > $@
+	! cmp -s $< $@
+
+build/m1n1-hv_stop-broken-%.o: build/hv_stop-broken-%.c
+	$(CC) -c $(M1N1_CFLAGS) -Wno-error -o $@ $<
+
+$(foreach n,$(QEMU_NOHOST_BROKEN),$(eval build/nohost-qemu-broken-$(n).elf: \
+	build/stoptest-el2-head.o build/nohost-qemu-$(call nohost_broken_run,$(n)).o \
+	build/m1n1-hv_stop-broken-$(n).o $(filter-out build/m1n1-hv_stop.o,$(NOHOST_OBJS)) ; \
+	$$(LD) -Ttext=0x40100000 -e _start --build-id=none --no-warn-rwx-segments -o $$@ $$^))
+
+qemu-nohost-broken: $(QEMU_NOHOST_BROKEN:%=build/nohost-qemu-broken-%.elf)
+	@$(foreach n,$(QEMU_NOHOST_BROKEN),\
+		if ($(call NOHOST_RUN,$(call nohost_broken_run,$(n)),build/nohost-qemu-broken-$(n).elf,build/nohost-qemu-broken-$(n).log)) > build/nohost-qemu-broken-$(n).check; \
+		then echo "qemu-nohost-broken: $(n): the run is as it should be, and must not be"; exit 1; \
+		else echo "qemu-nohost-broken: $(n): $$(tail -1 build/nohost-qemu-broken-$(n).check)"; fi;)
+	@echo "qemu-nohost-broken: all $(words $(QEMU_NOHOST_BROKEN)) failed, as they must"
 
 clean:
 	rm -rf build

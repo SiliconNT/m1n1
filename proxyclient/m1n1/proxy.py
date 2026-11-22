@@ -1181,7 +1181,13 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_HV_SET_GENTER_TRAP, enabled)
     def hv_xtrack(self):
         return self.request(self.P_HV_XTRACK)
-    def selfboot_run(self, phys_base, image_size, disk_size):
+    def selfboot_run(self, phys_base, image_size, disk_size, no_host=False):
+        """selfboot_run_loaded() of src/selfboot_run.c. With no_host the host is not staying:
+        m1n1 runs the guest as if it had read the two files itself, and nothing waits for
+        the reply, which comes only if the guest is not entered."""
+        if no_host:
+            return self.request(self.P_SELFBOOT_RUN, phys_base, image_size, disk_size, 1,
+                                no_reply=True)
         return self.request(self.P_SELFBOOT_RUN, phys_base, image_size, disk_size, signed=True)
     def hv_aicmap(self, dest):
         """hv_aicmap() of src/hv/hv_layout.c: writes the table of AIC lines and SPIs to dest,

@@ -129,7 +129,10 @@ def make_fakes(case):
                                 guest_reads=[],
                                 # P_HV_AICMAP: where m1n1 was asked to write the table, and
                                 # what it wrote there
-                                aicmap_calls=[], tables=[])
+                                aicmap_calls=[], tables=[],
+                                # --no-host: P_SELFBOOT_RUN said there is no host; how many
+                                # times the port to m1n1 was flushed, and when
+                                no_host=None, flushes=[])
     heap_top = case.get("heap_top", M4["heap_top"])
 
     def stage2(addr):
@@ -176,7 +179,9 @@ def make_fakes(case):
             def write(data):
                 rec.interrupts.append((time.monotonic(), bytes(data)))
                 rec.sigints.append(time.monotonic())
-            self.dev = types.SimpleNamespace(timeout=3, write=write)
+            def flush():
+                rec.flushes.append(rec.no_host)
+            self.dev = types.SimpleNamespace(timeout=3, write=write, flush=flush)
         def set_handler(self, reason, code, handler):
             self.handlers[(reason, code)] = handler
         def unkhandler(self, data):
@@ -220,11 +225,17 @@ def make_fakes(case):
             return stage2(addr)
         def exit(self, value):
             rec.stopped = value
-        def selfboot_run(self, phys_base, image_size, disk_size):
+        def selfboot_run(self, phys_base, image_size, disk_size, no_host=False):
             """selfboot_run_loaded() of src/selfboot_run.c, as the host sees it: lines on
             m1n1's console, then nothing until the hypervisor has an event for the host, and
-            the reply once the guest has been left."""
+            the reply once the guest has been left. With no_host the command goes out and
+            nothing is waited for (proxy.py sends it with no_reply)."""
+            rec.no_host = no_host
             rec.selfboot = (phys_base, image_size, disk_size)
+            if no_host:
+                rec.selfboot_sent = time.monotonic()
+                rec.writes_at_entry = len(rec.writes)
+                return None
             rec.selfboot_sent = time.monotonic()
             rec.writes_at_entry = len(rec.writes)
             rec.timeout_at_entry = self.iface.dev.timeout
@@ -1198,15 +1209,17 @@ rec, out, code = run({"stop_reason": "EXCEPTION_LOWER"}, *M1N1, "--seconds", "30
 check("m1n1 loader: a guest exception that reaches the host ends the run and is named for "
       "what it means without a host",
       code == 0 and rec.stopped == "EXIT_GUEST" and rec.interrupts == [] and
-      "Run ended: the hypervisor could not deal with this by itself; without a host the guest "
-      "would hang here (EXCEPTION_LOWER/SYNC)" in out, f"{code!r} {tty(out)[-900:]}")
+      "Run ended: the hypervisor could not deal with this by itself; without a host the "
+      "machine would stop here and show why on its screen (EXCEPTION_LOWER/SYNC)" in out,
+      f"{code!r} {tty(out)[-900:]}")
 check("m1n1 loader: its context is printed as a fault",
       rec.context_printed and rec.context_fault is True)
 
 rec, out, code = run({"stop_code": "HOOK_VM"}, *M1N1, "--seconds", "30", *image_args)
 check("m1n1 loader: so does any other event of the hypervisor that nobody asked for",
       code == 0 and rec.stopped == "EXIT_GUEST" and
-      "without a host the guest would hang here (HV/HOOK_VM)" in out, tty(out)[-900:])
+      "without a host the machine would stop here and show why on its screen (HV/HOOK_VM)"
+      in out, tty(out)[-900:])
 
 # 37. the guest stopped for good
 rec, out, code = run({"stop_code": "GUEST_RESET"}, *M1N1, "--seconds", "30", *image_args)
@@ -1249,6 +1262,34 @@ check("m1n1 loader: without a boot disk it is refused, nothing touched",
 rec, out, code = run({}, *M1N1, "--xtrack", "off", *image_args)
 check("m1n1 loader: without execution tracking it is refused, nothing touched",
       code != 0 and untouched(rec) and rec.selfboot is None, f"{code!r}")
+
+# 40a. --no-host: the two files go up, the command says there is no host, and the script leaves
+rec, out, code = run({}, *M1N1, "--no-host", *image_args)
+check("no host: the run exits 0 and says that what follows is on the machine",
+      code == 0 and "Sent. This script does not stay" in out and
+      "Hypervisor exited." not in out and "Run ended" not in out, f"{code!r} {tty(out)[-900:]}")
+check("no host: both files go up as without it, before the command",
+      rec.writes[:1] == [(IMAGE_BASE, image_data)] and
+      b"".join(data for base, data in rec.writes[1:]) == disk_data and
+      rec.writes_at_entry == len(rec.writes), f"{[(hex(b), len(d)) for b, d in rec.writes[:2]]}")
+check("no host: m1n1 is told where guest RAM starts, the two sizes, and that there is no host",
+      rec.selfboot == (M4["heap_top"], image_len, DISK_LEN) and rec.no_host is True,
+      f"{rec.selfboot} {rec.no_host}")
+check("no host: the port is flushed after the command, and nothing else is sent or looked up",
+      rec.flushes == [True] and rec.interrupts == [] and rec.stopped is None and
+      rec.pt_walks == [] and rec.heap_reads == [] and no_hv(rec),
+      f"{rec.flushes} {rec.interrupts} {rec.pt_walks} {rec.heap_reads}")
+for extra in (("--loader", "host", "--disk", disk_path), ("--wait-debugger", "5"),
+              ("--bugcheck", "/nonexistent")):
+    rec, out, code = run({}, *M1N1, "--no-host", *extra, *image_args)
+    check(f"no host: refused with {extra[0]}, nothing touched",
+          code != 0 and untouched(rec) and rec.selfboot is None, f"{code!r}")
+rec, out, code = run({}, "--no-host", *image_args)
+check("no host: refused with the host's loader, the default, nothing touched",
+      code != 0 and untouched(rec) and rec.selfboot is None, f"{code!r}")
+rec, out, code = run({"guest": wait_for_sigint}, *M1N1, "--seconds", "1", *image_args)
+check("no host: without the option the command says there is a host, as before",
+      code == 0 and rec.no_host is False and rec.flushes == [], f"{rec.no_host} {rec.flushes}")
 
 # 41. --check-only writes nothing
 rec, out, code = run({}, *M1N1, "--check-only", *image_args)
