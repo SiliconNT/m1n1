@@ -57,7 +57,8 @@ enum {
 struct fake_adt_places {
     u64 smc, smc_size; /* reg 0 of /arm-io/smc: the coprocessor; its mailbox is 0x8000 in */
     u64 spmi_a1, spmi0, spmi1;
-    u64 wdt, wdt_second; /* reg 0 and reg 2 of /arm-io/wdt */
+    u64 wdt, wdt_second;         /* reg 0 and reg 2 of /arm-io/wdt */
+    u64 smc_sram, smc_sram_size; /* region-base, region-size of iop-smc-nub: its memory */
 };
 
 extern struct fake_node fake_adt_nodes[FAKE_NODES];

@@ -495,23 +495,40 @@ bool rtkit_start_ep(rtkit_dev_t *rtk, u8 ep)
 
 /*
  * A message for the management endpoint, before the timeout. What comes for other endpoints
- * meanwhile is dropped: a coprocessor that was running before rtkit_boot(), as iBoot leaves
- * the SMC, may still be sending it (SiliconNT docs/findings/0067).
+ * meanwhile is dropped, and counted: a coprocessor that was running before rtkit_boot(), as
+ * iBoot leaves the SMC, may still be sending it (SiliconNT docs/findings/0067, 0069).
  */
-static bool rtkit_recv_mgmt(rtkit_dev_t *rtk, struct asc_message *msg, u64 timeout)
+static bool rtkit_recv_mgmt(rtkit_dev_t *rtk, struct asc_message *msg, u64 timeout, u32 *dropped)
 {
     while (!timeout_expired(timeout)) {
         if (!asc_recv(rtk->asc, msg))
             continue;
         if (msg->msg1 == RTKIT_EP_MGMT)
             return true;
-        rtkit_printf("dropping a message for endpoint 0x%x while booting: %lx\n", msg->msg1,
-                     msg->msg0);
+        (*dropped)++;
     }
     return false;
 }
 
-bool rtkit_boot(rtkit_dev_t *rtk)
+/*
+ * A power state the coprocessor says it is in, taken whenever it comes, as Linux takes it
+ * (drivers/soc/apple/rtkit.c, apple_rtkit_management_rx_iop_pwr_ack()): one that was running
+ * may say so before its HELLO. False if the message is not one.
+ */
+static bool rtkit_power_ack(rtkit_dev_t *rtk, const struct asc_message *msg)
+{
+    switch (FIELD_GET(MGMT_TYPE, msg->msg0)) {
+        case MGMT_MSG_IOP_PWR_STATE_ACK:
+            rtk->iop_power = FIELD_GET(MGMT_PWR_STATE, msg->msg0);
+            return true;
+        case MGMT_MSG_AP_PWR_STATE_ACK:
+            rtk->ap_power = FIELD_GET(MGMT_PWR_STATE, msg->msg0);
+            return true;
+    }
+    return false;
+}
+
+static bool rtkit_boot_steps(rtkit_dev_t *rtk, u32 *dropped)
 {
     struct asc_message msg;
     u64 timeout;
@@ -523,8 +540,7 @@ bool rtkit_boot(rtkit_dev_t *rtk)
      */
     timeout = timeout_calculate(USEC_PER_SEC);
     while (asc_recv(rtk->asc, &msg) && !timeout_expired(timeout))
-        rtkit_printf("dropping a message that was waiting for endpoint 0x%x: %lx\n", msg.msg1,
-                     msg.msg0);
+        (*dropped)++;
 
     /* boot the IOP if it isn't already */
     asc_cpu_start(rtk->asc);
@@ -540,13 +556,13 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     /* Within a second, as Linux waits for each step (drivers/soc/apple/rtkit.c) */
     timeout = timeout_calculate(USEC_PER_SEC);
     do {
-        if (!rtkit_recv_mgmt(rtk, &msg, timeout)) {
+        if (!rtkit_recv_mgmt(rtk, &msg, timeout, dropped)) {
             rtkit_printf("did not receive HELLO\n");
             return false;
         }
         msgtype = FIELD_GET(MGMT_TYPE, msg.msg0);
-        if (msgtype != MGMT_MSG_HELLO)
-            rtkit_printf("expected HELLO, dropping a management message of type 0x%02x\n", msgtype);
+        if (msgtype != MGMT_MSG_HELLO && !rtkit_power_ack(rtk, &msg))
+            (*dropped)++;
     } while (msgtype != MGMT_MSG_HELLO);
 
     u32 min_ver, max_ver, want_ver;
@@ -577,13 +593,16 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     bool has_syslog = false;
     bool has_oslog = false;
     bool got_epmap = false;
+    timeout = timeout_calculate(USEC_PER_SEC);
     while (!got_epmap) {
-        if (!rtkit_recv_mgmt(rtk, &msg, timeout_calculate(USEC_PER_SEC))) {
+        if (!rtkit_recv_mgmt(rtk, &msg, timeout, dropped)) {
             rtkit_printf("couldn't receive message while waiting for endpoint map\n");
             return false;
         }
 
         msgtype = FIELD_GET(MGMT_TYPE, msg.msg0);
+        if (rtkit_power_ack(rtk, &msg))
+            continue;
         if (msgtype != MGMT_MSG_EPMAP) {
             rtkit_printf("expected endpoint map message but got 0x%x instead\n", msgtype);
             return false;
@@ -650,19 +669,21 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     if (has_oslog && !rtkit_start_ep(rtk, RTKIT_EP_OSLOG))
         return false;
 
+    /* Whatever comes meanwhile, the time is looked at every round */
     timeout = timeout_calculate(USEC_PER_SEC);
     while (rtk->iop_power != RTKIT_POWER_ON) {
         struct rtkit_message rtk_msg;
-        int ret = rtkit_recv(rtk, &rtk_msg);
-        if (ret == 1)
-            rtkit_printf("unexpected message to non-system endpoint 0x%02x during boot: %lx\n",
-                         rtk_msg.ep, rtk_msg.msg);
-        else if (ret < 0)
-            return false;
-        else if (rtk->iop_power != RTKIT_POWER_ON && timeout_expired(timeout)) {
+        int ret;
+
+        if (timeout_expired(timeout)) {
             rtkit_printf("did not say that it is on\n");
             return false;
         }
+        ret = rtkit_recv(rtk, &rtk_msg);
+        if (ret == 1)
+            (*dropped)++;
+        else if (ret < 0)
+            return false;
     }
 
     /* this enables syslog */
@@ -675,6 +696,22 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     }
 
     return true;
+}
+
+/*
+ * What was dropped while booting is said in one line: printed one by one, a coprocessor that
+ * keeps sending would push everything else out of the console's buffer (src/iodev.c), which
+ * is what is shown when a guest is stopped without a host (src/hv/hv_stop.c)
+ */
+bool rtkit_boot(rtkit_dev_t *rtk)
+{
+    u32 dropped = 0;
+    bool ok = rtkit_boot_steps(rtk, &dropped);
+
+    if (dropped)
+        rtkit_printf("dropped %u messages that were left from before or not for booting\n",
+                     dropped);
+    return ok;
 }
 
 static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state target)

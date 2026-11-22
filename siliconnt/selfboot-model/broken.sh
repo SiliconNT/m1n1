@@ -89,6 +89,9 @@ host-uart-unnamed@selfboot_run.c@s/    if (host == NO_HOST && selfboot_adt_unnam
 loaded-no-host-ignored@selfboot_run.c@s/host_iodev == SELFBOOT_NO_HOST ? NO_HOST : host_iodev/host_iodev/@run
 unname-part-of-it@selfboot.c@s/memset(copy_of(dest, prop)->value, 0, prop->size);/memset(copy_of(dest, prop)->value, 0, 1);/@run
 unname-m1n1-tree@selfboot.c@s/memset(copy_of(dest, prop)->value, 0, prop->size);/memset((void *)prop->value, 0, prop->size);/@run
+nohost-ports-not-given-back@selfboot_run.c@s/            iodev_set_usage(i, usage\[i\]);/            ;/@run
+ports-given-back-with-host@selfboot_run.c@s/^    if (host == NO_HOST)$/    if (1)/@run
+nohost-not-entered-is-left@selfboot_run.c@s/^    if (host != NO_HOST)$/    if (1)/@run
 EOF
 [ $bad = 0 ] && echo "broken: all $n failed, as they must"
 exit $bad

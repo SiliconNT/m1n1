@@ -88,12 +88,16 @@ static const char *scenario = "";
 
 /* ---- time, and how the machine ends ---- */
 
-enum outcome { RETURNED, RESTARTED, POWERED_OFF, M1N1_RESTARTED };
+enum outcome { RETURNED, RESTARTED, POWERED_OFF, M1N1_RESTARTED, HUNG };
 static const char *const outcome_names[] = {"returned", "restarted", "powered off",
-                                            "m1n1 restarted"};
+                                            "m1n1 restarted", "hung (not ended after 10 s)"};
+
+/* What has not ended this long after it was called does not end: the longest case takes 3 s */
+#define HANG_USEC 10000000
 
 static jmp_buf machine;
 static u64 now;          /* microseconds */
+static u64 started_at;   /* when the case called the code */
 static u64 restart_at;   /* 0: nothing pending */
 static u64 power_off_at; /* 0: nothing pending */
 static u64 ended_at;
@@ -108,6 +112,10 @@ static void advance(u64 us)
     if (power_off_at && now >= power_off_at) {
         ended_at = power_off_at;
         longjmp(machine, POWERED_OFF);
+    }
+    if (now - started_at > HANG_USEC) {
+        ended_at = now;
+        longjmp(machine, HUNG);
     }
 }
 
@@ -153,6 +161,8 @@ void model_sysop(const char *op)
 
 static char log_buf[1 << 16];
 static size_t log_len;
+/* How many lines: what floods the console's 8 KB pushes the reason out of it (hv_stop.c) */
+static int printed_lines;
 
 int debug_printf(const char *fmt, ...)
 {
@@ -172,6 +182,7 @@ int debug_printf(const char *fmt, ...)
             log_len -= sizeof(log_buf) / 2;
         }
         log_buf[log_len++] = *p;
+        printed_lines += *p == '\n';
     }
     log_buf[log_len] = 0;
     return n;
@@ -294,6 +305,15 @@ static int find(enum ev_kind kind, u64 a)
     return -1;
 }
 
+/* The place of the last event of the kind with this a, or -1 */
+static int find_last(enum ev_kind kind, u64 a)
+{
+    for (int i = n_evs - 1; i >= 0; i--)
+        if (evs[i].kind == kind && evs[i].a == a)
+            return i;
+    return -1;
+}
+
 static int find_key(u64 value)
 {
     for (int i = 0; i < n_evs; i++)
@@ -344,9 +364,15 @@ static u8 *sram;
 
 static struct smc {
     /* What the case makes it do */
-    bool no_hello, no_power_ack, no_init_reply, a2i_full, flood;
+    bool no_hello, no_power_ack, no_init_reply, a2i_full;
     bool notify_before_init, notify_always, crash_on_start;
-    bool ack_before_hello, notify_before_hello; /* what comes first after the wake-up */
+    /* After the wake-up: the power state before HELLO (and not after the endpoint map), a
+     * notification, or a management message of no use; the power state in the middle of the
+     * endpoint map */
+    bool ack_before_hello, notify_before_hello, odd_before_hello, ack_during_epmap;
+    /* From when on the mailbox is never empty again, with notifications */
+    enum { FLOOD_NEVER, FLOOD_ALWAYS, FLOOD_AFTER_EPMAP, FLOOD_AFTER_START, FLOOD_AFTER_KEY } flood;
+    u8 *shmem_at;                 /* the address it gives for the shared memory; NULL: SHMEM */
     u32 fail_value, silent_value; /* MBSE writes of this value are refused, or not answered */
     bool off1_does_nothing;
     u64 off_delay;
@@ -357,7 +383,8 @@ static struct smc {
     int q_head, q_tail;
     u64 send0;
     u64 started;
-    bool shmem_given;
+    bool shmem_given, flooding;
+    u8 *shmem;
 } smc;
 
 static void to_ap(u64 ep, u64 msg0)
@@ -386,8 +413,10 @@ static void smc_key(u64 msg0)
 {
     u32 id = (msg0 >> 12) & 0xf, size = (msg0 >> 16) & 0xff, key = msg0 >> 32, value;
 
-    memcpy(&value, SHMEM, sizeof(value));
+    memcpy(&value, smc.shmem, sizeof(value));
     note(EV_KEY, key, value);
+    if (smc.flood == FLOOD_AFTER_KEY)
+        smc.flooding = true;
     if (size != 4)
         stray_access("a key written with another size", size);
     if (key == KEY_MBSE && value == smc.fail_value) {
@@ -418,21 +447,31 @@ static void smc_receive(u64 msg0, u64 ep)
                     to_ap(0, mgmt(T_IOP_PWR_ACK, 0x20));
                 if (smc.notify_before_hello)
                     to_ap(SMC_EP, notification());
+                if (smc.odd_before_hello)
+                    to_ap(0, mgmt(0x3f, 0));
                 if ((msg0 & 0xffff) == 0x220 && !smc.no_hello)
                     to_ap(0, mgmt(T_HELLO, 12UL << 16 | 11));
                 break;
             case T_HELLO_ACK:
                 /* crashlog, syslog, ioreport; then the SMC's endpoint, 0x20 */
                 to_ap(0, mgmt(T_EPMAP, BIT(1) | BIT(2) | BIT(4)));
+                if (smc.ack_during_epmap)
+                    to_ap(0, mgmt(T_IOP_PWR_ACK, 0x20));
                 to_ap(0, mgmt(T_EPMAP, EPMAP_DONE | 1UL << 32 | BIT(0)));
                 break;
             case T_EPMAP:
-                if ((msg0 & EPMAP_DONE) && !smc.no_power_ack)
+                /* Said already, when it says it once */
+                if ((msg0 & EPMAP_DONE) && !smc.no_power_ack && !smc.ack_before_hello &&
+                    !smc.ack_during_epmap)
                     to_ap(0, mgmt(T_IOP_PWR_ACK, 0x20));
+                if ((msg0 & EPMAP_DONE) && smc.flood == FLOOD_AFTER_EPMAP)
+                    smc.flooding = true;
                 break;
             case T_START_EP: {
                 u64 which = (msg0 >> 32) & 0xff;
                 smc.started |= BIT(which >= 0x20 ? 63 : which);
+                if (which == SMC_EP && smc.flood == FLOOD_AFTER_START)
+                    smc.flooding = true;
                 if (which == 1 || which == 2 || which == 4)
                     to_ap(which, mgmt(T_BUFFER, 1UL << 44 | (u64)(sram + 0x1000 * which)));
                 if (which == 1 && smc.crash_on_start)
@@ -460,7 +499,8 @@ static void smc_receive(u64 msg0, u64 ep)
             if (smc.notify_before_init)
                 to_ap(SMC_EP, notification());
             if (!smc.no_init_reply) {
-                to_ap(SMC_EP, (u64)SHMEM);
+                smc.shmem = smc.shmem_at ? smc.shmem_at : SHMEM;
+                to_ap(SMC_EP, (u64)smc.shmem);
                 smc.shmem_given = true;
             }
             break;
@@ -476,7 +516,7 @@ static void smc_receive(u64 msg0, u64 ep)
 
 static bool smc_has_message(void)
 {
-    return smc.flood ||
+    return smc.flooding ||
            (smc.q_head != smc.q_tail && smc.q[smc.q_head % ARRAY_SIZE(smc.q)].ready <= now);
 }
 
@@ -488,11 +528,11 @@ static u64 smc_read(u64 off, bool high)
         case MBOX_I2A_CONTROL:
             return smc_has_message() ? 0 : MBOX_EMPTY;
         case MBOX_I2A_RECV0:
-            if (smc.flood)
+            if (smc.flooding)
                 return notification();
             return smc_has_message() ? smc.q[smc.q_head % ARRAY_SIZE(smc.q)].msg0 : 0;
         case MBOX_I2A_RECV1:
-            if (smc.flood)
+            if (smc.flooding)
                 return SMC_EP;
             if (!smc_has_message())
                 return 0;
@@ -523,6 +563,7 @@ u8 pmu_mem[0x10000];
 static struct spmi {
     /* What the case makes the PMU do */
     int fail_write, fail_read; /* a register that is not written, or not read; -1 none */
+    int fail_write_after;      /* ...after this many writes of it that work */
     bool absent, tx_stuck;
     /* What it is doing */
     u32 cmd, words_left, len, data[4], ndata;
@@ -545,7 +586,7 @@ static void spmi_execute(void)
     if (spmi.absent || addr != PMU_ADDR)
         return; /* nobody answers */
     if ((opc & ~7) == 0x30) {
-        if ((int)reg == spmi.fail_write) {
+        if ((int)reg == spmi.fail_write && spmi.fail_write_after-- <= 0) {
             spmi_reply(head);
             return;
         }
@@ -638,10 +679,16 @@ static bool in(u64 addr, u64 base, u64 size)
     return addr >= base && addr < base + size;
 }
 
+/*
+ * A read of the mailbox takes a microsecond: a loop that only reads it, and never looks at the
+ * time, still lets time pass, and is found to hang (advance())
+ */
 u32 read32(u64 addr)
 {
-    if (in(addr, SMC_MBOX, 0x1000))
+    if (in(addr, SMC_MBOX, 0x1000)) {
+        advance(1);
         return smc_read(addr - SMC_MBOX, false);
+    }
     if (addr == SMC_BASE + CPU_CONTROL)
         return 0x10; /* running, as iBoot leaves it */
     if (in(addr, SPMI0_BASE, 0x4000))
@@ -673,8 +720,10 @@ void write32(u64 addr, u32 data)
 
 u64 read64(u64 addr)
 {
-    if (in(addr, SMC_MBOX, 0x1000))
+    if (in(addr, SMC_MBOX, 0x1000)) {
+        advance(1);
         return smc_read(addr - SMC_MBOX, true);
+    }
     stray_access("a 64-bit read", addr);
     return 0;
 }
@@ -698,9 +747,9 @@ static const struct fake_adt_places places = {
     .spmi1 = SPMI1_BASE,
     .wdt = WDT_BASE,
     .wdt_second = WDT_SECOND,
+    .smc_sram = SRAM_BASE,
+    .smc_sram_size = SRAM_SIZE,
 };
-
-static u64 started_at;
 
 /* The machine as m1n1 finds it when it starts, and as it is when the guest has run */
 static void reset(const char *name, u8 boot_state)
@@ -717,11 +766,12 @@ static void reset(const char *name, u8 boot_state)
     pmu_mem[BOOT_STATE] = boot_state;
     memset(sram, 0, SRAM_SIZE);
     fake_adt_reset(&places);
-    now = 1000000;
+    now = started_at = 1000000;
     restart_at = power_off_at = ended_at = 0;
     stray = 0;
     log_len = 0;
     log_buf[0] = 0;
+    printed_lines = 0;
 
     /* src/main.c: m1n1 finds the watchdog when it starts */
     wdt_disable();
@@ -847,21 +897,38 @@ static void off_tests(void)
     for (int i = smc.q_head; i < smc.q_tail; i++)
         smc.q[i].ready = 0;
     check_powered_off(run(hv_power_off), 0xda);
+    CHECK(printed("dropped 4 messages"));
 
-    /* What comes after the wake-up and before HELLO is not HELLO, and is passed over */
+    /*
+     * What comes after the wake-up and before HELLO: the power state the SMC is in, which is
+     * kept, as Linux keeps it, and is not asked again; anything else is passed over
+     */
     reset("off, the power state before HELLO", 0xda);
     smc.ack_before_hello = true;
     check_powered_off(run(hv_power_off), 0xda);
+    CHECK(!printed("dropped"));
 
     reset("off, a notification before HELLO", 0xda);
     smc.notify_before_hello = true;
     check_powered_off(run(hv_power_off), 0xda);
+    CHECK(printed("dropped 1 messages"));
+
+    reset("off, a management message of no use before HELLO", 0xda);
+    smc.odd_before_hello = true;
+    check_powered_off(run(hv_power_off), 0xda);
+    CHECK(printed("dropped 1 messages"));
+
+    /* The power state in the middle of the endpoint map: kept too */
+    reset("off, the power state during the endpoint map", 0xda);
+    smc.ack_during_epmap = true;
+    check_powered_off(run(hv_power_off), 0xda);
+    CHECK(!printed("dropped"));
 
     /* An SMC that has notifications on: one before the address of the shared memory */
     reset("off, a notification before the shared memory", 0xda);
     smc.notify_before_init = true;
     check_powered_off(run(hv_power_off), 0xda);
-    CHECK(printed("SMC: Notification: 0x12345678"));
+    CHECK(printed("SMC: 1 notifications passed over\n"));
 
     reset("off, a notification before every answer", 0x00);
     smc.notify_always = true;
@@ -880,7 +947,7 @@ static void off_tests(void)
     CHECK_EQ(count(EV_KEY), 0);
     CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
     CHECK(took() >= 1000000 && took() < 2100000);
-    CHECK(printed("the SMC did not wake up"));
+    CHECK(printed("the SMC cannot be used"));
 
     reset("off, never says it is on", 0xda);
     smc.no_power_ack = true;
@@ -903,12 +970,49 @@ static void off_tests(void)
     CHECK_EQ(count(EV_KEY) + count(EV_PMU_W) + count(EV_PMU_R), 0);
     CHECK(took() < 1500000);
 
+    /*
+     * A mailbox that is never empty again, from before the wake-up, from the endpoint map on,
+     * from when endpoint 0x20 is started, or from after offw: every wait still ends in its
+     * time, and what is passed over is said in a line, not one for each message (the
+     * console's 8 KB would have nothing else left)
+     */
     reset("off, a mailbox that is never empty", 0xda);
-    smc.flood = true;
+    smc.flood = FLOOD_ALWAYS;
+    smc.flooding = true;
     o = run(hv_power_off);
     check_not_off(o);
     CHECK_EQ(count(EV_KEY) + count(EV_PMU_W) + count(EV_PMU_R), 0);
     CHECK(took() >= 2000000 && took() < 3100000);
+    CHECK(printed("did not receive HELLO") && printed("dropped"));
+    CHECK(printed_lines < 30);
+
+    reset("off, a mailbox never empty from the endpoint map on", 0xda);
+    smc.flood = FLOOD_AFTER_EPMAP;
+    o = run(hv_power_off);
+    check_not_off(o);
+    CHECK_EQ(count(EV_KEY) + count(EV_PMU_W) + count(EV_PMU_R), 0);
+    CHECK(took() >= 1000000 && took() < 1200000);
+    CHECK(printed("did not say that it is on") && printed("dropped"));
+    CHECK(printed_lines < 30);
+
+    reset("off, a mailbox never empty from when endpoint 0x20 is started", 0xda);
+    smc.flood = FLOOD_AFTER_START;
+    o = run(hv_power_off);
+    check_not_off(o);
+    CHECK_EQ(count(EV_KEY) + count(EV_PMU_W) + count(EV_PMU_R), 0);
+    CHECK(took() >= 500000 && took() < 700000);
+    CHECK(printed("SMC: no answer within 500 ms") && printed("notifications passed over"));
+    CHECK(printed_lines < 30);
+
+    reset("off, a mailbox never empty from offw on", 0xda);
+    smc.flood = FLOOD_AFTER_KEY;
+    o = run(hv_power_off);
+    check_not_off(o);
+    CHECK_EQ(count(EV_KEY), 1);
+    CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
+    CHECK(took() >= 500000 && took() < 700000);
+    CHECK(printed("did not take MBSE = offw") && printed("notifications passed over"));
+    CHECK(printed_lines < 30);
 
     reset("off, the SMC crashes while it starts", 0xda);
     smc.crash_on_start = true;
@@ -933,6 +1037,58 @@ static void off_tests(void)
     CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
     CHECK(took() >= 500000 && took() < 600000);
 
+    /*
+     * The shared memory the SMC gives: written to only if all of its 4 KB are in the SMC's own
+     * memory (region-base and region-size of iop-smc-nub). Not elsewhere: memory of m1n1's here
+     */
+    static u8 elsewhere[0x2000] __attribute__((aligned(0x1000)));
+    reset("off, the shared memory is not the SMC's", 0xda);
+    smc.shmem_at = elsewhere;
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_KEY) + count(EV_PMU_W) + count(EV_PMU_R), 0);
+    CHECK(printed("is not in its memory"));
+    for (size_t i = 0; i < sizeof(elsewhere); i++)
+        if (elsewhere[i]) {
+            CHECK(!"written where the SMC said its shared memory is");
+            break;
+        }
+
+    reset("off, the shared memory at the start of the SMC's memory", 0xda);
+    smc.shmem_at = sram;
+    check_powered_off(run(hv_power_off), 0xda);
+
+    reset("off, the shared memory in the last 4 KB of the SMC's memory", 0xda);
+    smc.shmem_at = sram + SRAM_SIZE - 0x1000;
+    check_powered_off(run(hv_power_off), 0xda);
+
+    reset("off, the shared memory running past the end of the SMC's memory", 0xda);
+    smc.shmem_at = sram + SRAM_SIZE - 0x800;
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_KEY), 0);
+    CHECK(printed("is not in its memory"));
+
+    reset("off, the shared memory below the SMC's memory", 0xda);
+    smc.shmem_at = sram - 0x1000;
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_KEY), 0);
+
+    reset("off, no region-base", 0xda);
+    fake_adt_set(FAKE_SMC_NUB, "region-base", NULL, 0);
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_KEY), 0);
+    CHECK(printed("no region-base and region-size"));
+
+    reset("off, a region-size of 32 bits", 0xda);
+    fake_adt_set(FAKE_SMC_NUB, "region-size", &(u32){SRAM_SIZE}, 4);
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_KEY), 0);
+
+    reset("off, the SMC's memory smaller than the shared memory", 0xda);
+    fake_adt_set(FAKE_SMC_NUB, "region-size", &(u64){0x800}, 8);
+    smc.shmem_at = sram;
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_KEY), 0);
+
     /* The PMU: not there, not written, not read. off1 without the flag would restart */
     reset("off, no primary PMU", 0xda);
     fake_adt_set(FAKE_PMU_MAIN, "is-primary", NULL, 0);
@@ -940,7 +1096,47 @@ static void off_tests(void)
     check_not_off(o);
     CHECK(find_key(MBSE_OFFW) >= 0);
     CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
-    CHECK(printed("no primary PMU"));
+    CHECK(printed("0 primary PMUs"));
+
+    /*
+     * Which node is the primary PMU: is-primary, and compatible with a PMU. A second one that
+     * says so leaves it unknown which is meant, and none is written to; a node of another
+     * kind that says so is not one
+     */
+    reset("off, two primary PMUs", 0xda);
+    fake_adt_set(FAKE_PMU_AUX, "is-primary", &(u32){1}, 4);
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
+    CHECK(printed("2 primary PMUs"));
+
+    reset("off, a USB-C controller that says it is primary", 0xda);
+    fake_adt_set(FAKE_HPM3, "is-primary", &(u32){1}, 4);
+    check_powered_off(run(hv_power_off), 0xda);
+
+    reset("off, a primary PMU of the d2422 kind", 0xda);
+    fake_adt_set(FAKE_PMU_MAIN, "compatible", "pmu,d2422", sizeof("pmu,d2422"));
+    check_powered_off(run(hv_power_off), 0xda);
+
+    reset("off, a primary that is not a PMU", 0xda);
+    fake_adt_set(FAKE_PMU_MAIN, "compatible", "pmu,other", sizeof("pmu,other"));
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
+    CHECK(printed("0 primary PMUs"));
+
+    reset("off, a primary whose compatible only starts like a PMU's", 0xda);
+    fake_adt_set(FAKE_PMU_MAIN, "compatible", "pmu,spmix", sizeof("pmu,spmix"));
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
+
+    reset("off, a primary whose compatible has no end", 0xda);
+    fake_adt_set(FAKE_PMU_MAIN, "compatible", "pmu,spmi", 8);
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
+
+    reset("off, a primary without compatible", 0xda);
+    fake_adt_set(FAKE_PMU_MAIN, "compatible", NULL, 0);
+    check_not_off(run(hv_power_off));
+    CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
 
     reset("off, is-primary 0", 0xda);
     fake_adt_set(FAKE_PMU_MAIN, "is-primary", &(u32){0}, 4);
@@ -976,49 +1172,71 @@ static void off_tests(void)
     fake_adt_set(FAKE_PMU_MAIN, "reg", NULL, 0);
     check_not_off(run(hv_power_off));
 
+    /*
+     * Byte 15 is put back only once it has been read: before, what it was is not known, and
+     * nothing is said about it
+     */
     reset("off, the PMU does not answer", 0xda);
     spmi.absent = true;
     o = run(hv_power_off);
     check_not_off(o);
     CHECK_EQ(pmu_mem[BOOT_STATE], 0xda);
     CHECK(took() < 1000000);
+    CHECK(!printed("may still be set"));
 
     reset("off, byte 1 not written", 0xda);
     spmi.fail_write = BOOT_STAGE;
     check_not_off(run(hv_power_off));
     CHECK_EQ(pmu_mem[BOOT_STATE], 0xda);
+    CHECK_EQ(find(EV_PMU_W, BOOT_STATE), -1);
+    CHECK(!printed("may still be set"));
 
     reset("off, byte 15 not read", 0xda);
     spmi.fail_read = BOOT_STATE;
     check_not_off(run(hv_power_off));
     CHECK_EQ(pmu_mem[BOOT_STATE], 0xda);
     CHECK_EQ(find(EV_PMU_W, BOOT_STATE), -1);
+    CHECK(!printed("may still be set"));
 
+    /* Not written, and not put back either: whether the flag is set is not known */
     reset("off, byte 15 not written", 0xda);
     spmi.fail_write = BOOT_STATE;
     check_not_off(run(hv_power_off));
     CHECK_EQ(pmu_mem[BOOT_STATE], 0xda);
+    CHECK(printed("the shutdown flag of the PMU may still be set"));
 
     reset("off, the SPMI controller has commands it has not sent", 0xda);
     spmi.tx_stuck = true;
     check_not_off(run(hv_power_off));
     CHECK_EQ(count(EV_PMU_W) + count(EV_PMU_R), 0);
 
-    /* off1: refused, not answered, or the machine stays on */
+    /*
+     * off1: refused, not answered, or the machine stays on. Byte 15 had the flag when off1
+     * was sent, and is put back as it was afterwards: left set, the next restart could be a
+     * power off
+     */
     reset("off, off1 refused", 0xda);
     smc.fail_value = MBSE_OFF1;
     o = run(hv_power_off);
     check_outcome(o, RETURNED);
     CHECK_EQ(count(EV_WDT_W), 0);
-    CHECK_EQ(pmu_mem[BOOT_STATE], 0x0a);
+    CHECK_EQ(pmu_mem[BOOT_STATE], 0xda);
     CHECK(printed("did not take MBSE = off1"));
     CHECK(took() < 100000);
+    CHECK_EQ(count(EV_PMU_W), 3);
+    CHECK(find(EV_PMU_W, BOOT_STATE) >= 0 && evs[find(EV_PMU_W, BOOT_STATE)].b == 0x0a &&
+          find(EV_PMU_W, BOOT_STATE) < find_key(MBSE_OFF1));
+    CHECK(find_last(EV_PMU_W, BOOT_STATE) > find_key(MBSE_OFF1));
+    CHECK(!printed("may still be set"));
+    check_only_two_bytes();
 
     reset("off, off1 not answered", 0xda);
     smc.silent_value = MBSE_OFF1;
     o = run(hv_power_off);
     check_outcome(o, RETURNED);
     CHECK(took() >= 500000 && took() < 600000);
+    CHECK_EQ(pmu_mem[BOOT_STATE], 0xda);
+    CHECK(find_last(EV_PMU_W, BOOT_STATE) > find_key(MBSE_OFF1));
 
     reset("off, off1 answered and the machine stays on", 0xda);
     smc.off1_does_nothing = true;
@@ -1027,6 +1245,21 @@ static void off_tests(void)
     CHECK_EQ(count(EV_WDT_W), 0);
     CHECK(took() >= 1000000 && took() < 1100000);
     CHECK(printed("still on 1000 ms after MBSE = off1"));
+    CHECK_EQ(pmu_mem[BOOT_STATE], 0xda);
+    /* Not before the wait: the machine may yet go off */
+    CHECK(find_last(EV_PMU_W, BOOT_STATE) >= 0 && find_key(MBSE_OFF1) >= 0 &&
+          evs[find_last(EV_PMU_W, BOOT_STATE)].t >= evs[find_key(MBSE_OFF1)].t + 1000000);
+    check_only_two_bytes();
+
+    /* Set, and then cannot be put back: said, for whoever looks at the screen */
+    reset("off, the shutdown flag cannot be put back", 0xda);
+    smc.off1_does_nothing = true;
+    spmi.fail_write = BOOT_STATE;
+    spmi.fail_write_after = 1;
+    o = run(hv_power_off);
+    check_outcome(o, RETURNED);
+    CHECK_EQ(pmu_mem[BOOT_STATE], 0x0a);
+    CHECK(printed("the shutdown flag of the PMU may still be set"));
 }
 
 /* ---- restarting ---- */

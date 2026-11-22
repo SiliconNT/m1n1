@@ -110,8 +110,6 @@ static void hv_stop_print(const struct exc_info *ctx)
 
 static void __attribute__((noreturn)) hv_stop_halt(void)
 {
-    /* Not even an SError is taken from here on: m1n1 restarts on one (exc_serr()) */
-    sysop("msr daifset, #0xf");
     for (;;)
         sysop("wfe");
 }
@@ -123,12 +121,21 @@ void hv_stop_if_no_host(struct exc_info *ctx, uartproxy_boot_reason_t reason, u3
 
     printf("HV: %s\n", hv_stop_what(reason, type));
     printf("HV: there is no host: the guest does not run again\n");
-    /* Each returns only if the machine is still running */
+    /*
+     * Each returns only if the machine is still running. An SError while they try restarts
+     * the machine (exc_serr()), which for a restart is what was asked for, and for a power off
+     * is the next best thing (SiliconNT docs/findings/0067).
+     */
     if (reason == START_HV && type == HV_GUEST_RESET)
         hv_power_reset();
     else if (reason == START_HV && type == HV_GUEST_OFF)
         hv_power_off();
 
+    /*
+     * From here on not even an SError is taken: m1n1 would restart on one, and what is shown
+     * would be gone before anyone saw it
+     */
+    sysop("msr daifset, #0xf");
     hv_stop_show();
     hv_stop_print(ctx);
     hv_stop_halt();

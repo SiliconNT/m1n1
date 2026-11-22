@@ -12,11 +12,15 @@ int fake_adt_misses;
 
 /* Values as the M4 has them (R35, adt-1.bin) */
 static const u32 one = 1;
+static u64 smc_sram, smc_sram_size;
 static const u32 gen3 = 3;
 static const u32 wdt_version = 2;
 static const u32 pmu_reg[6] = {0x0e, 0x03, 0, 0x04, 0, 0};
 static const u32 leg_scrpad = 0xf800;
 static const char pmu_compat[] = "pmu,spmi\0pmu,abbey";
+/* Of these two only the first entry: what the code looks at */
+static const char pmu_aux_compat[] = "pmu,spmi";
+static const char hpm_compat[] = "usbc,sn201202x,spmi";
 static const char smc_compat[] = "iop,ascwrap-v6";
 
 static void node(int index, const char *name, int parent)
@@ -65,9 +69,14 @@ void fake_adt_reset(const struct fake_adt_places *where)
     reg(FAKE_SMC, where->smc, where->smc_size);
     node(FAKE_SMC_NUB, "iop-smc-nub", FAKE_SMC);
     fake_adt_set(FAKE_SMC_NUB, "no-shutdown", &one, 4);
+    smc_sram = where->smc_sram;
+    smc_sram_size = where->smc_sram_size;
+    fake_adt_set(FAKE_SMC_NUB, "region-base", &smc_sram, 8);
+    fake_adt_set(FAKE_SMC_NUB, "region-size", &smc_sram_size, 8);
     node(FAKE_SPMI_A1, "nub-spmi-a1", FAKE_ARM_IO);
     reg(FAKE_SPMI_A1, where->spmi_a1, 0x4000);
     node(FAKE_HPM3, "hpm3", FAKE_SPMI_A1);
+    fake_adt_set(FAKE_HPM3, "compatible", hpm_compat, sizeof(hpm_compat));
     node(FAKE_SPMI0, "nub-spmi0", FAKE_ARM_IO);
     fake_adt_set(FAKE_SPMI0, "gen", &gen3, 4);
     reg(FAKE_SPMI0, where->spmi0, 0x4000);
@@ -81,6 +90,7 @@ void fake_adt_reset(const struct fake_adt_places *where)
     fake_adt_set(FAKE_SPMI1, "gen", &gen3, 4);
     reg(FAKE_SPMI1, where->spmi1, 0x4000);
     node(FAKE_PMU_AUX, "pmu-aux", FAKE_SPMI1);
+    fake_adt_set(FAKE_PMU_AUX, "compatible", pmu_aux_compat, sizeof(pmu_aux_compat));
     node(FAKE_WDT, "wdt", FAKE_ARM_IO);
     fake_adt_set(FAKE_WDT, "wdt-version", &wdt_version, 4);
     reg(FAKE_WDT, where->wdt, 0x4000);

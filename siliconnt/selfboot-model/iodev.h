@@ -20,4 +20,5 @@ typedef enum _iodev_id_t {
 
 typedef int iodev_usage_t;
 void iodev_set_usage(iodev_id_t id, iodev_usage_t usage);
+iodev_usage_t iodev_get_usage(iodev_id_t id);
 #endif

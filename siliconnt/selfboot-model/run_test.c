@@ -24,6 +24,7 @@
  * told so, and that it is what the host's loader gets from the same function (P_HV_AICMAP of
  * src/proxy.c calls nothing else): both loaders hand the firmware the same bytes.
  */
+#include <setjmp.h>
 #include <sys/mman.h>
 
 #include "aic.h"
@@ -306,6 +307,19 @@ static bool nvme_fails;
 static const char *missing_file;
 static int map_hw_fails_at; /* the how-manieth call of hv_map_hw() fails; -1: none */
 static u64 sctlr_el12;
+static bool xtrack_fails;
+/*
+ * What hv_start() does. With a host the guest runs until the host leaves it, and hv_start()
+ * returns. Without one it runs for good, and hv_start() does not return: here it goes back to
+ * where the test called (from_the_ssd(), loaded()), which says ENTERED. Or the hypervisor finds
+ * something that keeps it from entering the guest, and returns.
+ */
+static enum { GUEST_LEFT, GUEST_STAYS, NOT_ENTERED } hv_start_does;
+static jmp_buf in_the_guest;
+#define ENTERED 1000
+
+/* What each port is used for; the proxy's port is the first USB port */
+static iodev_usage_t usages[IODEV_NUM], usages_before[IODEV_NUM];
 
 static bool nvme_up;
 static u64 hcr_el2, actlr_el12;
@@ -424,18 +438,40 @@ void hv_map_vuart(u64 base, int irq, iodev_id_t iodev)
 int hv_pt_xtrack(void)
 {
     note(EV_XTRACK, 0, 0, 0);
-    return 0;
+    return xtrack_fails ? -1 : 0;
 }
 
-/* The guest runs until a host tells the hypervisor to leave it: here it is left at once */
 void hv_start(void *entry, u64 regs[4])
 {
     note(EV_HV_START, (u64)entry, regs[0], regs[1] | regs[2] | regs[3]);
+    if (hv_start_does == GUEST_STAYS)
+        longjmp(in_the_guest, 1);
 }
 
 void iodev_set_usage(iodev_id_t id, iodev_usage_t usage)
 {
     note(EV_IODEV_USAGE, id, usage, 0);
+    usages[id] = usage;
+}
+
+iodev_usage_t iodev_get_usage(iodev_id_t id)
+{
+    return usages[id];
+}
+
+/* m1n1 loads by itself, or a host has loaded: what the call returns, or ENTERED */
+static int from_the_ssd(void)
+{
+    if (setjmp(in_the_guest))
+        return ENTERED;
+    return selfboot_run(PART_UUID);
+}
+
+static int loaded(u64 phys_base, u64 image_size, u64 disk_size, int host_iodev)
+{
+    if (setjmp(in_the_guest))
+        return ENTERED;
+    return selfboot_run_loaded(phys_base, image_size, disk_size, host_iodev);
 }
 
 void fb_shutdown(bool restore_logo)
@@ -462,6 +498,13 @@ static void reset(void)
     missing_file = NULL;
     map_hw_fails_at = -1;
     map_hw_calls = 0;
+    xtrack_fails = false;
+    hv_start_does = GUEST_STAYS;
+    /* The proxy on the first USB port; a console on the UART, the screen, the second port */
+    memset(usages, 0, sizeof(usages));
+    usages[IODEV_UART] = usages[IODEV_FB] = usages[IODEV_USB0 + 1] = 1;
+    usages[IODEV_USB0] = 3;
+    memcpy(usages_before, usages, sizeof(usages));
     sctlr_el12 = SCTLR_EL12_R21;
     nvme_up = false;
     hcr_el2 = 0x5555555555555555UL; /* nobody is to build on what it is before hv_init() */
@@ -850,17 +893,34 @@ static void check_not_started(int ret)
     CHECK_EQ(stray, 0);
 }
 
+/*
+ * The ports after the guest was not entered. With a host: its own as it was, the spare USB
+ * ports the guest's (as before), the UART and the screen untouched. Without one every port is
+ * what it was, the proxy's port the proxy's again, so that a host can connect.
+ */
+static void check_ports_given_back(int host_iodev)
+{
+    for (int i = 0; i < IODEV_NUM; i++) {
+        if (host_iodev < 0 || i < IODEV_USB0 || i == host_iodev)
+            CHECK_EQ(usages[i], usages_before[i]);
+        else
+            CHECK_EQ(usages[i], 0);
+    }
+}
+
 /* The hypervisor was initialized, but the guest never ran, and m1n1 still prints */
-static void check_not_entered(int ret)
+static void check_not_entered(int ret, int host_iodev)
 {
     CHECK_EQ(ret, -1);
     CHECK_EQ(count(EV_HV_INIT), 1);
     CHECK_EQ(count(EV_HV_START), 0);
     CHECK_EQ(count(EV_XTRACK), 0);
-    /* The screen and the consoles that are not spare USB ports are as they were */
+    /* The screen as it was; the consoles that are not USB ports are not even touched */
     CHECK_EQ(count(EV_FB_SHUTDOWN), 0);
-    for (int i = 0; i < n_events; i++)
-        CHECK(events[i].ev != EV_IODEV_USAGE || events[i].a >= IODEV_USB0);
+    if (host_iodev >= 0)
+        for (int i = 0; i < n_events; i++)
+            CHECK(events[i].ev != EV_IODEV_USAGE || events[i].a >= IODEV_USB0);
+    check_ports_given_back(host_iodev);
     CHECK_EQ(stray, 0);
 }
 
@@ -875,7 +935,7 @@ static void test_from_the_ssd(void)
 
     reset();
     /* The guest ran and was left */
-    CHECK_EQ(selfboot_run(PART_UUID), 0);
+    CHECK_EQ(from_the_ssd(), ENTERED);
 
     /* Guest RAM starts 128 MB above the heap, on a 16 KB page, and the heap ends there */
     limit = the(EV_HEAP_LIMIT);
@@ -909,7 +969,7 @@ static void test_no_ssd(void)
 {
     reset();
     nvme_fails = true;
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
     CHECK_EQ(count(EV_READ_FILE), 0);
 }
 
@@ -917,13 +977,13 @@ static void test_no_files(void)
 {
     reset();
     missing_file = "siliconnt/firmware.fd";
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
     /* Without the image the disk is not read */
     CHECK_EQ(count(EV_READ_FILE), 1);
 
     reset();
     missing_file = "siliconnt/bootdisk.img";
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
     CHECK_EQ(count(EV_READ_FILE), 2);
 }
 
@@ -931,12 +991,12 @@ static void test_files_that_are_not_what_they_should_be(void)
 {
     reset();
     image_file[0x38] = 'X';
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
     CHECK_EQ(count(EV_READ_FILE), 1);
 
     reset();
     disk_file[512] = 'X';
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
 }
 
 static void test_a_machine_that_will_not_do(void)
@@ -944,19 +1004,19 @@ static void test_a_machine_that_will_not_do(void)
     /* The framebuffer inside guest RAM: nothing is read */
     reset();
     cur_boot_args.video.base = SELF_PHYS_BASE + 0x4000;
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
     CHECK_EQ(count(EV_NVME_INIT), 0);
 
     /* The MMU of EL1 is on: the entry code of the firmware expects it off */
     reset();
     sctlr_el12 = SCTLR_EL12_R21 | 1;
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
 
     /* No spare entry of /chosen/memory-map for the boot disk */
     reset();
     spare_entries = 0;
     make_tree();
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
 
     /*
      * /arm-io without ranges, and with addresses of three cells: where the devices of the
@@ -965,12 +1025,12 @@ static void test_a_machine_that_will_not_do(void)
     reset();
     with_ranges = false;
     make_tree();
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
 
     reset();
     arm_io_cells = 3;
     make_tree();
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
 }
 
 /*
@@ -993,7 +1053,7 @@ static void test_no_table(void)
     reset();
     many_lines = 987;
     make_tree();
-    CHECK_EQ(selfboot_run(PART_UUID), 0);
+    CHECK_EQ(from_the_ssd(), ENTERED);
     CHECK_EQ(((const u32 *)self.aicmap)[1], 988);
     CHECK(guest_range_is(&self, "AICToGIC", self.aicmap, 8 + 4 * 988));
 
@@ -1001,22 +1061,22 @@ static void test_no_table(void)
     reset();
     many_lines = 988;
     make_tree();
-    check_no_table(&self, selfboot_run(PART_UUID));
+    check_no_table(&self, from_the_ssd());
 
     reset();
     put_files(&host);
     many_lines = 988;
     make_tree();
-    check_no_table(&host, selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
+    check_no_table(&host, loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
 
     reset();
     aic = NULL;
-    check_no_table(&self, selfboot_run(PART_UUID));
+    check_no_table(&self, from_the_ssd());
 
     reset();
     with_aic = false;
     make_tree();
-    check_no_table(&self, selfboot_run(PART_UUID));
+    check_no_table(&self, from_the_ssd());
 }
 
 static void test_mappings_that_fail(void)
@@ -1027,7 +1087,7 @@ static void test_mappings_that_fail(void)
 
         reset();
         map_hw_fails_at = at[i];
-        check_not_entered(selfboot_run(PART_UUID));
+        check_not_entered(from_the_ssd(), -1);
         CHECK_EQ(map_hw_calls, at[i] + 1);
     }
 }
@@ -1049,12 +1109,60 @@ static void test_loaded_by_a_host(void)
     /* The image is where it was in R21 */
     CHECK_EQ(w.image, 0x1001ac00000);
     put_files(&w);
-    CHECK_EQ(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), 0);
+    /* The guest runs until the host leaves it */
+    hv_start_does = GUEST_LEFT;
+    CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), 0);
 
     /* The SSD is not touched, and the heap is the host's business */
     CHECK_EQ(count(EV_NVME_INIT) + count(EV_NVME_SHUTDOWN) + count(EV_READ_FILE), 0);
     CHECK_EQ(count(EV_HEAP_LIMIT), 0);
     check_entry(&w, IODEV_USB0);
+}
+
+/*
+ * Without a host, a step between taking the ports and entering the guest fails: a mapping,
+ * execution tracking, or the hypervisor itself (hv_start() returns). m1n1 goes back to the
+ * proxy, and every port is what it was: with P_SELFBOOT_RUN the one the command came over is
+ * the proxy's again, so that a host can connect again. With a host nothing is given back: its
+ * port was never taken, and the spare ones stay the guest's, as before.
+ */
+static void test_not_entered_without_a_host(void)
+{
+    struct where w = where(R21_PHYS_BASE);
+
+    for (int i = 0; i < 3; i++) {
+        reset();
+        put_files(&w);
+        map_hw_fails_at = i == 0 ? 0 : -1;
+        xtrack_fails = i == 1;
+        hv_start_does = i == 2 ? NOT_ENTERED : GUEST_STAYS;
+        CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, SELFBOOT_NO_HOST), -1);
+        CHECK_EQ(count(EV_HV_INIT), 1);
+        CHECK_EQ(count(EV_XTRACK), i >= 1);
+        CHECK_EQ(count(EV_HV_START), i == 2);
+        check_ports_given_back(-1);
+        CHECK_EQ(usages[IODEV_USB0], 3);
+        CHECK_EQ(stray, 0);
+    }
+
+    /* From the SSD, where the hypervisor does not enter the guest */
+    reset();
+    hv_start_does = NOT_ENTERED;
+    CHECK_EQ(from_the_ssd(), -1);
+    check_ports_given_back(-1);
+
+    /* With a host: a mapping that fails, and hv_start() returning, are as before */
+    reset();
+    put_files(&w);
+    xtrack_fails = true;
+    CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), -1);
+    check_ports_given_back(IODEV_USB0);
+    CHECK_EQ(usages[IODEV_USB0 + 1], 0);
+
+    reset();
+    put_files(&w);
+    hv_start_does = NOT_ENTERED;
+    CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), 0);
 }
 
 /*
@@ -1067,7 +1175,7 @@ static void test_loaded_without_a_host(void)
 
     reset();
     put_files(&w);
-    CHECK_EQ(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, SELFBOOT_NO_HOST), 0);
+    CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, SELFBOOT_NO_HOST), ENTERED);
     CHECK_EQ(count(EV_NVME_INIT) + count(EV_NVME_SHUTDOWN) + count(EV_READ_FILE), 0);
     CHECK_EQ(count(EV_HEAP_LIMIT), 0);
     check_entry(&w, -1);
@@ -1084,7 +1192,7 @@ static void test_no_uart(void)
     reset();
     with_uart = false;
     make_tree();
-    CHECK_EQ(selfboot_run(PART_UUID), 0);
+    CHECK_EQ(from_the_ssd(), ENTERED);
     CHECK_EQ(count(EV_HV_START), 1);
     CHECK_EQ(count(EV_MAP_VUART), 0);
     CHECK_EQ(count(EV_UNMAP), 2);
@@ -1095,7 +1203,7 @@ static void test_no_uart(void)
     with_uart = false;
     make_tree();
     put_files(&w);
-    check_not_entered(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
+    check_not_entered(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), IODEV_USB0);
 }
 
 static void test_loaded_refuses(void)
@@ -1105,23 +1213,23 @@ static void test_loaded_refuses(void)
     /* A start of guest RAM that is not a page, or that is inside m1n1's heap */
     reset();
     put_files(&w);
-    check_not_started(selfboot_run_loaded(R21_PHYS_BASE + 0x1000, IMAGE_SIZE, DISK_SIZE, 4));
+    check_not_started(loaded(R21_PHYS_BASE + 0x1000, IMAGE_SIZE, DISK_SIZE, 4));
     reset();
-    check_not_started(selfboot_run_loaded(HEAP_TOP & ~0x3fffUL, IMAGE_SIZE, DISK_SIZE, 4));
+    check_not_started(loaded(HEAP_TOP & ~0x3fffUL, IMAGE_SIZE, DISK_SIZE, 4));
 
     /* The image is not there; the disk is not there; sizes that are not theirs */
     reset();
     memcpy((void *)w.disk, disk_file, DISK_SIZE);
-    check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, 4));
+    check_not_started(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, 4));
     reset();
     memcpy((void *)w.image, image_file, IMAGE_SIZE);
-    check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, 4));
+    check_not_started(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, 4));
     reset();
     put_files(&w);
-    check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE - 0x4000, DISK_SIZE, 4));
+    check_not_started(loaded(R21_PHYS_BASE, IMAGE_SIZE - 0x4000, DISK_SIZE, 4));
     reset();
     put_files(&w);
-    check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE + 0x800, 4));
+    check_not_started(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE + 0x800, 4));
 }
 
 /*
@@ -1144,7 +1252,7 @@ static void test_a_machine_with_something_at_the_gic(void)
     one_more_device[0] = 0x5000000000;
     one_more_device[1] = 0x4000;
     make_tree();
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
     check_nothing_for_the_guest(&self);
 
     /* A device at the Redistributor of the last core there can be */
@@ -1152,13 +1260,13 @@ static void test_a_machine_with_something_at_the_gic(void)
     one_more_device[0] = 0x51003e0000;
     one_more_device[1] = 0x20000;
     make_tree();
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
     check_nothing_for_the_guest(&self);
 
     /* Memory that reaches the Redistributors */
     reset();
     ram_base = 0x5000000000 + 0x100000000;
-    check_not_started(selfboot_run(PART_UUID));
+    check_not_started(from_the_ssd());
     check_nothing_for_the_guest(&self);
 
     /* The same when a host has done the loading */
@@ -1167,14 +1275,14 @@ static void test_a_machine_with_something_at_the_gic(void)
     one_more_device[0] = 0x5000000000;
     one_more_device[1] = 0x4000;
     make_tree();
-    check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
+    check_not_started(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
     check_nothing_for_the_guest(&host);
 
     reset();
     put_files(&host);
     ram_base = 0x5000000000 - 0x100000000;
     mem_size_actual = 0x100004000;
-    check_not_started(selfboot_run_loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
+    check_not_started(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0));
     check_nothing_for_the_guest(&host);
 
     /* A device right after the Redistributors is in nobody's way, and is the guest's */
@@ -1182,7 +1290,7 @@ static void test_a_machine_with_something_at_the_gic(void)
     one_more_device[0] = 0x5100400000;
     one_more_device[1] = 0x4000;
     make_tree();
-    CHECK_EQ(selfboot_run(PART_UUID), 0);
+    CHECK_EQ(from_the_ssd(), ENTERED);
     CHECK_EQ(count(EV_HV_START), 1);
     CHECK_EQ(count(EV_MAP_HW), R21_MMIO_COUNT + 1 + 2);
 }
@@ -1201,6 +1309,7 @@ int main(void)
     test_mappings_that_fail();
     test_loaded_by_a_host();
     test_loaded_without_a_host();
+    test_not_entered_without_a_host();
     test_no_uart();
     test_loaded_refuses();
     test_a_machine_with_something_at_the_gic();

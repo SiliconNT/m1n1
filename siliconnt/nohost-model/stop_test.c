@@ -51,6 +51,8 @@ static const char *const end_names[] = {"returned", "halted", "restarted", "powe
 
 static jmp_buf core;
 static bool masked;
+/* Calls of hv_power_*() made with everything masked, and screens set up without */
+static int power_masked, screen_unmasked;
 static int wfes;
 
 void model_sysop(const char *op)
@@ -187,6 +189,7 @@ struct iodev iodev_fb = {.ops = &fb_ops, .usage = USAGE_CONSOLE};
 bool fb_init_unbuffered(void)
 {
     screen_inits++;
+    screen_unmasked += !masked;
     if (!screen_there)
         return false;
     /* What fb_init() prints, before the console is there */
@@ -214,6 +217,7 @@ static int resets, offs;
 void hv_power_reset(void)
 {
     resets++;
+    power_masked += masked;
     if (power_works)
         longjmp(core, RESTARTED);
     debug_printf("HV: the watchdog has not restarted the machine within 500 ms\n");
@@ -222,9 +226,10 @@ void hv_power_reset(void)
 void hv_power_off(void)
 {
     offs++;
+    power_masked += masked;
     if (power_works)
         longjmp(core, POWERED_OFF);
-    debug_printf("HV: power: the SMC did not wake up\n");
+    debug_printf("HV: power: the SMC cannot be used\n");
 }
 
 /* ---- a case ---- */
@@ -267,6 +272,7 @@ static void start(const char *name, enum how how)
     power_works = false;
     resets = offs = 0;
     masked = false;
+    power_masked = screen_unmasked = 0;
     wfes = 0;
 }
 
@@ -426,6 +432,8 @@ static void check_shown(enum how how, const char *words, bool regs)
         "HV: the guest has stopped. Hold the power button to turn the machine off.\n";
     CHECK(screen.len >= strlen(last) && !strcmp(screen.text + screen.len - strlen(last), last));
     CHECK(masked && wfes == 3);
+    /* Masked before the screen was set up, and not before a restart or power off was tried */
+    CHECK(screen_unmasked == 0 && power_masked == 0);
     /* The ports nobody listens on got nothing */
     CHECK(uart_out.len == 0 && usb_out.len == 0);
     UNUSED(how);
@@ -450,7 +458,7 @@ static void no_host_tests(void)
             if (reset)
                 CHECK(on_screen("has not restarted the machine within 500 ms\n"));
             if (off)
-                CHECK(on_screen("HV: power: the SMC did not wake up\n"));
+                CHECK(on_screen("HV: power: the SMC cannot be used\n"));
         }
 
     /* The machine restarts, or powers off: nothing is shown */
@@ -458,13 +466,13 @@ static void no_host_tests(void)
     power_works = true;
     make_ctx();
     check_end(stop(&ctx, START_HV, HV_GUEST_RESET), RESTARTED);
-    CHECK(resets == 1 && offs == 0 && screen_inits == 0);
+    CHECK(resets == 1 && offs == 0 && screen_inits == 0 && power_masked == 0);
 
     start("no host, the machine powers off", NO_HOST_SAID);
     power_works = true;
     make_ctx();
     check_end(stop(&ctx, START_HV, HV_GUEST_OFF), POWERED_OFF);
-    CHECK(resets == 0 && offs == 1 && screen_inits == 0);
+    CHECK(resets == 0 && offs == 1 && screen_inits == 0 && power_masked == 0);
 
     /* hv_do_panic(): no registers to show */
     start("no host, the hypervisor cannot go on", NO_HOST_SELF);
@@ -477,7 +485,7 @@ static void no_host_tests(void)
     screen_there = false;
     make_ctx();
     check_end(stop(&ctx, START_HV, HV_GUEST_HVC), HALTED);
-    CHECK(screen_inits == 1 && screen.len == 0 && masked && wfes == 3);
+    CHECK(screen_inits == 1 && screen.len == 0 && masked && wfes == 3 && !screen_unmasked);
 
     /*
      * More than the ring buffer holds before the stop: the screen starts with what it still

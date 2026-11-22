@@ -164,12 +164,27 @@ static void print_layout(const struct selfboot_layout *l)
 }
 
 /*
+ * The guest has not been entered after the ports were taken. Without a host they are as they
+ * were again: with P_SELFBOOT_RUN and no host, the port the command came over is the proxy's
+ * once more, and a host can connect to m1n1 again. With a host nothing changes: its port was
+ * never taken. Returns -1.
+ */
+static int selfboot_give_back(const iodev_usage_t *usage, iodev_id_t host)
+{
+    if (host == NO_HOST)
+        for (int i = 0; i < IODEV_MAX; i++)
+            iodev_set_usage(i, usage[i]);
+    return -1;
+}
+
+/*
  * The two files are in guest memory and the layout is complete. host: the port a host talks
  * to m1n1 over, or NO_HOST.
  */
 static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
 {
     u64 regs[4] = {l->bootargs, 0, 0, 0};
+    iodev_usage_t usage[IODEV_MAX];
     int aicmap_size;
 
     print_layout(l);
@@ -213,15 +228,18 @@ static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
     /*
      * HV.init(). The USB ports nobody talks over stop being m1n1's first: hv_init() gives the
      * interrupts of their port controllers back, for the guest (usb_hpm_restore_irqs() of
-     * src/usb.c). The other cores are left alone: hv_init() does not start them.
+     * src/usb.c). The other cores are left alone: hv_init() does not start them. What the
+     * ports were is kept, for a guest that is not entered without a host (selfboot_give_back())
      */
+    for (int i = 0; i < IODEV_MAX; i++)
+        usage[i] = iodev_get_usage(i);
     for (int i = IODEV_USB0; i < IODEV_MAX; i++)
         if (i != (int)host)
             iodev_set_usage(i, 0);
     hv_init();
     selfboot_regs();
     if (selfboot_map(l, host) < 0)
-        return -1;
+        return selfboot_give_back(usage, host);
 
     /*
      * Execution tracking, when all the memory is mapped: this is where it is taken apart
@@ -230,7 +248,7 @@ static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
      */
     if (hv_pt_xtrack() < 0) {
         printf("selfboot: the hypervisor refused to track execution\n");
-        return -1;
+        return selfboot_give_back(usage, host);
     }
 
     /*
@@ -244,7 +262,11 @@ static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
     fb_shutdown(true);
 
     hv_start((void *)l->image_base, regs);
-    return 0;
+    /* Left by the host. Without one the guest is never left: hv_start() did not enter it */
+    if (host != NO_HOST)
+        return 0;
+    printf("selfboot: the hypervisor did not enter the firmware\n");
+    return selfboot_give_back(usage, host);
 }
 
 #ifdef CHAINLOADING

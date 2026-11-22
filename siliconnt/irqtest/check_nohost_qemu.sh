@@ -56,7 +56,7 @@ nohost-*)
         has "^SCREEN> HV: PSCI: SYSTEM_OFF from the guest"
         has "^SCREEN> HV: the guest called PSCI SYSTEM_OFF"
         has "^SCREEN> HV: powering the machine off"
-        has "^SCREEN> HV: power: the SMC did not wake up"
+        has "^SCREEN> HV: power: the SMC cannot be used"
         hasnt "PMU byte|restarting"
         ;;
     nohost-2)
