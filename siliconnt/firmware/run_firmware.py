@@ -696,10 +696,13 @@ def check_stage2(io_ranges):
     mapped to itself or not at all: both ends of every range of /arm-io, of guest RAM and
     of the memory below iBoot's are; m1n1 and the heap of this script are not; the UART is
     a hook of the hypervisor. A page of memory may also be execute-only, mapped to a shadow
-    page: code that the guest ran, with instructions replaced. Returns how many are not as
-    they should be."""
+    page: code that the guest ran, with instructions replaced. A shadow page is m1n1's, never
+    a page of the guest's memory. Returns how many are not as they should be."""
     uart = u.adt["/arm-io/uart0"].get_reg(0)[0] & ~(STAGE2_PAGE - 1)
     ram_base = layout.phys_base & ~0xffffffff
+    guest_memory = [(layout.phys_base, layout.mem_top)]
+    if ram_base < u.ba.phys_base:
+        guest_memory.append((ram_base, u.ba.phys_base))
     pages = {}
     for base, size in io_ranges:
         for addr in (base, base + size - STAGE2_PAGE):
@@ -722,8 +725,13 @@ def check_stage2(io_ranges):
         elif not pte & PTE_VALID:
             got = "hook"
         elif pte & PTE_SW_XONLY:
-            got = ("execute-only, mapped to a shadow page" if (pte & PTE_TARGET) != addr
-                   else "execute-only, mapped to itself")
+            target = pte & PTE_TARGET
+            if target == addr:
+                got = "execute-only, mapped to itself"
+            elif any(base <= target < top for base, top in guest_memory):
+                got = f"execute-only, mapped to 0x{target:x} in the guest's memory"
+            else:
+                got = "execute-only, mapped to a shadow page"
         elif (pte & PTE_TARGET) == addr:
             got = "mapped"
         else:

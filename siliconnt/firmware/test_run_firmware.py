@@ -1313,6 +1313,17 @@ rec, out, code = run({"guest": wait_for_sigint, "xonly_pt": {MEM_TOP - 0x1000: M
 check("m1n1 loader: a page of memory execute-only and mapped to itself is a problem: no shadow page",
       code == 2 and f"PROBLEM: 0x{MEM_TOP - 0x1000:x} should be mapped and is execute-only, "
       "mapped to itself" in out, f"{code!r} {tty(out)[-900:]}")
+in_ram, below = M4["heap_top"] + 0x10000, RAM_BASE + 0x10000
+rec, out, code = run({"guest": wait_for_sigint,
+                      "xonly_pt": {MEM_TOP - 0x1000: in_ram, M4["ba_phys_base"] - 0x1000: below}},
+                     *M1N1, "--seconds", "1", *image_args)
+check("m1n1 loader: a page of memory execute-only and mapped into the guest's memory, of RAM or "
+      "below iBoot's, is a problem: that is no shadow page",
+      code == 2 and "Stage 2: 2 of" in out and
+      f"PROBLEM: 0x{MEM_TOP - 0x1000:x} should be mapped and is execute-only, mapped to "
+      f"0x{in_ram:x} in the guest's memory" in out and
+      f"PROBLEM: 0x{M4['ba_phys_base'] - 0x1000:x} should be mapped and is execute-only, mapped "
+      f"to 0x{below:x} in the guest's memory" in out, f"{code!r} {tty(out)[-900:]}")
 rec, out, code = run({"guest": wait_for_sigint, "wrong_pt": RAM_BASE}, *M1N1, "--seconds", "1",
                      *image_args)
 check("m1n1 loader: a page of memory mapped to another page, and not execute-only, is a problem",

@@ -16,7 +16,7 @@ BREAK_6 := /^static int xt_to_data/,/^}/s/if (hv_pt_set_scanned(page, HV_XPAGE_I
 BREAK_6_IS := a page of code becomes data without an invalid entry in between
 BREAK_7 := s/ \&\& !(off == 0 \&\& size > 1)//
 BREAK_7_IS := the address that faulted is taken for the start of the access
-BREAK_8 := s/return hv_pt_set_scanned(page, HV_XPAGE_XONLY, (u64)xt_shadow(r));/return hv_pt_set_scanned(page, HV_XPAGE_SCANNED, orig);/
+BREAK_8 := s/return hv_pt_set_scanned(page, HV_XPAGE_XONLY, (u64)xt_shadow(r)) < 0 ? XT_REFUSED : 0;/return hv_pt_set_scanned(page, HV_XPAGE_SCANNED, orig) < 0 ? XT_REFUSED : 0;/
 BREAK_8_IS := a page of code that gets its first access stays readable and executes it
 BREAK_9 := s/^                new\[i\] = 0;$$/                new[i] = 1;/
 BREAK_9_IS := DC ZVA carried out here does not write zeroes
@@ -40,4 +40,14 @@ BREAK_18 := /^    xt_free\[xt_nr_free++\] = r->shadow;$$/d
 BREAK_18_IS := a page that becomes data does not give its shadow page back
 BREAK_19 := /^    xt_clean(orig + off, len);$$/d
 BREAK_19_IS := a store into an execute-only page leaves lines of the guest's page not clean
-BROKEN := 2 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+BREAK_20 := /^    xt_clean((u64)shadow, XT_PAGE);$$/d
+BREAK_20_IS := a shadow page is not cleaned to the point of coherency before it is executed
+BREAK_21 := /^static int xt_to_data/,/^}/s/^        xt_drop_icache();$$/        ;/
+BREAK_21_IS := the instruction caches are not dropped when a page stops being execute-only
+BREAK_22 := /^static int xt_to_code/,/^}/s/if (hv_pt_set_scanned(page, HV_XPAGE_INVALID, 0) < 0)/if (0)/
+BREAK_22_IS := a page of data becomes code without an invalid entry in between
+BREAK_23 := s/^        if (shadow\[i\] == xt_shadow_word(words\[i\]))$$/        if (1)/
+BREAK_23_IS := a shadow page is never found out of date
+BREAK_24 := s/part\[parts\]\.orig = xt_orig(part\[parts\]\.page, part\[parts\]\.state, pa);/part[parts].orig = pa;/
+BREAK_24_IS := an access taken apart from the instruction goes to the page that stage 2 points to
+BROKEN := 2 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24

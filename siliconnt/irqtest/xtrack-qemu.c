@@ -366,14 +366,20 @@ static void ic_ialluis(void)
     asm volatile("ic ialluis");
 }
 
-/* Where EL2 finds the instruction at this address of the guest: memory is where it says it is */
+/*
+ * Where EL2 finds the instruction at this address of the guest: as in hv_vm.c, in the page that
+ * stage 2 points to, the one that the core executes (for an execute-only page, its shadow
+ * page). 0 outside the memory that has pages of its own, where the guest has no code, and for a
+ * page while its entry is invalid.
+ */
 static u64 hv_translate_insn(u64 addr)
 {
     u64 ipa = hv_translate(addr, true, false, NULL);
+    u64 pa;
 
-    if (ipa < RAM_BASE || ipa >= PAGED_END)
+    if (!ipa || hv_pt_scanned(ipa, &pa) < 0)
         return 0;
-    return ipa;
+    return pa | (ipa & (PAGE - 1));
 }
 
 /* The SIMD registers of the guest, which nothing here uses: xtrack-qemu-head.S */

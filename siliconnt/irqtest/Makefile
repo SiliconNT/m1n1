@@ -185,12 +185,14 @@ $(EL2_GUESTS:%=build/%-el2-qemu-nosyn.elf): build/%-el2-qemu-nosyn.elf: build/%-
 # The same EL2 with one thing wrong in hv_xtrack.c (../xtrack-broken.mk). Each must fail on
 # QEMU: in what the guest finds, or in what this EL2 checks as it runs (xtrack-qemu.c: where
 # stage 2 points, and no shadow page found out of date that no device wrote). xitest runs
-# them, told to end at its first failure; DC IVAC is in pmutest alone, which runs 16.
-# One cannot show on QEMU: 19 leaves lines of the guest's page not clean, and QEMU has no
-# caches. That one is for the model (../vgic-model, make xtrack-broken).
+# them, told to end at its first failure. DC IVAC and a device that writes into code are in
+# pmutest alone, which runs 16 and 23.
+# Three cannot show on QEMU, which has no caches: 19 leaves lines of the guest's page not
+# clean, 20 a shadow page, and 21 leaves the instruction caches as they are. Those are for the
+# model (../vgic-model, make xtrack-broken).
 include ../xtrack-broken.mk
-QEMU_BROKEN := $(filter-out 19,$(BROKEN))
-QEMU_BROKEN_PMU := 16
+QEMU_BROKEN := $(filter-out 19 20 21,$(BROKEN))
+QEMU_BROKEN_PMU := 16 23
 broken_guest = $(if $(filter $(1),$(QEMU_BROKEN_PMU)),pmutest,xitest)
 
 build/hv_xtrack-broken-%.inc: build/hv_xtrack.inc ../xtrack-broken.mk
@@ -269,11 +271,12 @@ qemu-xi-el2: build/xitest-el2-qemu.elf
 qemu-xi-el2-nosyn: build/xitest-el2-qemu-nosyn.elf
 	-timeout 900 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel $<
 
-# One variant ($(1)) with its guest ($(2)): run it, and insist that the guest started and did
-# not end without a failure
+# One variant ($(1)) with its guest ($(2)): run it, and insist that the guest started, or that
+# execution tracking stopped it at its first instruction (22 does), and that it did not end
+# without a failure
 define XI_BROKEN_RUN
 timeout 900 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel build/$(2)-el2-broken-$(1).elf > build/$(2)-el2-broken-$(1).log 2>&1; \
-grep -q '$(2): start' build/$(2)-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): the guest did not start"; exit 1; }; \
+grep -q -E '$(2): start|execution tracking stops the guest' build/$(2)-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): the guest did not start"; exit 1; }; \
 if grep -q -E 'DONE pass fail = [0-9]+ 0[^0-9]*$$' build/$(2)-el2-broken-$(1).log; then echo "qemu-xi-broken: $(1): the test passes and must not"; exit 1; fi; \
 grep -q -E 'FAIL|stops the guest|unexpected exception' build/$(2)-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): ended without a failed check"; exit 1; }; \
 echo "qemu-xi-broken: $(1) $(BREAK_$(1)_IS) ($(2)): $$(grep -m1 -E 'FAIL|stops the guest|unexpected exception' build/$(2)-el2-broken-$(1).log | tr -d '\r')";

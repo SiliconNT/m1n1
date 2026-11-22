@@ -114,6 +114,16 @@
 /* The lines that cache maintenance by address goes by, as memory.c has them */
 #define XT_LINE 64UL
 
+/*
+ * CTR_EL0.DminLine (Arm DDI 0487 M.d, D24.2.41): log2 of the words in the smallest line of the
+ * data caches that data cache maintenance affects
+ */
+#define CTR_DMINLINE GENMASK(19, 16)
+
+/* Why a page could not be given the state it needed (xt_to_code(), xt_write()) */
+#define XT_FULL    -1 // there is no shadow page left
+#define XT_REFUSED -2 // hv_pt_set_scanned() refused to change the entry
+
 /* The most bytes that one instruction of hv_xinsn.c accesses: DC ZVA of a 64-byte block */
 #define XT_MAX_ACCESS 64
 
@@ -260,9 +270,23 @@ void hv_xtrack_init(void)
  * now, before there is a guest to stop for want of one. They are kept for as long as m1n1
  * runs. Returns -1 if there is no room for them; memalign() of m1n1 stops m1n1 itself when
  * the heap runs out, so on m1n1 that is where it ends.
+ *
+ * Also -1 if the data caches have lines smaller than XT_LINE. Cleaning by address steps by
+ * XT_LINE bytes, here and in memory.c, and an instruction affects at least the line of the
+ * smallest data cache that holds its address (D7.5.9.4): with smaller lines, some would be left
+ * as they are, and nothing would show it.
  */
 int hv_xtrack_start(void)
 {
+    u64 line = 4UL << FIELD_GET(CTR_DMINLINE, mrs(CTR_EL0));
+
+    if (line < XT_LINE) {
+        printf("HV: execution tracking: the smallest data cache line is %ld bytes, and cache "
+               "maintenance here goes by %ld\n",
+               line, XT_LINE);
+        return -1;
+    }
+
     if (!xt_pool) {
         xt_pool = memalign(XT_PAGE, XT_MAX_PAGES * XT_PAGE);
         if (!xt_pool) {
@@ -271,7 +295,9 @@ int hv_xtrack_start(void)
         }
         xt_free_all();
     }
-    printf("HV: execution tracking: %d shadow pages at %p\n", XT_MAX_PAGES, xt_pool);
+    printf("HV: execution tracking: %d shadow pages at %p; the smallest data cache line is %ld "
+           "bytes\n",
+           XT_MAX_PAGES, xt_pool, line);
     return 0;
 }
 
@@ -458,26 +484,32 @@ static int xt_to_data(u64 page, u64 orig)
 
 /*
  * A page of data at orig becomes code: scanned, and given a shadow page if there is an access
- * in it. Returns the state it is in now, or -1 if it is data still: no shadow page left.
+ * in it. Returns the state it is in now; XT_FULL if it is data still, with no shadow page left
+ * for it; XT_REFUSED if stage 2 could not be changed.
  */
 static int xt_to_code(u64 page, u64 orig)
 {
     if (hv_pt_set_scanned(page, HV_XPAGE_INVALID, 0) < 0)
-        return -1;
+        return XT_REFUSED;
 
     if (!hv_pmu_count_accesses((const u32 *)orig, XT_WORDS))
-        return hv_pt_set_scanned(page, HV_XPAGE_SCANNED, orig) < 0 ? -1 : HV_XPAGE_SCANNED;
+        return hv_pt_set_scanned(page, HV_XPAGE_SCANNED, orig) < 0 ? XT_REFUSED : HV_XPAGE_SCANNED;
 
     struct xt_rec *r = xt_add(page, orig);
 
-    if (!r) {
-        hv_pt_set_scanned(page, HV_XPAGE_UNSCANNED, orig);
-        return -1;
-    }
+    if (!r)
+        return hv_pt_set_scanned(page, HV_XPAGE_UNSCANNED, orig) < 0 ? XT_REFUSED : XT_FULL;
     xt_make_shadow(r);
     if (hv_pt_set_scanned(page, HV_XPAGE_XONLY, (u64)xt_shadow(r)) < 0)
-        return -1;
+        return XT_REFUSED;
     return HV_XPAGE_XONLY;
+}
+
+/* What hv_xtrack_iabort() says when xt_to_code() failed with err */
+static const char *xt_why(int err)
+{
+    return err == XT_FULL ? "all shadow pages are in use"
+                          : "stage 2 refused to change the entry of the page";
 }
 
 /*
@@ -512,8 +544,9 @@ static int xt_check(u64 page, u32 off, u32 len)
 
 /*
  * The guest writes len bytes at off into a page of code at this IPA, whose guest's page is at
- * orig, and which stays code: the store of an instruction that is in the page. Returns -1,
- * with nothing written, if the page needs a shadow page now and there is none left.
+ * orig, and which stays code: the store of an instruction that is in the page. Returns 0;
+ * XT_FULL, with nothing written, if the page needs a shadow page now and there is none left;
+ * XT_REFUSED if stage 2 could not be changed.
  */
 static int xt_write(u64 page, u64 orig, u32 off, u32 len, const u8 *buf)
 {
@@ -550,15 +583,13 @@ static int xt_write(u64 page, u64 orig, u32 off, u32 len, const u8 *buf)
     /* ...that gets its first access: execute-only, with a shadow page made after the store */
     if (!r) {
         if (hv_pt_set_scanned(page, HV_XPAGE_INVALID, 0) < 0)
-            return -1;
+            return XT_REFUSED;
         r = xt_add(page, orig);
-        if (!r) {
-            hv_pt_set_scanned(page, HV_XPAGE_SCANNED, orig);
-            return -1;
-        }
+        if (!r)
+            return hv_pt_set_scanned(page, HV_XPAGE_SCANNED, orig) < 0 ? XT_REFUSED : XT_FULL;
         xt_put(orig + off, buf, len);
         xt_make_shadow(r);
-        return hv_pt_set_scanned(page, HV_XPAGE_XONLY, (u64)xt_shadow(r));
+        return hv_pt_set_scanned(page, HV_XPAGE_XONLY, (u64)xt_shadow(r)) < 0 ? XT_REFUSED : 0;
     }
 
     /* Execute-only: the store into the guest's page, kept clean; the words in the shadow page */
@@ -575,6 +606,15 @@ static int xt_write(u64 page, u64 orig, u32 off, u32 len, const u8 *buf)
     xt_clean((u64)&shadow[first], 4 * nr);
     xt_drop_icache();
     return 0;
+}
+
+/* What xt_stop() says when xt_write() failed with err */
+static const char *xt_write_why(int err)
+{
+    return err == XT_FULL ? "a store puts an instruction to replace into a page that had none, "
+                            "and all shadow pages are in use"
+                          : "a store into its own page of code, and stage 2 refused to change "
+                            "the entry of the page";
 }
 
 /* ---- instruction aborts ---- */
@@ -648,8 +688,8 @@ bool hv_xtrack_iabort(struct exc_info *ctx)
     state = xt_to_code(page, pa);
     if (state < 0) {
         printf("HV: execution tracking stops the guest: it executes 0x%lx (IPA 0x%lx), a page "
-               "with instructions to replace, and all %d shadow pages are in use\n",
-               far, ipa, XT_MAX_PAGES);
+               "with instructions to replace, and %s\n",
+               far, ipa, xt_why(state));
         xt_stats.stops++;
         return false;
     }
@@ -886,12 +926,15 @@ static int xt_carry(struct exc_info *ctx, const struct hv_xinsn *d, u32 insn, u6
 
     if (wr) {
         /* The part in the instruction's own page first: the one there may be no room for */
-        for (u32 i = 0, done = 0; i < parts; done += part[i++].len)
-            if (part[i].page == pc_page &&
-                xt_write(part[i].page, part[i].orig, part[i].off, part[i].len, new + done) < 0)
-                return xt_stop(ctx, ipa, insn,
-                               "a store puts an instruction to replace into a page that had "
-                               "none, and all shadow pages are in use");
+        for (u32 i = 0, done = 0; i < parts; done += part[i++].len) {
+            if (part[i].page != pc_page)
+                continue;
+
+            int err = xt_write(part[i].page, part[i].orig, part[i].off, part[i].len, new + done);
+
+            if (err < 0)
+                return xt_stop(ctx, ipa, insn, xt_write_why(err));
+        }
 
         for (u32 i = 0, done = 0; i < parts; done += part[i++].len) {
             u64 pa;
@@ -1146,10 +1189,11 @@ int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write)
 
         for (u32 i = 0; i < size; i++)
             buf[i] = val >> (8 * i);
-        if (xt_write(page, orig, off, size, buf) < 0)
-            return xt_stop(ctx, ipa, 0,
-                           "a store puts an instruction to replace into a page that had none, "
-                           "and all shadow pages are in use");
+
+        int err = xt_write(page, orig, off, size, buf);
+
+        if (err < 0)
+            return xt_stop(ctx, ipa, 0, xt_write_why(err));
         xt_stats.writes_syn++;
         return HV_XTRACK_SKIP;
     }

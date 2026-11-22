@@ -65,6 +65,8 @@
 /* The registers that hv_xtrack.c reads and writes */
 static u64 test_CNTPCT_EL0, test_CNTFRQ_EL0 = 1000, test_SP_EL0, test_SP_EL1;
 static u64 test_DCZID_EL0 = 4; /* blocks of 64 bytes */
+/* CTR_EL0 with DminLine 4: data cache lines of 64 bytes at least */
+static u64 test_CTR_EL0 = 4UL << 16;
 #define mrs(reg)      (test_##reg)
 #define msr(reg, val) (test_##reg = (val))
 #define sysop(op)     ((void)0)
@@ -1321,6 +1323,14 @@ static void test_directed(void)
     test_no_memory = true;
     check(hv_xtrack_start() < 0, "execution tracking starts without its shadow pages");
     test_no_memory = false;
+
+    /* Data cache lines of 32 bytes: cleaning 64 bytes at a time would leave every other one */
+    test_CTR_EL0 = 3UL << 16;
+    check(hv_xtrack_start() < 0, "execution tracking starts with data cache lines of 32 bytes");
+    /* ...of 128 bytes: each line is cleaned twice, which does no harm */
+    test_CTR_EL0 = 5UL << 16;
+    check(hv_xtrack_start() == 0, "execution tracking does not start with lines of 128 bytes");
+    test_CTR_EL0 = 4UL << 16;
 
     start();
 
