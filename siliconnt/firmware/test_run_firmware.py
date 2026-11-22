@@ -135,7 +135,12 @@ def make_fakes(case):
     def stage2(addr):
         """What hv_pt_walk() of src/hv/hv_vm.c returns for the tables selfboot_map() of
         src/selfboot_run.c builds: the page itself with the valid bit for memory and device
-        registers, a software entry without it for the UART, 0 for what is not mapped."""
+        registers, a software entry without it for the UART, 0 for what is not mapped.
+        xonly_pt: pages made execute-only by execution tracking (src/hv/hv_vm.c,
+        hv_pt_set_scanned()), each mapped to the page given: no access, PTE_SW_SCANNED and
+        PTE_SW_XONLY."""
+        if addr in case.get("xonly_pt", {}):
+            return case["xonly_pt"][addr] | 3 | 1 << 56 | 1 << 58
         if addr == case.get("bad_pt"):
             return 0
         if addr == case.get("extra_pt"):
@@ -1283,6 +1288,36 @@ check("m1n1 loader: a page of /arm-io mapped to another page is a problem",
       in out, f"{code!r} {tty(out)[-900:]}")
 check("m1n1 loader: a run with a stage 2 problem still says that the hypervisor was left",
       out.endswith("Hypervisor exited.\n"), out[-300:])
+
+# 43a. pages of memory that the guest ran code from, with instructions replaced: execute-only,
+# mapped to a shadow page in m1n1's heap. That is right for memory, and for nothing else.
+SHADOW = M1N1_HEAP_TOP + 0x10000
+memory_ends = (M4["heap_top"], MEM_TOP - 0x1000, RAM_BASE, M4["ba_phys_base"] - 0x1000)
+rec, out, code = run({"guest": wait_for_sigint,
+                      "xonly_pt": {a: SHADOW + i * 0x1000 for i, a in enumerate(memory_ends)}},
+                     *M1N1, "--seconds", "1", *image_args)
+check("m1n1 loader: both ends of guest RAM and of the memory below iBoot's may be execute-only, "
+      "mapped to a shadow page",
+      code == 0 and "PROBLEM" not in out and "Stage 2: as expected" in out and
+      "(4 of the pages of memory execute-only, mapped to a shadow page)" in out and
+      set(memory_ends) <= {addr for addr, after in rec.pt_walks}, f"{code!r} {tty(out)[-900:]}")
+for name, addr in (("a page of /arm-io", ARM_IO[2][0]), ("m1n1", M4["m1n1_base"]),
+                   ("the host's heap", M4["heap_top"] - 0x1000)):
+    rec, out, code = run({"guest": wait_for_sigint, "xonly_pt": {addr: SHADOW}}, *M1N1,
+                         "--seconds", "1", *image_args)
+    check(f"m1n1 loader: {name} execute-only, mapped to a shadow page, is a problem",
+          code == 2 and f"PROBLEM: 0x{addr:x} should be" in out and
+          "is execute-only, mapped to a shadow page" in out, f"{code!r} {tty(out)[-900:]}")
+rec, out, code = run({"guest": wait_for_sigint, "xonly_pt": {MEM_TOP - 0x1000: MEM_TOP - 0x1000}},
+                     *M1N1, "--seconds", "1", *image_args)
+check("m1n1 loader: a page of memory execute-only and mapped to itself is a problem: no shadow page",
+      code == 2 and f"PROBLEM: 0x{MEM_TOP - 0x1000:x} should be mapped and is execute-only, "
+      "mapped to itself" in out, f"{code!r} {tty(out)[-900:]}")
+rec, out, code = run({"guest": wait_for_sigint, "wrong_pt": RAM_BASE}, *M1N1, "--seconds", "1",
+                     *image_args)
+check("m1n1 loader: a page of memory mapped to another page, and not execute-only, is a problem",
+      code == 2 and f"PROBLEM: 0x{RAM_BASE:x} should be mapped and is mapped to another page" in out,
+      f"{code!r} {tty(out)[-900:]}")
 
 # 44. --wait-debugger: the command is not sent before a debugger has connected
 rec, out, code = run({"at_upload": connect_later, "guest": wait_for_sigint}, *M1N1,

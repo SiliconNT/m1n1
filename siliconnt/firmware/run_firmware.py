@@ -665,6 +665,10 @@ def wait_for_debugger():
 # PTE_TARGET_MASK, the page of the machine it maps
 PTE_VALID = 1
 PTE_TARGET = (1 << 50) - (1 << 12)
+# Left to software (PTE_SW_XONLY): a page of the guest's code with instructions replaced, which
+# the core executes from a shadow page of the hypervisor (src/hv/hv_xtrack.c), so the entry
+# points there and not to the page itself
+PTE_SW_XONLY = 1 << 58
 STAGE2_PAGE = 0x1000
 # hv_pt_walk() asserts that the address is one the tables cover; the M4's cover 42 bits
 # ("HV: Initializing for 42-bit PA range")
@@ -691,20 +695,22 @@ def check_stage2(io_ranges):
     stage 2 tables, which are still there once the guest has been left. Each page has to be
     mapped to itself or not at all: both ends of every range of /arm-io, of guest RAM and
     of the memory below iBoot's are; m1n1 and the heap of this script are not; the UART is
-    a hook of the hypervisor. Returns how many are not as they should be."""
+    a hook of the hypervisor. A page of memory may also be execute-only, mapped to a shadow
+    page: code that the guest ran, with instructions replaced. Returns how many are not as
+    they should be."""
     uart = u.adt["/arm-io/uart0"].get_reg(0)[0] & ~(STAGE2_PAGE - 1)
     ram_base = layout.phys_base & ~0xffffffff
     pages = {}
     for base, size in io_ranges:
         for addr in (base, base + size - STAGE2_PAGE):
             pages[addr] = "mapped"
-    pages[layout.phys_base] = pages[layout.mem_top - STAGE2_PAGE] = "mapped"
+    pages[layout.phys_base] = pages[layout.mem_top - STAGE2_PAGE] = "memory"
     if ram_base < u.ba.phys_base:
-        pages[ram_base] = pages[u.ba.phys_base - STAGE2_PAGE] = "mapped"
+        pages[ram_base] = pages[u.ba.phys_base - STAGE2_PAGE] = "memory"
     pages[u.base] = pages[layout.phys_base - STAGE2_PAGE] = "not mapped"
     pages[uart] = "hook"
 
-    problems = 0
+    problems = xonly = 0
     for addr, want in sorted(pages.items()):
         if addr >> STAGE2_BITS:
             print(f"PROBLEM: 0x{addr:x} is beyond {STAGE2_BITS} bits, not looked up")
@@ -715,19 +721,27 @@ def check_stage2(io_ranges):
             got = "not mapped"
         elif not pte & PTE_VALID:
             got = "hook"
+        elif pte & PTE_SW_XONLY:
+            got = ("execute-only, mapped to a shadow page" if (pte & PTE_TARGET) != addr
+                   else "execute-only, mapped to itself")
         elif (pte & PTE_TARGET) == addr:
             got = "mapped"
         else:
             got = "mapped to another page"
+        if want == "memory" and got in ("mapped", "execute-only, mapped to a shadow page"):
+            xonly += got != "mapped"
+            continue
         if got != want:
+            want = "mapped" if want == "memory" else want
             print(f"PROBLEM: 0x{addr:x} should be {want} and is {got} (entry 0x{pte:x})")
             problems += 1
     if problems:
         print(f"Stage 2: {problems} of {len(pages)} pages are not as they should be")
     else:
         print(f"Stage 2: as expected, {len(pages)} pages looked up: both ends of the "
-              f"{len(io_ranges)} ranges of /arm-io and of the memory mapped, m1n1 and this "
-              "script's heap not mapped, the UART a hook")
+              f"{len(io_ranges)} ranges of /arm-io and of the memory mapped ({xonly} of the "
+              "pages of memory execute-only, mapped to a shadow page), m1n1 and this script's "
+              "heap not mapped, the UART a hook")
     return problems
 
 def m1n1_loads():

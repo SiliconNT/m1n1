@@ -21,7 +21,8 @@
 #   make qemu-psci-strict  pscitest.bin expecting the hypervisor's answers, which QEMU's
 #                      PSCI does not give: shows that those checks can fail
 #   make qemu-pmu-el2  pmutest.bin under an EL2 of its own that links the real execution
-#                      tracking and PMU code (xtrack-qemu.c)
+#                      tracking and PMU code (xtrack-qemu.c), and plays a device that writes
+#                      into the guest's code
 #   make qemu-pmu-el2-nosyn  ...where ESR_EL2 never describes an access, so that every read
 #                      and store that EL2 carries out is taken apart from the instruction
 #   make qemu-xi       xitest.bin on QEMU with no EL2: checks the guest itself
@@ -29,7 +30,8 @@
 #                      against the same instruction where EL2 has no part
 #   make qemu-xi-el2-nosyn  ...where ESR_EL2 never describes an access
 #   make qemu-xi-broken     ...against hv_xtrack.c with one thing wrong in it at a time
-#                      (../xtrack-broken.mk): xitest must fail on each of QEMU_BROKEN
+#                      (../xtrack-broken.mk): xitest, or pmutest for QEMU_BROKEN_PMU, must
+#                      fail on each of QEMU_BROKEN
 
 ARCH ?= aarch64-linux-gnu-
 QEMU ?= qemu-system-aarch64
@@ -180,21 +182,29 @@ $(EL2_GUESTS:%=build/%-el2-qemu.elf): build/%-el2-qemu.elf: build/%-el2-head.o b
 $(EL2_GUESTS:%=build/%-el2-qemu-nosyn.elf): build/%-el2-qemu-nosyn.elf: build/%-el2-head.o build/xtrack-qemu-nosyn.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
 
-# The same EL2 with one thing wrong in hv_xtrack.c, and xitest told to end at its first failure.
-# Two of them cannot show on QEMU: an access that is left as it is executes there (4), and
-# there is one core, which cannot catch a page in the middle of a change (6). Those are for
-# the model (../vgic-model, make xtrack-broken).
+# The same EL2 with one thing wrong in hv_xtrack.c (../xtrack-broken.mk). Each must fail on
+# QEMU: in what the guest finds, or in what this EL2 checks as it runs (xtrack-qemu.c: where
+# stage 2 points, and no shadow page found out of date that no device wrote). xitest runs
+# them, told to end at its first failure; DC IVAC is in pmutest alone, which runs 16.
+# One cannot show on QEMU: 19 leaves lines of the guest's page not clean, and QEMU has no
+# caches. That one is for the model (../vgic-model, make xtrack-broken).
 include ../xtrack-broken.mk
-QEMU_BROKEN := $(filter-out 4 6,$(BROKEN))
+QEMU_BROKEN := $(filter-out 19,$(BROKEN))
+QEMU_BROKEN_PMU := 16
+broken_guest = $(if $(filter $(1),$(QEMU_BROKEN_PMU)),pmutest,xitest)
 
 build/hv_xtrack-broken-%.inc: build/hv_xtrack.inc ../xtrack-broken.mk
 	sed -e '$(BREAK_$*)' $< > $@
 	! cmp -s $< $@
 
+# ARG_STRICT and ARG_DEVICE for pmutest, ARG_STOP for xitest
 build/xtrack-qemu-broken-%.o: xtrack-qemu.c $(XTRACK_INCS) build/hv_xtrack-broken-%.inc
-	$(CC) -c $(SGI_CFLAGS) -Wno-error -Ibuild -DXTRACK_INC='"hv_xtrack-broken-$*.inc"' -DGUEST_ARG=0x300 -o $@ $<
+	$(CC) -c $(SGI_CFLAGS) -Wno-error -Ibuild -DXTRACK_INC='"hv_xtrack-broken-$*.inc"' -DGUEST_ARG=0x700 -o $@ $<
 
 build/xitest-el2-broken-%.elf: build/xitest-el2-head.o build/xtrack-qemu-broken-%.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
+
+build/pmutest-el2-broken-%.elf: build/pmutest-el2-head.o build/xtrack-qemu-broken-%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $^
 
 # The guests spin after they have printed DONE, so stop QEMU after a while
@@ -230,7 +240,8 @@ qemu-psci-strict: build/pscitest-qemu-0x100.elf
 	-timeout 20 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
 # pmutest ends with SYSTEM_OFF. QEMU has real PMUv3 registers, so nothing is replaced there:
-# the strict run shows that the checks for replaced code can fail (8 of the 24)
+# the strict run shows that the checks for replaced code can fail (2 of the 38). Neither has
+# ARG_DEVICE: the device that writes into code is for the EL2 of xtrack-qemu.c to play
 qemu-pmu: build/pmutest-qemu-0x0.elf
 	-timeout 30 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
@@ -258,17 +269,18 @@ qemu-xi-el2: build/xitest-el2-qemu.elf
 qemu-xi-el2-nosyn: build/xitest-el2-qemu-nosyn.elf
 	-timeout 900 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel $<
 
-# One variant: run it, and insist that the guest started and did not end without a failure
+# One variant ($(1)) with its guest ($(2)): run it, and insist that the guest started and did
+# not end without a failure
 define XI_BROKEN_RUN
-timeout 900 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel build/xitest-el2-broken-$(1).elf > build/xitest-el2-broken-$(1).log 2>&1; \
-grep -q 'xitest: start' build/xitest-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): the guest did not start"; exit 1; }; \
-if grep -q -E 'DONE pass fail = [0-9]+ 0[^0-9]*$$' build/xitest-el2-broken-$(1).log; then echo "qemu-xi-broken: $(1): the test passes and must not"; exit 1; fi; \
-grep -q -E 'FAIL|stops the guest|unexpected exception' build/xitest-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): ended without a failed check"; exit 1; }; \
-echo "qemu-xi-broken: $(1) $(BREAK_$(1)_IS): $$(grep -m1 -E 'FAIL|stops the guest|unexpected exception' build/xitest-el2-broken-$(1).log | tr -d '\r')";
+timeout 900 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel build/$(2)-el2-broken-$(1).elf > build/$(2)-el2-broken-$(1).log 2>&1; \
+grep -q '$(2): start' build/$(2)-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): the guest did not start"; exit 1; }; \
+if grep -q -E 'DONE pass fail = [0-9]+ 0[^0-9]*$$' build/$(2)-el2-broken-$(1).log; then echo "qemu-xi-broken: $(1): the test passes and must not"; exit 1; fi; \
+grep -q -E 'FAIL|stops the guest|unexpected exception' build/$(2)-el2-broken-$(1).log || { echo "qemu-xi-broken: $(1): ended without a failed check"; exit 1; }; \
+echo "qemu-xi-broken: $(1) $(BREAK_$(1)_IS) ($(2)): $$(grep -m1 -E 'FAIL|stops the guest|unexpected exception' build/$(2)-el2-broken-$(1).log | tr -d '\r')";
 endef
 
-qemu-xi-broken: $(QEMU_BROKEN:%=build/xitest-el2-broken-%.elf)
-	@$(foreach n,$(QEMU_BROKEN),$(call XI_BROKEN_RUN,$(n)))
+qemu-xi-broken: $(foreach n,$(QEMU_BROKEN),build/$(call broken_guest,$(n))-el2-broken-$(n).elf)
+	@$(foreach n,$(QEMU_BROKEN),$(call XI_BROKEN_RUN,$(n),$(call broken_guest,$(n))))
 	@echo "qemu-xi-broken: all $(words $(QEMU_BROKEN)) failed, as they must"
 
 clean:
