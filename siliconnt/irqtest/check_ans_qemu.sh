@@ -11,7 +11,8 @@
 # never set; silent, it reads "active", the reset is done, RUN is set, the coprocessor never
 # says HELLO, and the core clears RUN and resets again. Either way the guest says the start
 # failed, no NVMe command is sent, and the only registers written are RUN, the mailbox's send
-# registers and the power manager register. The guest ends with SYSTEM_OFF, which ends QEMU.
+# registers and the power manager register. Before that the guest's self-test of its checks of
+# commands and SART writes passes. The guest ends with SYSTEM_OFF, which ends QEMU.
 set -u
 run=$1
 log=$2
@@ -33,8 +34,10 @@ has "^HVLOG: anstest: start, ${run%%-*}$"
 has "^HVLOG: anstest: FAIL ans_start: "
 has "^HVLOG: anstest: core: ans: controller failed$"
 has "^HVLOG: anstest: DONE outcome 4$"
-hasnt "EXCEPTION|NOT RUNG|refused a|env: admin command|core: nvme: denied|forbidden"
-has "^HVLOG: anstest: counts: .* commands 0, not rung 0, log full 0, bad accesses 0$"
+has "^HVLOG: anstest: self-test: [1-9][0-9]* cases, 0 wrong$"
+hasnt "EXCEPTION|NOT RUNG|NOT SET|NOT WRITTEN|refused a|env: admin command|core: nvme: denied|forbidden|FAIL self-test"
+has "^HVLOG: anstest: counts: .* commands 0, rung 0, not rung 0, log full 0, bad accesses 0, SART writes not done 0$"
+has "^HVLOG: anstest: SART at the end: the entries in use before unchanged; all others off$"
 
 # Every register write: RUN (asc+44), the mailbox's send registers, the power manager register
 writes=$(grep -E "^HVLOG: anstest: W(32|64) " "$log")

@@ -44,8 +44,11 @@
 #                      repository (ANS_CORE) in a guest that run_anstest.py loads (R38). Not
 #                      part of "all": it needs that repository
 #   make qemu-ans      anstest.bin on QEMU, with RAM where the controller would be: the
-#                      controller cannot come up there, and the guest has to say so without
-#                      writing anything it was not given (check_ans_qemu.sh)
+#                      guest's self-test of its own checks passes, the controller cannot come
+#                      up there, and the guest says so, having written no register but RUN,
+#                      the mailbox's and the power manager's (check_ans_qemu.sh)
+#   make qemu-ans-broken  ...against anstest.c with one of its checks broken at a time
+#                      (ans-broken.mk): the self-test has to find each
 
 ARCH ?= aarch64-linux-gnu-
 QEMU ?= qemu-system-aarch64
@@ -64,7 +67,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: anstest qemu-ans all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken qemu-nohost qemu-nohost-broken clean
+.PHONY: anstest qemu-ans qemu-ans-broken all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken qemu-nohost qemu-nohost-broken clean
 .SECONDARY:
 
 all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin
@@ -431,17 +434,55 @@ build/anstest-qemu-%.o: sgitest-qemu.S sgitest.h build/anstest-qemu-%.bin
 build/anstest-qemu-%.elf: build/anstest-qemu-%.o
 	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
 
+# $(1) the run check_ans_qemu.sh judges, $(2) the ELF without .elf (the log goes next to it),
+# $(3) what the power manager register reads
 define ANS_QEMU_RUN
 { timeout 30 $(QEMU) $(ANS_QEMU_FLAGS) -smp 1 -no-reboot \
 	-device loader,addr=$$(($(ANS_QEMU_ASC) + 0x8114)),data=0x20000,data-len=4 \
-	-device loader,addr=$(ANS_QEMU_PMGR),data=$(call ans_qemu_pmgr,$(1)),data-len=4 \
-	-kernel build/anstest-qemu-$(1).elf > build/anstest-qemu-$(1).log 2>&1; \
-bash check_ans_qemu.sh $(1) build/anstest-qemu-$(1).log $$?; }
+	-device loader,addr=$(ANS_QEMU_PMGR),data=$(3),data-len=4 \
+	-kernel $(2).elf > $(2).log 2>&1; \
+bash check_ans_qemu.sh $(1) $(2).log $$?; }
 endef
 
 qemu-ans: $(ANS_QEMU_RUNS:%=build/anstest-qemu-%.elf)
-	@$(foreach r,$(ANS_QEMU_RUNS),$(call ANS_QEMU_RUN,$(r)) &&) true
+	@$(foreach r,$(ANS_QEMU_RUNS),\
+		$(call ANS_QEMU_RUN,$(r),build/anstest-qemu-$(r),$(call ans_qemu_pmgr,$(r))) &&) true
 	@echo "qemu-ans: all $(words $(ANS_QEMU_RUNS)) as they should be"
+
+# anstest.c with one of its own checks broken at a time (ans-broken.mk), run as polling-silent:
+# each run has to fail its check, and because the self-test found the break.
+# build/ansbroken-<name>.bin is the image, build/ansbroken-qemu-<name> the run on QEMU
+include ans-broken.mk
+
+build/ansbroken-%.c: anstest.c ans-broken.mk
+	@mkdir -p build
+	sed -e '$(ANS_BREAK_$*)' $< > $@
+	! cmp -s $< $@
+
+build/ansbroken-%.o: build/ansbroken-%.c sgitest.h gic.h $(wildcard $(ANS_CORE)/*.h)
+	$(CC) -c $(ANS_CFLAGS) -Wno-error -I. -march=armv8-a+crc -o $@ $<
+
+build/ansbroken-%.bin: build/sgitest-head.o build/ansbroken-%.o $(ANS_CORE_OBJS) sgitest.ld
+	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o build/ansbroken-$*.elf \
+		build/sgitest-head.o build/ansbroken-$*.o $(ANS_CORE_OBJS)
+	$(OBJCOPY) -O binary build/ansbroken-$*.elf $@
+
+build/ansbroken-qemu-%.elf: build/ansbroken-%.bin run_anstest.py sgitest-qemu.S sgitest.h
+	$(PYTHON) run_anstest.py --mode polling --qemu-image build/ansbroken-qemu-$*.bin $<
+	$(CC) -c -Wall -Werror -DNR_CPUS=1 -DIMAGE='"build/ansbroken-qemu-$*.bin"' \
+		-o build/ansbroken-qemu-$*.o sgitest-qemu.S
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ build/ansbroken-qemu-$*.o
+
+qemu-ans-broken: $(ANS_BROKEN:%=build/ansbroken-qemu-%.elf)
+	@$(foreach n,$(ANS_BROKEN),\
+		if ($(call ANS_QEMU_RUN,polling-silent,build/ansbroken-qemu-$(n),0xf0)) \
+			> build/ansbroken-qemu-$(n).check; \
+		then echo "qemu-ans-broken: $(n): the run is as it should be, and must not be"; exit 1; \
+		elif ! grep -q "^HVLOG: anstest: FAIL self-test" build/ansbroken-qemu-$(n).log; \
+		then echo "qemu-ans-broken: $(n): the self-test did not find it"; exit 1; \
+		else echo "qemu-ans-broken: $(n): $$(grep -m1 "FAIL self-test" \
+			build/ansbroken-qemu-$(n).log | sed "s/^HVLOG: anstest: //")"; fi;)
+	@echo "qemu-ans-broken: all $(words $(ANS_BROKEN)) failed, as they must"
 
 clean:
 	rm -rf build
