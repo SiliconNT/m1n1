@@ -12,9 +12,13 @@
 #   ioq-registers  0x1200 and 0x1208 need not hold the I/O queues made
 #   sart-in-use    a SART entry in use before the core may be written
 #   sart-arena     a SART entry may be turned on for any memory
+#   queue-shape    an I/O queue may be made not physically contiguous, or larger than its memory
+#   metadata       CDW2, CDW3 and the metadata pointer are not checked
+#   aqa            CC.EN may be set whatever AQA says
+#   sq-base        the submission queue need not be in the memory given to the core
 
 ANS_BROKEN := flags io-whitelist admin-identify prp1 prp-list tcb ioq-registers sart-in-use \
-	sart-arena
+	sart-arena queue-shape metadata aqa sq-base
 
 ANS_BREAK_flags := s/^    if (flags)$$/    if (0)/
 ANS_BREAK_io-whitelist := s/return opcode == 0x02 && nsid == 1;/return 1;/
@@ -25,3 +29,7 @@ ANS_BREAK_tcb := s/if (tcb\[3\] != prp1 || tcb\[4\] != prp2)/if (0)/
 ANS_BREAK_ioq-registers := s/(ioq_cmds != iosq || ioq_cqes != iocq)/0/
 ANS_BREAK_sart-in-use := s/if (sart\[idx\].in_use)/if (0)/
 ANS_BREAK_sart-arena := s/!in_arena((u64)next.paddr << 12, sart_bytes(&next)))/0)/
+ANS_BREAK_queue-shape := s/if (!(cdw11 & 1) || (cdw10 >> 16) >= QUEUE_ENTRIES)/if (0)/
+ANS_BREAK_metadata := s/if (sqe\[1\] || sqe\[2\])/if (0)/
+ANS_BREAK_aqa := s/if ((aqa & 0xfff) >= QUEUE_ENTRIES || ((aqa >> 16) & 0xfff) >= QUEUE_ENTRIES)/if (0)/
+ANS_BREAK_sq-base := s/if (!in_arena(base, QUEUE_ENTRIES \* SQE_SIZE))/if (0)/

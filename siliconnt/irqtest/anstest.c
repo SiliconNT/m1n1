@@ -182,6 +182,7 @@ struct anstest_result {
     u64 data_hi;
     u64 burst_lo;
     u64 burst_hi;
+    u64 ns_format; /* namespace 1: metadata bytes | LBA data size (log2) << 16 | FLBAS << 24 */
 };
 
 struct anstest_result result __attribute__((aligned(16))) = {
@@ -201,7 +202,7 @@ struct anstest_result result __attribute__((aligned(16))) = {
 #define READBACK_SLOTS 128UL
 #define SCATTER_PAGES  130UL /* the pieces in the odd pages 1..127, the rest guards */
 #define CMDLOG_MAX     4096UL
-#define CMDLOG_WORDS   26UL /* meta, the 64 bytes of the command, the 128 of the TCB, the time */
+#define CMDLOG_WORDS   29UL /* meta, the command (64 bytes), the TCB (128), SQ, CQ, TCBs, time */
 #define CRC_SLOTS      1024UL
 
 #define IO_DEPTH      ANS_MAX_IO_DEPTH
@@ -493,7 +494,8 @@ static const u32 nvme_written[] = {
 enum queue { Q_ADMIN, Q_IO };
 
 /* What the core wrote into the queue registers, and the I/O queues the commands made */
-static u64 asq, acq, tcb_admin, tcb_io, ioq_cmds, ioq_cqes, iosq, iocq;
+static u64 asq, acq, tcb_admin, tcb_io, ioq_cmds, ioq_cqes, iosq, iocq, ident;
+static u32 aqa;
 
 static int range_ok(enum ans_region rgn, uint32_t off, uint32_t width)
 {
@@ -514,6 +516,8 @@ static int write_allowed(enum ans_region rgn, uint32_t off, uint32_t width)
         case ANS_RGN_NVME:
             for (unsigned i = 0; width == 4 && i < sizeof(nvme_written) / sizeof(u32); i++)
                 ok |= off == nvme_written[i];
+            if (off >= NVME_IOQ_CMDS && off < NVME_IOQ_CQES + 8 && !params.ioq_registers)
+                ok = 0; /* only with nvme-secure-bar */
             break;
         case ANS_RGN_ASC: /* RUN, and the mailbox's send registers */
             ok = (width == 4 && off == 0x44) || (width == 8 && (off == 0x8800 || off == 0x8808));
@@ -626,6 +630,8 @@ static const char *cmd_check(enum queue q, u32 tag, u64 sqe[8], u64 tcb[16])
 
     if (!env_cmd_allowed(q, opcode, flags, nsid, cdw10, cdw11))
         return "not on the whitelist";
+    if (sqe[1] || sqe[2])
+        return "CDW2, CDW3 or the metadata pointer set";
     if (tcb[3] != prp1 || tcb[4] != prp2)
         return "the TCB's PRPs are not the command's";
     if (q == Q_IO) {
@@ -637,11 +643,10 @@ static const char *cmd_check(enum queue q, u32 tag, u64 sqe[8], u64 tcb[16])
     }
     switch (opcode) {
         case 0x05:
-            return prp2 || !in_arena(prp1, QUEUE_ENTRIES * CQE_SIZE)
-                       ? "the queue is not in the memory given to the core"
-                       : 0;
         case 0x01:
-            return prp2 || !in_arena(prp1, QUEUE_ENTRIES * SQE_SIZE)
+            if (!(cdw11 & 1) || (cdw10 >> 16) >= QUEUE_ENTRIES)
+                return "the queue is not physically contiguous, or larger than its memory";
+            return prp2 || !in_arena(prp1, QUEUE_ENTRIES * (opcode == 0x05 ? CQE_SIZE : SQE_SIZE))
                        ? "the queue is not in the memory given to the core"
                        : 0;
         case 0x06:
@@ -673,7 +678,10 @@ static int doorbell(enum queue q, u32 tag)
         log[1 + i] = sqe[i];
     for (int i = 0; i < 16; i++)
         log[9 + i] = tcb[i];
-    log[25] = now();
+    log[25] = q == Q_ADMIN ? asq : iosq;
+    log[26] = q == Q_ADMIN ? acq : iocq;
+    log[27] = q == Q_ADMIN ? tcb_admin : tcb_io;
+    log[28] = now();
     result.cmdlog_count++;
 
     if (why) {
@@ -690,20 +698,38 @@ static int doorbell(enum queue q, u32 tag)
             iocq = sqe[3];
         else if (opcode == 0x01)
             iosq = sqe[3];
+        else if (opcode == 0x06)
+            ident = sqe[3];
     }
     result.doorbells_rung++;
     return 1;
 }
 
-/* CC.EN only with the admin queues and their TCBs in the memory given to the core */
+/*
+ * CC.EN only with the admin queues and their TCBs in the memory given to the core, and no
+ * larger than that memory (AQA); 0 or why not
+ */
+static const char *cc_check(uint32_t value)
+{
+    if (!(value & 1))
+        return 0;
+    if ((aqa & 0xfff) >= QUEUE_ENTRIES || ((aqa >> 16) & 0xfff) >= QUEUE_ENTRIES)
+        return "AQA says larger admin queues than their memory";
+    if (!in_arena(asq, QUEUE_ENTRIES * SQE_SIZE) || !in_arena(acq, QUEUE_ENTRIES * CQE_SIZE) ||
+        !in_arena(tcb_admin, QUEUE_ENTRIES * TCB_SIZE))
+        return "the admin queues or their TCBs are not in the memory given to the core";
+    return 0;
+}
+
 static int cc_ok(uint32_t value)
 {
-    if (!(value & 1) ||
-        (in_arena(asq, QUEUE_ENTRIES * SQE_SIZE) && in_arena(acq, QUEUE_ENTRIES * CQE_SIZE) &&
-         in_arena(tcb_admin, QUEUE_ENTRIES * TCB_SIZE)))
+    const char *why = cc_check(value);
+
+    if (!why)
         return 1;
     result.env_refused++;
-    say("env: NOT SET: CC.EN with ASQ %llx ACQ %llx TCBs %llx", ULL(asq), ULL(acq), ULL(tcb_admin));
+    say("env: NOT SET: CC.EN (ASQ %llx ACQ %llx TCBs %llx AQA %x): %s", ULL(asq), ULL(acq),
+        ULL(tcb_admin), aqa, why);
     return 0;
 }
 
@@ -827,18 +853,28 @@ static void sart_read(struct sart_entry *e, u32 i)
     e->size = sart_size_at ? sart_rd(sart_size_at + 4 * i) : 0;
 }
 
-/* Step 0: which entries are in use; read only */
-static void sart_snapshot(void)
+/*
+ * Step 0: which entries are in use; read only. 0 if one of them lets the coprocessor reach
+ * this guest or its memory for the device
+ */
+static int sart_snapshot(void)
 {
+    int apart = 1;
+
     for (u32 i = 0; i < sart_n; i++) {
         sart_read(&sart[i], i);
         sart[i].in_use = sart_on(&sart[i]);
-        if (sart[i].in_use) {
-            result.sart_entries_in_use++;
-            say("SART entry %u in use: cfg %08x paddr %08x size %08x", i, sart[i].cfg,
-                sart[i].paddr, sart[i].size);
+        if (!sart[i].in_use)
+            continue;
+        u64 lo = (u64)sart[i].paddr << 12, hi = lo + sart_bytes(&sart[i]);
+        result.sart_entries_in_use++;
+        say("SART entry %u in use: %llx..%llx", i, ULL(lo), ULL(hi));
+        if (lo < pool_end && (u64)image_start < hi) {
+            apart = 0;
+            say("FAIL SART entry %u lets the coprocessor reach this guest or its memory", i);
         }
     }
+    return apart;
 }
 
 /* Step 6: the entries in use as they were, all the others off */
@@ -881,6 +917,8 @@ void ans_env_write32(struct ans_env *e, enum ans_region rgn, uint32_t off, uint3
             (off == NVME_DB_LINEAR_IOSQ && !doorbell(Q_IO, value)) ||
             (off == NVME_CC && !cc_ok(value)))
             return;
+        if (off == NVME_AQA)
+            aqa = value;
         track_lo_hi(&asq, off, NVME_ASQ, value);
         track_lo_hi(&acq, off, NVME_ACQ, value);
         track_lo_hi(&ioq_cmds, off, NVME_IOQ_CMDS, value);
@@ -1040,6 +1078,17 @@ static void expect_sart(const char *name, u32 off, u32 value, int allowed)
     }
 }
 
+static void expect_cc(const char *name, u32 value, int allowed)
+{
+    const char *why = cc_check(value);
+
+    result.selftest_cases++;
+    if ((why == 0) != allowed) {
+        result.selftest_wrong++;
+        say("FAIL self-test: %s: %s", name, why ? why : "allowed");
+    }
+}
+
 static u32 sart_cfg_on(u32 pages)
 {
     switch (params.sart_version) {
@@ -1075,8 +1124,24 @@ static void selftest(void)
     expect("create I/O CQ 1", Q_ADMIN, 1);
     make_cmd(&t, Q_ADMIN, 0x05, 0, 0, b1, 0, 1 | (63 << 16), 3, 0, 0);
     expect("create I/O CQ 1 in a read buffer", Q_ADMIN, 0);
+    make_cmd(&t, Q_ADMIN, 0x05, 0, 0, t.iocq, 0, 1 | (63 << 16), 2, 0, 0);
+    expect("create I/O CQ 1, not physically contiguous", Q_ADMIN, 0);
+    make_cmd(&t, Q_ADMIN, 0x05, 0, 0, t.iocq, 0, 1 | (64 << 16), 3, 0, 0);
+    expect("create I/O CQ 1 with 65 entries", Q_ADMIN, 0);
+    make_cmd(&t, Q_ADMIN, 0x01, 0, 0, t.iosq, 0, 1 | (63 << 16), 1 | (1 << 16), 0, 2);
+    expect("create I/O SQ 1 on CQ 1", Q_ADMIN, 1);
+    make_cmd(&t, Q_ADMIN, 0x01, 0, 0, b1, 0, 1 | (63 << 16), 1 | (1 << 16), 0, 2);
+    expect("create I/O SQ 1 in a read buffer", Q_ADMIN, 0);
     make_cmd(&t, Q_ADMIN, 0x01, 0, 0, t.iosq, 0, 1 | (63 << 16), 1 | (2 << 16), 0, 2);
     expect("create I/O SQ 1 on CQ 2", Q_ADMIN, 0);
+    make_cmd(&t, Q_ADMIN, 0x00, 0, 0, t.ident, 0, 1, 0, 0, 0);
+    expect("delete I/O SQ 1 with memory", Q_ADMIN, 0);
+    make_cmd(&t, Q_ADMIN, 0x06, 0, 0, t.ident, 0, 1, 0, 0, 1);
+    for (u64 off = 0; off < SQE_SIZE; off += 8) /* the same command, in a read buffer */
+        wr64(b1 + off, rd64(t.asq + off));
+    asq = b1;
+    expect("identify with the admin SQ in a read buffer", Q_ADMIN, 0);
+    asq = t.asq;
     make_cmd(&t, Q_ADMIN, 0x00, 0, 0, 0, 0, 2, 0, 0, 0);
     expect("delete I/O SQ 2", Q_ADMIN, 0);
     make_cmd(&t, Q_ADMIN, 0x00, 0, 0, 0, 0, 1, 0, 0, 0);
@@ -1107,10 +1172,22 @@ static void selftest(void)
     expect("read into the memory given to the core", Q_IO, 0);
     make_cmd(&t, Q_IO, 0x02, 0, 1, result.burst_hi - PAGE / 2, result.burst_hi, 5, 0, 0, 1);
     expect("read past the end of the burst buffers", Q_IO, 0);
-    make_cmd(&t, Q_IO, 0x01, 0, 1, rb, 0, 5, 0, 0, 2);
-    expect("write", Q_IO, 0);
-    make_cmd(&t, Q_IO, 0x00, 0, 1, 0, 0, 0, 0, 0, 0);
-    expect("flush", Q_IO, 0);
+    make_cmd(&t, Q_IO, 0x01, 0, 1, rb, 0, 5, 0, 0, 1);
+    expect("write, with the TCB of a read", Q_IO, 0);
+    make_cmd(&t, Q_IO, 0x00, 0, 1, rb, 0, 0, 0, 0, 1);
+    expect("flush, with the TCB of a read", Q_IO, 0);
+    make_cmd(&t, Q_IO, 0x02, 0, 1, rb, b2, 5, 0, 0, 1);
+    expect("read 1 block with a PRP2", Q_IO, 0);
+    make_cmd(&t, Q_IO, 0x02, 0, 1, rb, 0, 5, 0, 0, 1);
+    wr64(t.tcb_io, (1UL << 8) | (1UL << 32));
+    expect("read whose TCB has another length", Q_IO, 0);
+    make_cmd(&t, Q_IO, 0x02, 0, 1, rb, 0, 5, 0, 0, 1);
+    wr64(t.iosq + 16, b1);
+    expect("read with a metadata pointer", Q_IO, 0);
+    make_cmd(&t, Q_IO, 0x02, 0, 1, rb, 0, 5, 0, 0, 1);
+    iocq = ioq_cqes = b1;
+    expect("read with the I/O CQ in a read buffer", Q_IO, 0);
+    iocq = ioq_cqes = t.iocq;
     make_cmd(&t, Q_IO, 0x02, 0, 2, rb, 0, 5, 0, 0, 1);
     expect("read namespace 2", Q_IO, 0);
     make_cmd(&t, Q_IO, 0x02, 0, 1, rb, 0, 5, 0, 0, 1);
@@ -1128,6 +1205,17 @@ static void selftest(void)
     expect("read with the TCB table in a read buffer", Q_IO, 0);
     tcb_io = t.tcb_io;
 
+    /* CC.EN */
+    aqa = (63 << 16) | 63;
+    expect_cc("CC.EN", 1, 1);
+    acq = b1;
+    expect_cc("CC with EN clear, the admin CQ in a read buffer", 0, 1);
+    expect_cc("CC.EN with the admin CQ in a read buffer", 1, 0);
+    acq = t.acq;
+    aqa = (63 << 16) | 64;
+    expect_cc("CC.EN with an admin SQ of 65 entries", 1, 0);
+    aqa = 0;
+
     /* The SART: entry 0 stands for one in use before the core */
     sart[0].in_use = 1;
     expect_sart("writing an entry in use before", 0, 0, 0);
@@ -1141,13 +1229,18 @@ static void selftest(void)
     if (sart_size_at)
         expect_sart("size of entry 2", sart_size_at + 8, 1, 1);
     expect_sart("turning entry 2 on for a read buffer", 8, sart_cfg_on(1), 0);
+    expect_sart("address of entry 3", sart_paddr_at + 12, (u32)((arena_next - PAGE) >> 12), 1);
+    if (sart_size_at)
+        expect_sart("size of entry 3", sart_size_at + 12, 2, 1);
+    expect_sart("turning entry 3 on, running past the memory given to the core", 12, sart_cfg_on(2),
+                0);
     expect_sart("a register after the entries",
                 sart_size_at ? sart_size_at + 4 * sart_n : sart_paddr_at + 4 * sart_n, 0, 0);
 
     /* as it was */
     for (u32 i = 0; i < SART_MAX; i++)
         sart[i] = (struct sart_entry){0, 0, 0, 0};
-    asq = acq = tcb_admin = tcb_io = ioq_cmds = ioq_cqes = iosq = iocq = 0;
+    asq = acq = tcb_admin = tcb_io = ioq_cmds = ioq_cqes = iosq = iocq = ident = 0;
     fill64(arena, 0xa000, 0);
     arena_next = arena;
     block_size = 0;
@@ -1699,6 +1792,21 @@ static int params_ok(void)
     return 1;
 }
 
+/*
+ * Namespace 1 as the identify that ans_start() made left it: the format in use has no
+ * metadata, so that a read writes no more than its blocks (the core looks at LBADS only)
+ */
+static int namespace_ok(void)
+{
+    if (!in_arena(ident, PAGE))
+        return 0;
+    u32 flbas = rd8(ident + 26), lbaf = rd32(ident + 128 + 4 * (flbas & 0xf));
+    result.ns_format = (lbaf & 0xffff) | (((lbaf >> 16) & 0xff) << 16) | ((u64)flbas << 24);
+    say("namespace 1: FLBAS %02x, format %u: %u bytes of metadata, blocks of 2^%u bytes", flbas,
+        flbas & 0xf, lbaf & 0xffff, (lbaf >> 16) & 0xff);
+    return (lbaf & 0xffff) == 0 && (1U << ((lbaf >> 16) & 0xff)) == block_size;
+}
+
 static void run(void)
 {
     struct ans_config config = {
@@ -1710,7 +1818,10 @@ static void run(void)
     u64 t0;
     int r;
 
-    sart_snapshot();
+    if (!sart_snapshot()) {
+        result.outcome = OUT_PRECONDITION;
+        return;
+    }
     r = ans_probe(&core, &env);
     result.probe = r;
     if (r) {
@@ -1751,11 +1862,11 @@ static void run(void)
 
     fill64(readback, READBACK_SLOTS * PAGE, GUARD);
     result.guards_intact = 1;
-    if (block_size == PAGE) {
+    if (namespace_ok() && block_size == PAGE) {
         reads();
     } else {
         result.read_errors++;
-        say("FAIL blocks of %u bytes: this guest reads blocks of 4096", block_size);
+        say("FAIL namespace 1 is not one with blocks of 4096 bytes and no metadata: no reads");
     }
 
     t0 = now();

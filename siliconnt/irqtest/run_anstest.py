@@ -44,10 +44,11 @@ Exit status, decided in this order:
   4  the guest did not finish (an exception, or --seconds ran out), or the script failed after
      the guest was entered. The controller may still be up: nothing else is to be brought up
      in this boot
+  3  the command log holds a command that is not on the whitelist, or one that points
+     somewhere else, or a doorbell that was not rung, or does not add up; or the guest
+     refused to set CC.EN
   6  the coprocessor crashed
   5  stopped before the guest touched the controller
-  3  the command log holds a command that is not on the whitelist, or one that points
-     somewhere else, or a doorbell that was not rung, or does not add up
   1  the controller did not come up: ans_probe() found it running, or ans_start() failed (the
      core brings it down again)
   2  it came up, but something else did not hold (reads, data, the way down, the counts, the
@@ -92,14 +93,14 @@ RESULT_FIELDS = (
     "irq_mbox irq_other irq_spurious irq_before_start irq_after_stop storms cntfrq "
     "start_ticks stop_ticks dma_allocs dma_frees dma_bytes doorbells_rung sart_refused "
     "sart_entries_in_use sart_in_use_intact sart_ours_removed selftest_cases selftest_wrong "
-    "arena_lo arena_hi data_lo data_hi burst_lo burst_hi").split()
+    "arena_lo arena_hi data_lo data_hi burst_lo burst_hi ns_format").split()
 RESULT_FMT = f"<8s{len(RESULT_FIELDS)}Q"
 SIGNED_FIELDS = ("probe", "start")
 OUTCOMES = {0: "NONE (did not get to the end)", 1: "OK", 2: "PRECONDITION", 3: "PROBE_FAILED",
             4: "START_FAILED", 5: "CRASHED", 6: "WRONG"}
 STATES = {0: "ANS_OFF", 1: "ANS_STARTING", 2: "ANS_READY", 3: "ANS_STOPPING", 4: "ANS_FAILED",
           5: "ANS_CRASHED"}
-CMDLOG_WORDS = 26
+CMDLOG_WORDS = 29
 RGN_NAMES = ("NVMe", "coprocessor and mailbox", "SART", "power manager register")
 
 # QEMU: RAM where the controller's ranges would be (Makefile: ANS_QEMU_ASC, ANS_QEMU_PMGR)
@@ -241,8 +242,9 @@ def allowed(queue, sqe):
             0x04: nsid == 0 and cdw10 == 1}.get(opcode, False)
 
 
-def where_ok(res, queue, sqe, tcb):
-    """None, or why what the command points at is not where it is to point"""
+def where_ok(res, queue, sqe, tcb, bases):
+    """None, or why what the command points at is not where it is to point. bases: the
+    submission queue, completion queue and TCB table the guest found when it rang"""
     def inside(addr, size, lo, hi):
         return size > 0 and lo <= addr and addr + size <= hi
 
@@ -256,6 +258,12 @@ def where_ok(res, queue, sqe, tcb):
     w0 = struct.unpack_from("<I", sqe, 0)[0]
     opcode = w0 & 0xff
     prp1, prp2 = struct.unpack_from("<QQ", sqe, 24)
+    cdw10, cdw11 = struct.unpack_from("<II", sqe, 40)
+    sq, cq, tcbs = bases
+    if not (in_arena(sq, 64 * 64) and in_arena(cq, 64 * 16) and in_arena(tcbs, 64 * 128)):
+        return "a queue or the TCB table is not in the memory given to the core"
+    if any(sqe[8:24]):
+        return "CDW2, CDW3 or the metadata pointer set"
     cdw12 = struct.unpack_from("<I", sqe, 48)[0]
     tcb_head, = struct.unpack_from("<Q", tcb, 0)
     tcb_prp1, tcb_prp2 = struct.unpack_from("<QQ", tcb, 24)
@@ -280,6 +288,8 @@ def where_ok(res, queue, sqe, tcb):
         return None if in_arena(prp1, 0x1000) and not prp2 else \
             "identify not into the memory given to the core"
     if opcode in (0x01, 0x05):
+        if not cdw11 & 1 or cdw10 >> 16 >= 64:
+            return "the queue is not physically contiguous, or larger than its memory"
         return None if in_arena(prp1, 64 * (64 if opcode == 0x01 else 16)) and not prp2 else \
             "the queue is not in the memory given to the core"
     return None if not prp1 and not prp2 else "a delete with memory"
@@ -434,6 +444,7 @@ def run(args):
     print(f"Mode: {args.mode}")
     hv.start()
     timer.cancel()
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     print("Hypervisor exited.")
     return report(args, p, iface, align_up, image_base + result_off, stopped)
 
@@ -482,11 +493,12 @@ def report(args, p, iface, align_up, result_addr, stopped):
         meta = struct.unpack_from("<Q", entry, 0)[0]
         queue, tag, guest_allowed = meta & 0xff, (meta >> 8) & 0xff, (meta >> 16) & 1
         sqe, tcb = entry[8:72], entry[72:200]
+        bases = struct.unpack_from("<QQQ", entry, 200)
         w0, nsid = struct.unpack_from("<II", sqe, 0)
         opcode = w0 & 0xff
         cdw10, cdw11, cdw12 = struct.unpack_from("<III", sqe, 40)
         why = None if allowed(queue, sqe) else "not on the whitelist"
-        why = why or where_ok(res, queue, sqe, tcb)
+        why = why or where_ok(res, queue, sqe, tcb, bases)
         rung += guest_allowed
         if why or not guest_allowed:
             commands_ok = False
@@ -526,12 +538,12 @@ def report(args, p, iface, align_up, result_addr, stopped):
         print(f"NOT the expected burst CRC-32 0x{args.expect_burst_crc:08x}")
 
     outcome = res["outcome"]
+    if not commands_ok:
+        return EXIT_COMMANDS
     if outcome == 5:
         return EXIT_CRASHED
     if outcome == 2:
         return EXIT_NOT_RUN
-    if not commands_ok:
-        return EXIT_COMMANDS
     if outcome in (3, 4):
         return EXIT_NOT_UP
     if outcome == 1 and expected_ok:
