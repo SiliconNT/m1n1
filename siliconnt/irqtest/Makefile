@@ -40,6 +40,12 @@
 #                      one, for hvc #1, SYSTEM_OFF and SYSTEM_RESET
 #   make qemu-nohost-broken ...against hv_stop.c with one thing wrong in it at a time
 #                      (../nohost-model/broken.mk): it must fail on each of QEMU_NOHOST_BROKEN
+#   make anstest       build/anstest.bin: the disk controller core of the SiliconNT drivers
+#                      repository (ANS_CORE) in a guest that run_anstest.py loads (R38). Not
+#                      part of "all": it needs that repository
+#   make qemu-ans      anstest.bin on QEMU, with RAM where the controller would be: the
+#                      controller cannot come up there, and the guest has to say so without
+#                      writing anything it was not given (check_ans_qemu.sh)
 
 ARCH ?= aarch64-linux-gnu-
 QEMU ?= qemu-system-aarch64
@@ -58,7 +64,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken qemu-nohost qemu-nohost-broken clean
+.PHONY: anstest qemu-ans all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken qemu-nohost qemu-nohost-broken clean
 .SECONDARY:
 
 all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin
@@ -375,6 +381,67 @@ qemu-nohost-broken: $(QEMU_NOHOST_BROKEN:%=build/nohost-qemu-broken-%.elf)
 		then echo "qemu-nohost-broken: $(n): the run is as it should be, and must not be"; exit 1; \
 		else echo "qemu-nohost-broken: $(n): $$(tail -1 build/nohost-qemu-broken-$(n).check)"; fi;)
 	@echo "qemu-nohost-broken: all $(words $(QEMU_NOHOST_BROKEN)) failed, as they must"
+
+# anstest: the core of the drivers repository is compiled from there, as it is; nothing of it
+# is copied here. Its headers come with the compiler's own stdbool.h, stddef.h and stdint.h
+ANS_CORE ?= /mnt/c/src/siliconnt-drivers/ans/core
+ANS_CORE_SRCS := asc nvme pmgr rtkit sart
+ANS_CFLAGS := $(SGI_CFLAGS) -isystem $(shell $(CC) -print-file-name=include) -I$(ANS_CORE)
+ANS_CORE_OBJS := $(ANS_CORE_SRCS:%=build/anscore-%.o)
+
+anstest: build/anstest.bin
+
+build/anscore-%.o: $(ANS_CORE)/%.c $(wildcard $(ANS_CORE)/*.h)
+	@mkdir -p build
+	$(CC) -c $(ANS_CFLAGS) -o $@ $<
+
+# The CRC32 instructions for the GPT
+build/anstest.o: anstest.c sgitest.h gic.h $(wildcard $(ANS_CORE)/*.h)
+	@mkdir -p build
+	$(CC) -c $(ANS_CFLAGS) -march=armv8-a+crc -o $@ $<
+
+# The image runs where it was not linked: no absolute address may be stored in it
+build/anstest.elf: build/sgitest-head.o build/anstest.o $(ANS_CORE_OBJS) sgitest.ld
+	! $(ARCH)objdump -r build/anstest.o $(ANS_CORE_OBJS) | grep -E "R_AARCH64_ABS(64|32)"
+	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ \
+		build/sgitest-head.o build/anstest.o $(ANS_CORE_OBJS)
+
+build/anstest.bin: build/anstest.elf
+	$(OBJCOPY) -O binary $< $@
+
+# anstest on QEMU: run_anstest.py --qemu-image fills in the parameters with QEMU's addresses,
+# RAM where the controller's four ranges would be, and the image goes behind sgitest-qemu.S.
+# build/anstest-qemu-<polling or interrupts>-<refused or silent>: refused, the power manager
+# register reads 0, so the reset before the start is refused; silent, it reads "active", the
+# coprocessor is started and never answers. The mailbox reads empty in both
+PYTHON ?= python3
+ANS_QEMU_FLAGS := $(subst -m 64,-m 256,$(QEMU_FLAGS))
+ANS_QEMU_ASC := 0x48100000
+ANS_QEMU_PMGR := 0x48300538
+ANS_QEMU_RUNS := polling-refused polling-silent interrupts-refused interrupts-silent
+ans_qemu_mode = $(word 1,$(subst -, ,$(1)))
+ans_qemu_pmgr = $(if $(filter %-silent,$(1)),0xf0,0)
+
+build/anstest-qemu-%.bin: build/anstest.bin run_anstest.py
+	$(PYTHON) run_anstest.py --mode $(call ans_qemu_mode,$*) --qemu-image $@ $<
+
+build/anstest-qemu-%.o: sgitest-qemu.S sgitest.h build/anstest-qemu-%.bin
+	$(CC) -c -Wall -Werror -DNR_CPUS=1 -DIMAGE='"build/anstest-qemu-$*.bin"' -o $@ $<
+
+build/anstest-qemu-%.elf: build/anstest-qemu-%.o
+	$(LD) -Ttext=0x40100000 -e _start --build-id=none -o $@ $<
+
+define ANS_QEMU_RUN
+{ timeout 30 $(QEMU) $(ANS_QEMU_FLAGS) -smp 1 -no-reboot \
+	-device loader,addr=$$(($(ANS_QEMU_ASC) + 0x8114)),data=0x20000,data-len=4 \
+	-device loader,addr=$(ANS_QEMU_PMGR),data=$(call ans_qemu_pmgr,$(1)),data-len=4 \
+	-kernel build/anstest-qemu-$(1).elf > build/anstest-qemu-$(1).log 2>&1; \
+bash check_ans_qemu.sh $(1) build/anstest-qemu-$(1).log $$?; }
+endef
+
+qemu-ans: $(ANS_QEMU_RUNS:%=build/anstest-qemu-%.elf)
+	@$(foreach r,$(ANS_QEMU_RUNS),$(call ANS_QEMU_RUN,$(r)) &&) true
+	@echo "qemu-ans: all $(words $(ANS_QEMU_RUNS)) as they should be"
 
 clean:
 	rm -rf build
