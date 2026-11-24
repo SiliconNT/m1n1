@@ -88,6 +88,8 @@ struct cpu {
     volatile u64 spsr;       // SPSR_EL1 in the handler
     volatile u64 slowest;    // crossfire: longest time from sending an SGI to it being taken
     volatile u64 slow;       // crossfire: how many took longer than SLOW_US
+    volatile u64 noticed;    // crossfire: longest time until the sender saw that it was taken
+    volatile u64 taken_at[NR_SGIS]; // when the handler last took this SGI
 
     volatile u64 expect_undef;
     volatile u64 undef_count;
@@ -228,6 +230,8 @@ void irq_handler(void)
     if (intid < NR_SGIS) {
         c->rpr = read_sysreg(ICC_RPR_EL1);
         c->spsr = read_sysreg(spsr_el1);
+        c->taken_at[intid] = now();
+        asm volatile("dmb sy");
         c->count[intid]++;
 
         /* While this SGI is still active: it has to come again after the EOI */
@@ -293,13 +297,13 @@ static void crossfire(int target, u32 intid, u64 times)
     struct cpu *c = me();
     u64 val = sgi_to(target, intid);
 
-    c->slowest = c->slow = 0;
+    c->slowest = c->slow = c->noticed = 0;
 
     for (u64 i = 0; i < times; i++) {
         u32 before = cpus[target].count[intid];
         u64 start = now();
         u64 end = start + 2000 * ticks_per_ms;
-        u64 took;
+        u64 took, noticed;
 
         send_sgi(val);
         while (cpus[target].count[intid] == before) {
@@ -309,7 +313,15 @@ static void crossfire(int target, u32 intid, u64 times)
             }
         }
 
-        took = now() - start;
+        /*
+         * The SGIs of the other CPU may keep this one in its handler for a long time, one after
+         * the other: when it got around to looking is not when its own SGI was taken.
+         */
+        noticed = now() - start;
+        if (noticed > c->noticed)
+            c->noticed = noticed;
+        asm volatile("dmb sy");
+        took = cpus[target].taken_at[intid] - start;
         if (took > c->slowest)
             c->slowest = took;
         if (took * 1000 > SLOW_US * ticks_per_ms)
@@ -333,7 +345,9 @@ static void put_latency(int from, int to)
     put_dec(cpus[from].slowest * 1000 / ticks_per_ms);
     put(" us, slower than 250 us: ");
     put_dec(cpus[from].slow);
-    put("\n");
+    put(", seen by the sender after at most ");
+    put_dec(cpus[from].noticed * 1000 / ticks_per_ms);
+    put(" us\n");
 }
 
 static void execute(u64 op, u64 arg)

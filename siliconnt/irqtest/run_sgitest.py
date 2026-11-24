@@ -452,15 +452,16 @@ class DoneWatch:
     """Gets what m1n1 prints, in place of a log file; the last line of a guest ends the run"""
     def __init__(self):
         self.line = ""
+        self.done = False
 
     def write(self, text):
         self.line += text
         if not self.line.endswith("\n"):
             return
-        if "DONE pass fail = " in self.line:
+        if "DONE pass fail = " in self.line and not self.done:
+            self.done = True
             timer.cancel()
             interrupt_after(args.stop_after_done).start()
-            iface.tty_log = None
         self.line = ""
 
     def flush(self):
