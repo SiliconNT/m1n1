@@ -24,6 +24,7 @@ struct adt_function_smc_gpio {
 
 static char dcp_pmgr_dev[16] = "DISP0_CPU0";
 static u32 dcp_die;
+bool dcp_abandoned;
 
 static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 {
@@ -106,7 +107,7 @@ int dcp_work(dcp_dev_t *dcp)
     return afk_epic_work(dcp->afk, -1);
 }
 
-static int dcp_create_firmware_mappings(const display_config_t *cfg, dcp_dev_t *dcp)
+static int dcp_create_firmware_mappings(const display_config_t *cfg, dcp_dev_t *dcp, bool as_left)
 {
     int created = 0;
     int dcp_node = adt_path_offset(adt, cfg->dcp);
@@ -131,6 +132,11 @@ static int dcp_create_firmware_mappings(const display_config_t *cfg, dcp_dev_t *
         if (dart_translate_silent(dcp->dart_dcp, iova))
             continue;
 
+        if (as_left) {
+            printf("dcp: segment #%u is not mapped\n", i);
+            return -1;
+        }
+
         size_t len = ALIGN_UP(seg[i].size, SZ_16K);
         u32 flags = i == 0 ? 0b0100 : 0; // TEXT gets this bit set?
         printf("dcp: Mapping segment #%u %lx -> %lx [%lx]\n", i, iova, seg[i].phys, len);
@@ -144,7 +150,7 @@ static int dcp_create_firmware_mappings(const display_config_t *cfg, dcp_dev_t *
     return created;
 }
 
-dcp_dev_t *dcp_init(const display_config_t *cfg)
+dcp_dev_t *dcp_init(const display_config_t *cfg, bool as_left)
 {
     u32 sid;
 
@@ -194,7 +200,7 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
 
     dcp->iovad_dcp = iovad_init(vm_base + 0x10000000, vm_base + 0x20000000);
 
-    int ret = dcp_create_firmware_mappings(cfg, dcp);
+    int ret = dcp_create_firmware_mappings(cfg, dcp, as_left);
     if (ret < 0) {
         printf("dcp: failed to create firmware mappings\n");
         goto out_iovad;
@@ -217,6 +223,8 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
 
     if (!rtkit_boot(dcp->rtkit)) {
         printf("dcp: failed to boot RTKit\n");
+        if (as_left)
+            goto abandon;
         goto out_iovad;
     }
 
@@ -235,9 +243,11 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     return dcp;
 
 out_afk:
-    afk_epic_shutdown(dcp->afk);
+    if (afk_epic_shutdown(dcp->afk) < 0)
+        dcp_abandoned = true;
 out_rtkit:
-    rtkit_quiesce(dcp->rtkit);
+    if (!rtkit_quiesce(dcp->rtkit))
+        goto abandon;
     rtkit_free(dcp->rtkit);
 out_iovad:
     iovad_shutdown(dcp->iovad_dcp, dcp->dart_dcp);
@@ -246,6 +256,11 @@ out_dart_dcp:
     dart_shutdown(dcp->dart_dcp);
 out_free:
     free(dcp);
+    return NULL;
+
+abandon:
+    /* It may be awake, and use what it was given */
+    dcp_abandoned = true;
     return NULL;
 }
 
@@ -256,13 +271,20 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
     dcp_dptx_shutdown(dcp->dptx_ep);
     dcp_dpav_shutdown(dcp->dpav_ep);
     free(dcp->phy);
-    afk_epic_shutdown(dcp->afk);
+    if (afk_epic_shutdown(dcp->afk) < 0)
+        dcp_abandoned = true;
+    bool ok;
     if (sleep) {
-        rtkit_sleep(dcp->rtkit);
-        pmgr_reset(dcp_die, dcp_pmgr_dev);
-    } else if (!rtkit_quiesce(dcp->rtkit)) {
-        /* It may use its buffers still */
+        ok = rtkit_sleep(dcp->rtkit);
+        if (!pmgr_reset(dcp_die, dcp_pmgr_dev))
+            ok = true;
+    } else {
+        ok = rtkit_quiesce(dcp->rtkit);
+    }
+    if (!ok) {
+        /* It may use what it was given still */
         printf("dcp: failed to quiesce\n");
+        dcp_abandoned = true;
         return -1;
     }
     rtkit_free(dcp->rtkit);

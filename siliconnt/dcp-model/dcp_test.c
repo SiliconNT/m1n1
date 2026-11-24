@@ -106,6 +106,8 @@ static void check_sane(void)
     CHECK_EQ(m.faults, 0);
     CHECK_EQ(m.out_of_band, 0);
     CHECK_EQ(m.before_open, 0);
+    /* RBEP_SHUTDOWN at most, and what was sent before the crash was seen */
+    CHECK(m.after_crash <= 2);
     if (m.iop_power == 0x10) {
         CHECK(machine_page_tables_untouched());
         /* A ring of an endpoint that did not start is left allocated */
@@ -139,6 +141,7 @@ static void check_changed(void)
     CHECK_EQ(m.fb_clears, 1);
     CHECK_EQ(m.surfaces_at_clear, 1);
     CHECK_EQ(m.fb_reinits, 1);
+    CHECK_EQ(m.depth_at_reinit, want.video.depth);
     CHECK(screen_is(0));
 }
 
@@ -152,6 +155,14 @@ static void check_put_away(void)
     CHECK_EQ(machine_dma_buffers(), 0);
 }
 
+/* P_DISPLAY_START_DCP, or hv_init() with an external display */
+static int start_ret;
+static void start_dcp(void)
+{
+    start_ret = display_start_dcp();
+    display_shutdown(DCP_QUIESCED);
+}
+
 /* Asked once more in the same boot (P_DISPLAY_INIT), after something went wrong */
 static void check_not_again(void)
 {
@@ -159,9 +170,13 @@ static void check_not_again(void)
 
     machine_recover();
     CHECK_EQ(machine_run(boot), RETURNED);
-    display_start_dcp();
+    CHECK_EQ(machine_run(start_dcp), RETURNED);
+    CHECK_EQ(start_ret, -1);
     CHECK_EQ(m.n_ap, n_ap);
     CHECK_EQ(m.asserts, 0);
+    machine_check_buffers();
+    CHECK_EQ(m.faults, 0);
+    CHECK_EQ(m.heap_errors, 0);
 }
 
 static void check_dcp_untouched(void)
@@ -179,6 +194,11 @@ static void check_sent(int i, const u8 *want, size_t len)
     CHECK(i < m.n_sent);
     CHECK_EQ(m.sent[i].len, len);
     CHECK(!memcmp(m.sent[i].data, want, len));
+    /* "IOP ", and no channel and no type in the ring */
+    CHECK_EQ(m.sent[i].hdr[0], 0x20504f49);
+    CHECK_EQ(m.sent[i].hdr[1], len);
+    CHECK_EQ(m.sent[i].hdr[2], 0);
+    CHECK_EQ(m.sent[i].hdr[3], 0);
 }
 
 static void check_recorded(void)
@@ -345,7 +365,8 @@ static void external(void)
     CHECK_EQ(m.surfaces, 0);
     CHECK_EQ(m.shutdowns, 0);
     CHECK(!memcmp(&cur_boot_args, &before, sizeof(before)));
-    CHECK_EQ(m.iop_power, 0x10);
+    CHECK(m.iop_power == 0x10 || m.iop_power == 1);
+    check_not_again();
 }
 
 /* An internal display that display_configure() is for (Sonoma): the same */
@@ -360,6 +381,43 @@ static void not_retina(void)
     CHECK_EQ(m.surfaces, 0);
     CHECK_EQ(m.shutdowns, 0);
     CHECK_EQ(cur_boot_args.video.depth, 30);
+    /* As for Windows: nothing else that is asked of DCP gets to it either */
+    check_not_again();
+}
+
+/* It worked, and then DCP is started the V1 way, twice */
+static void start_after(void)
+{
+    run();
+    check_changed();
+    check_put_away();
+    CHECK_EQ(machine_run(start_dcp), RETURNED);
+    CHECK_EQ(start_ret, -1);
+    CHECK_EQ(m.asserts, 0);
+    check_not_again();
+}
+
+/* Not as iBoot left it on the M4: nothing of it is changed, and DCP is not woken */
+static void segment_unmapped(void)
+{
+    machine_unmap_segment();
+    run();
+    check_left_alone();
+    CHECK_EQ(m.n_ap, 0);
+    CHECK_EQ(m.resets, 0);
+    CHECK(machine_page_tables_untouched());
+    check_not_again();
+}
+
+static void fb_unmapped(void)
+{
+    machine_unmap_fb();
+    run();
+    check_left_alone();
+    CHECK_EQ(m.inits, 0);
+    CHECK_EQ(m.surfaces, 0);
+    CHECK(machine_page_tables_untouched());
+    check_not_again();
 }
 
 /* ---- it stops somewhere on the way ---- */
@@ -367,11 +425,21 @@ static void not_retina(void)
 static enum step sweep_from;
 static enum way sweep_way;
 
+/* How long it may take, in milliseconds, when DCP is silent from there on */
+static const int silent_msec[STEPS] = {
+    [AT_WAKE] = 1100,       [AT_HELLO_ACK] = 1100,   [AT_POWER] = 1100,     [AT_INIT] = 6200,
+    [AT_GETBUF] = 6200,     [AT_START] = 6200,       [AT_ANNOUNCE] = 11200, [AT_SETTLE] = 13800,
+    [AT_OPEN] = 13800,      [AT_HPD] = 13800,        [AT_SURFACE] = 13800,  [AT_SHUTDOWN] = 8900,
+    [AT_AP_QUIESCE] = 3900, [AT_IOP_QUIESCE] = 3900,
+};
+
 static void sweep(void)
 {
     m.way = sweep_way;
     m.from = sweep_from;
     run();
+    if (sweep_way == SILENT)
+        CHECK(machine_now() <= 1000UL * silent_msec[sweep_from]);
     if (sweep_from >= AT_SHUTDOWN) {
         check_changed();
         check_not_again();
@@ -391,6 +459,30 @@ static void sweep(void)
     if (sweep_from >= AT_INIT && sweep_way != FULL)
         CHECK_EQ(m.inits, 1);
     check_not_again();
+}
+
+/* ---- it is slow, and in time ---- */
+
+static const struct {
+    enum step at;
+    u32 usec;
+} slow_steps[] = {
+    {AT_WAKE, 900000},      {AT_HELLO_ACK, 400000},  {AT_POWER, 900000},
+    {AT_INIT, 2000000},     {AT_GETBUF, 2000000},    {AT_START, 4500000},
+    {AT_ANNOUNCE, 4500000}, {AT_HPD, 4500000},       {AT_SURFACE, 4500000},
+    {AT_SHUTDOWN, 4500000}, {AT_AP_QUIESCE, 900000}, {AT_IOP_QUIESCE, 900000},
+};
+static size_t slow_index;
+
+static void slow(void)
+{
+    m.slow_at = slow_steps[slow_index].at;
+    m.slow_usec = slow_steps[slow_index].usec;
+    run();
+    check_changed();
+    check_put_away();
+    CHECK_EQ(m.n_ap, ARRAY_SIZE(r44c_ap));
+    CHECK(machine_now() >= m.slow_usec);
 }
 
 /* ---- replies ---- */
@@ -957,6 +1049,36 @@ static void ring_pointer(void)
     never_starts();
 }
 
+/* It says that it has started, and there are no rings */
+static void start_ack_before_rings(void)
+{
+    m.start_ack_before_rings = true;
+    run();
+    check_left_alone();
+    CHECK_EQ(m.shutdowns, 0);
+    CHECK_EQ(m.n_sent, 0);
+    check_not_again();
+}
+
+/* It says that it is closed, and nobody has asked for that: nothing more is sent to it */
+static void shutdown_ack_unasked(void)
+{
+    m.shutdown_ack_unasked = true;
+    run();
+    check_left_alone();
+    CHECK_EQ(m.shutdowns, 0);
+    CHECK_EQ(m.n_sent, 0);
+    CHECK_EQ(m.iop_power, 0x10);
+    check_not_again();
+}
+
+/* The ring is looked at, whatever is said of it */
+static void no_bell(void)
+{
+    m.no_bell = true;
+    works();
+}
+
 /* An entry before there are rings: passed over */
 static void recv_before_rings(void)
 {
@@ -992,6 +1114,36 @@ static void v1_started(void)
     CHECK_EQ(m.n_sent, 0);
     CHECK_EQ(m.surfaces, 0);
     check_put_away();
+}
+
+/* An external display that does not go to sleep: what DCP has stays, unless DCP is reset */
+static void v1_external_awake(bool resets)
+{
+    u32 one = 1;
+
+    machine_v1();
+    fake_adt_str("/chosen", "firmware-version", "iBoot-8422.141.2");
+    fake_adt_prop("/arm-io/disp0", "external", &one, 4);
+    m.way = SILENT;
+    m.from = AT_AP_QUIESCE;
+    m.pmgr_resets = resets;
+    run();
+    check_sane();
+    CHECK_EQ(m.surfaces, 1);
+    CHECK_EQ(m.resets, 1);
+    CHECK(resets == (machine_dma_buffers() == 0));
+    if (!resets)
+        check_not_again();
+}
+
+static void v1_external_awake_not_reset(void)
+{
+    v1_external_awake(false);
+}
+
+static void v1_external_awake_reset(void)
+{
+    v1_external_awake(true);
 }
 
 /* A table that is not of m1n1's heap is not given back to it */
@@ -1186,6 +1338,9 @@ static const struct test_case cases[] = {
     C(external_not_mac),
     C(external),
     C(not_retina),
+    C(start_after),
+    C(segment_unmapped),
+    C(fb_unmapped),
     C(hpd_made),
     C(hpd_not_connected),
     C(hpd_no_timing),
@@ -1251,8 +1406,13 @@ static const struct test_case cases[] = {
     C(ring_only_tx),
     C(ring_pointer),
     C(recv_before_rings),
+    C(start_ack_before_rings),
+    C(shutdown_ack_unasked),
+    C(no_bell),
     C(v1_there),
     C(v1_started),
+    C(v1_external_awake_not_reset),
+    C(v1_external_awake_reset),
     C(empty_l2),
     C(crashlog_length_0),
     C(crashlog_length_8),
@@ -1325,6 +1485,15 @@ int main(int argc, char **argv)
             continue;
         n++;
         bad += run_case(cases[i].name, cases[i].fn, &n_checks);
+    }
+    for (slow_index = 0; slow_index < ARRAY_SIZE(slow_steps); slow_index++) {
+        char name[64];
+
+        snprintf(name, sizeof(name), "slow-at-%s", step_names[slow_steps[slow_index].at]);
+        if (verbose && strcmp(argv[1], name))
+            continue;
+        n++;
+        bad += run_case(name, slow, &n_checks);
     }
     for (sweep_from = AT_WAKE; sweep_from < STEPS; sweep_from++) {
         for (sweep_way = SILENT; sweep_way < WAYS; sweep_way++) {

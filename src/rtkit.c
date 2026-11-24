@@ -793,10 +793,8 @@ bool rtkit_quiesce(rtkit_dev_t *rtk)
 
 bool rtkit_sleep(rtkit_dev_t *rtk)
 {
-    int ret = rtkit_switch_power_state(rtk, RTKIT_POWER_SLEEP);
-    if (ret < 0)
-        return ret;
+    bool ok = rtkit_switch_power_state(rtk, RTKIT_POWER_SLEEP);
 
     asc_cpu_stop(rtk->asc);
-    return 0;
+    return ok;
 }

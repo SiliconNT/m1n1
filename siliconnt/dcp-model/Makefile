@@ -10,7 +10,8 @@
 #   make same    what must not have changed since BASE, in both: every register written, every
 #                message, everything printed (transcripts of both are compared)
 #   make broken  the test against the real files with one thing wrong in them at a time
-#                (broken.mk): each must fail, with a failed check or by hanging
+#                (broken.mk): each must fail, with a failed check or by hanging (with -j, or it
+#                takes ten minutes)
 
 CC := gcc
 SRC := ../../src
@@ -114,12 +115,18 @@ endef
 $(foreach f,afk dcp_iboot display firmware dcp rtkit dart,$(eval $(call BROKEN_RULES,$(f))))
 
 # Each fails a check, or hangs where the real one has a timeout
-broken: $(BROKEN_BINS)
+BROKEN_LOGS := $(BROKEN_BINS:%=%.log)
+
+$(BROKEN_LOGS): %.log: %
+	@timeout $(TIMEOUT) $< > $@.out 2>&1; ret=$$?; \
+	if [ $$ret = 0 ]; then echo "$<: the test passes and must not"; exit 1; fi; \
+	if [ $$ret != 124 ] && ! grep -q '^FAIL' $@.out; then \
+		echo "$<: ended without a failed check"; exit 1; \
+	fi; \
+	mv $@.out $@
+
+broken: $(BROKEN_LOGS)
 	@for b in $(BROKEN_BINS); do \
-		timeout $(TIMEOUT) $$b > $$b.log 2>&1; ret=$$?; \
-		if [ $$ret = 0 ]; then echo "$$b: the test passes and must not"; exit 1; fi; \
-		if [ $$ret = 124 ]; then echo "$$(basename $$b): hangs"; continue; fi; \
-		grep -q -m1 '^FAIL' $$b.log || { echo "$$b: ended without a failed check"; exit 1; }; \
-		echo "$$(basename $$b): $$(grep -m1 '^FAIL' $$b.log)"; \
+		echo "$$(basename $$b): $$(grep -m1 '^FAIL' $$b.log || echo hangs)"; \
 	done
 	@echo "broken: all $(words $(BROKEN_BINS)) failed, as they must"

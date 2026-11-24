@@ -34,6 +34,7 @@ enum step {
     AT_GETBUF,      /* it has one: where the rings are */
     AT_START,       /* RBEP_START */
     AT_ANNOUNCE,    /* the endpoint is started: disp0-service */
+    AT_SETTLE,      /* a second after that, nothing having happened (V2) */
     AT_OPEN,        /* the service is opened (V2) */
     AT_HPD,         /* is a display connected? */
     AT_SURFACE,     /* a surface */
@@ -61,6 +62,7 @@ extern const char *const way_names[WAYS];
 /* What goes into a ring of DCP's: an entry, its header as it should be unless said otherwise */
 #define ENTRY_MAX 512
 struct entry {
+    u32 hdr[4]; /* what was sent: the header of the entry in the ring */
     u8 data[ENTRY_MAX];
     u32 len;
     u8 tail[16];   /* what was left there before, behind the entry */
@@ -94,6 +96,12 @@ struct machine {
     u16 ring_tag;          /* 0: as it should be */
     u32 ring_off, rb_size; /* where the second ring is, its size, in bytes */
     bool rings_before_buffer, recv_before_rings, only_tx_ring;
+    bool start_ack_before_rings;
+    bool shutdown_ack_unasked; /* at AT_SETTLE */
+    bool no_bell;              /* entries are put into the ring, and nothing says so */
+    enum step slow_at;         /* what it sends at that step is this much later */
+    u32 slow_usec;
+    bool pmgr_resets; /* DCP is reset when pmgr_reset() is asked to */
     struct entries announce, after_announce, hpd, surface;
     bool v1_no_replies;
 
@@ -118,6 +126,8 @@ struct machine {
     int inits, shutdowns; /* RBEP_INIT, RBEP_SHUTDOWN */
     int fb_clears, fb_reinits;
     int surfaces_at_clear; /* how many surfaces were set when the screen was cleared */
+    u64 depth_at_reinit;
+    int resets;
     u64 opened_at, announced_at, surface_at, shutdown_at; /* microseconds */
     bool awake, dead;
     u32 iop_power, ap_power;
@@ -143,6 +153,9 @@ void machine_check_buffers(void);
 bool machine_page_tables_untouched(void);
 /* iBoot left a table of the second level with nothing in it, for the addresses m1n1 uses */
 void machine_empty_l2(void);
+/* iBoot did not map a segment of DCP's firmware, or the framebuffer for the display */
+void machine_unmap_segment(void);
+void machine_unmap_fb(void);
 /* The crash log, as 32-bit words from its first entry on */
 void machine_crashlog(const u32 *words, int n);
 /* Buffers for DCP that are allocated still */

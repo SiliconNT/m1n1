@@ -41,6 +41,7 @@ const char *const step_names[STEPS] = {
     [AT_GETBUF] = "getbuf",
     [AT_START] = "start",
     [AT_ANNOUNCE] = "announce",
+    [AT_SETTLE] = "settle",
     [AT_OPEN] = "open",
     [AT_HPD] = "hpd",
     [AT_SURFACE] = "surface",
@@ -78,7 +79,8 @@ static struct {
     u32 tx_rptr, rx_wptr;
     u32 announced;
     bool opened;
-    u8 v1_seq;
+    u32 slow;
+    u64 settle_at;
 } dcp;
 
 /* ---- time ---- */
@@ -89,10 +91,12 @@ static jmp_buf machine;
 static u64 now, started_at;
 
 static void ring_send_later(void);
+static void settle_step(void);
 
 static void advance(u64 us)
 {
     now += us;
+    settle_step();
     ring_send_later();
     if (now - started_at > HANG_USEC)
         longjmp(machine, HUNG + 1);
@@ -311,6 +315,23 @@ void machine_empty_l2(void)
     memcpy(page_tables, (void *)PT_BASE, PT_SIZE);
 }
 
+void machine_unmap_segment(void)
+{
+    for (u64 iova = 0x7fb4000; iova < 0x7fb4000 + DATA_SIZE; iova += SZ_16K) {
+        u64 top = ((u64 *)L1_DCP)[iova >> 25];
+        ((u64 *)(FIELD_GET(GENMASK(39, 10), top) << 14))[iova >> 14 & 0x7ff] = 0;
+    }
+    memcpy(page_tables, (void *)PT_BASE, PT_SIZE);
+}
+
+void machine_unmap_fb(void)
+{
+    u64 top = ((u64 *)L1_DISP)[FB_DVA >> 25];
+
+    ((u64 *)(FIELD_GET(GENMASK(39, 10), top) << 14))[FB_DVA >> 14 & 0x7ff] = 0;
+    memcpy(page_tables, (void *)PT_BASE, PT_SIZE);
+}
+
 void machine_crashlog(const u32 *words, int n)
 {
     memset((void *)(CRASHLOG + 32), 0x11, 0x10000 - 32);
@@ -423,6 +444,7 @@ void fb_reinit(void)
 {
     trace("fb_reinit, depth 0x%lx\n", (unsigned long)cur_boot_args.video.depth);
     m.fb_reinits++;
+    m.depth_at_reinit = cur_boot_args.video.depth;
 }
 
 void mmu_map_framebuffer(u64 addr, size_t size)
@@ -439,7 +461,12 @@ u64 top_of_memory_alloc(size_t size)
 int pmgr_reset(int die, const char *name)
 {
     trace("pmgr_reset %d %s\n", die, name);
-    return -1;
+    m.resets++;
+    if (!m.pmgr_resets)
+        return -1;
+    m.awake = false;
+    m.dead = true;
+    return 0;
 }
 
 int pmgr_adt_power_enable(const char *path)
@@ -566,7 +593,7 @@ static void to_ap(u64 ep, u64 msg0)
     }
     dcp.q[dcp.q_tail % ARRAY_SIZE(dcp.q)].msg0 = msg0;
     dcp.q[dcp.q_tail % ARRAY_SIZE(dcp.q)].ep = ep;
-    dcp.q[dcp.q_tail % ARRAY_SIZE(dcp.q)].ready = now + LATENCY;
+    dcp.q[dcp.q_tail % ARRAY_SIZE(dcp.q)].ready = now + LATENCY + dcp.slow;
     dcp.q_tail++;
 }
 
@@ -590,6 +617,7 @@ static bool at(enum step step)
 {
     if (m.dead)
         return false;
+    dcp.slow = m.slow_at == step ? m.slow_usec : 0;
     if (m.way != ANSWERS && m.from == step) {
         if (m.way == CRASHES) {
             crash();
@@ -598,6 +626,18 @@ static bool at(enum step step)
         dcp.on = m.way;
     }
     return dcp.on == ANSWERS || (dcp.on == MUTE && (step < AT_INIT || step > AT_SHUTDOWN));
+}
+
+/* Nothing the host does leads to it, only time */
+static void settle_step(void)
+{
+    if (!dcp.settle_at || now < dcp.settle_at)
+        return;
+    dcp.settle_at = 0;
+    if (at(AT_SETTLE) && m.shutdown_ack_unasked) {
+        dcp.state = EP_CLOSED;
+        to_ap(EP_IBOOT, 0x00c1000000000000);
+    }
 }
 
 /* A mute endpoint: the rest of DCP still speaks */
@@ -687,7 +727,8 @@ static void ring_send(const struct entry *e, u32 channel, u32 type)
         *ring(1, data + where + 16 + e->len + i) = e->tail[i];
     dcp.rx_wptr = ALIGN_UP(where + 16 + e->len, m.block) % room;
     ring_put(1, 2 * m.block, dcp.rx_wptr);
-    to_ap(EP_IBOOT, 0x0085000000000000UL | (u64)dcp.rx_wptr << 16 | was);
+    if (!m.no_bell)
+        to_ap(EP_IBOOT, 0x0085000000000000UL | (u64)dcp.rx_wptr << 16 | was);
 }
 
 /* A little later, after what it sends at once */
@@ -702,7 +743,7 @@ static void ring_send_all(const struct entries *list)
         if (later[i].list)
             continue;
         later[i].list = list;
-        later[i].when = now + 2 * LATENCY;
+        later[i].when = now + 2 * LATENCY + dcp.slow;
         return;
     }
     stray("too much at once", 0);
@@ -870,8 +911,16 @@ static void ring_receive(void)
             firmware_assert("an entry that is none");
             return;
         }
-        if (from + 16 + e.len > room)
+        if (from + 16 + e.len > room) {
+            /* At the beginning, with its header once more */
             from = 0;
+            if (ring_get(0, data) != QE_MAGIC || ring_get(0, data + 4) != e.len) {
+                firmware_assert("an entry whose header is not at the beginning of the ring");
+                return;
+            }
+        }
+        for (int i = 0; i < 4; i++)
+            e.hdr[i] = ring_get(0, data + from + 4 * i);
         for (u32 i = 0; i < e.len; i++)
             e.data[i] = *ring(0, data + from + 16 + i);
         trace("dcp ring, channel %u, type %u:", ring_get(0, data + from + 8),
@@ -915,6 +964,8 @@ static void ep_receive(u64 msg0)
             if (!at(AT_INIT))
                 return;
             to_ap(EP_IBOOT, 0x00a0000000000100);
+            if (m.start_ack_before_rings)
+                to_ap(EP_IBOOT, 0x0086000000000000);
             if (m.recv_before_rings)
                 to_ap(EP_IBOOT, 0x0085000001000000);
             if (m.rings_before_buffer)
@@ -955,6 +1006,8 @@ static void ep_receive(u64 msg0)
             if (!at(AT_ANNOUNCE))
                 return;
             m.announced_at = now;
+            if (!m.v1)
+                dcp.settle_at = now + 1000000;
             ring_send_all(&m.announce);
             if (!m.v1)
                 to_ap(EP_LOGS, 0x0050000000000002);
@@ -1007,7 +1060,7 @@ static void dcp_receive(u64 msg0, u64 ep)
                     if (power == 0x220) {
                         dcp.logs_asked = false;
                         dcp.ioreports = 0;
-                        dcp.syslog_dva = dcp.ioreport_dva = dcp.ring_dva = 0;
+                        m.iop_power = power;
                         if (at(AT_WAKE))
                             to_ap(0, 0x00100000000c000c);
                         return;
@@ -1016,9 +1069,11 @@ static void dcp_receive(u64 msg0, u64 ep)
                         return;
                     m.iop_power = power;
                     m.awake = false;
+                    dcp.syslog_dva = dcp.ioreport_dva = dcp.ring_dva = 0;
                     to_ap_mgmt(0, 0x0070000000000000 | power);
                     return;
                 case T_HELLO_ACK:
+                    m.awake = true;
                     if (at(AT_HELLO_ACK))
                         to_ap(0, 0x008000000000051f);
                     return;
@@ -1027,6 +1082,7 @@ static void dcp_receive(u64 msg0, u64 ep)
                         to_ap(0, 0x0088000100803ffd);
                     return;
                 case T_START_EP:
+                    dcp.slow = 0;
                     /* oslog is the last of the system's */
                     if ((msg0 >> 32 & 0xff) == 8) {
                         to_ap(1, 0x0011010008259000);
@@ -1052,7 +1108,6 @@ static void dcp_receive(u64 msg0, u64 ep)
                         to_ap(EP_IOREPORT, 0x0080000000000000);
                     } else if (at(AT_POWER)) {
                         m.iop_power = 0x20;
-                        m.awake = true;
                         to_ap(0, 0x0070000000000020);
                     }
                     return;
@@ -1166,7 +1221,7 @@ void write32(u64 addr, u32 data)
 {
     trace("write32 0x%lx 0x%x\n", (unsigned long)addr, data);
     /* Started, or stopped when an external display is put to sleep */
-    if (addr == ASC_BASE + 0x44 && (data == 0x10 || (data == 0 && m.iop_power == POWER_SLEEP)))
+    if (addr == ASC_BASE + 0x44 && (data == 0x10 || (data == 0 && m.ap_power == POWER_QUIESCED)))
         return;
     if (addr == DART_DCP + 0xc00 && data == BIT(23))
         return;

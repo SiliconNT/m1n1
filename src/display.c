@@ -37,7 +37,6 @@ bool has_dcp;
 bool display_is_external;
 bool display_is_dptx;
 bool display_needs_power_cycle;
-static bool dcp_abandoned;
 
 static const display_config_t display_config_m1 = {
     .dcp = "/arm-io/dcp",
@@ -270,6 +269,11 @@ const display_config_t *display_get_config(void)
 
 static int display_do_start_dcp(bool v2)
 {
+    if (dcp_abandoned) {
+        printf("display: DCP failed before, leaving it alone\n");
+        return -1;
+    }
+
     if (iboot)
         return 0;
 
@@ -277,11 +281,6 @@ static int display_do_start_dcp(bool v2)
     printf("display: NO_DISPLAY!\n");
     return 0;
 #endif
-
-    if (dcp_abandoned) {
-        printf("display: DCP failed before, leaving it alone\n");
-        return -1;
-    }
 
     const display_config_t *disp_cfg = display_get_config();
 
@@ -292,7 +291,7 @@ static int display_do_start_dcp(bool v2)
 
     display_is_dptx = !!disp_cfg->dptx_phy[0];
 
-    dcp = dcp_init(disp_cfg);
+    dcp = dcp_init(disp_cfg, v2);
     if (!dcp) {
         printf("display: failed to initialize DCP\n");
         return -1;
@@ -312,7 +311,7 @@ static int display_do_start_dcp(bool v2)
     fb_dva = dart_search(dcp->dart_disp, (void *)cur_boot_args.video.base);
     // framebuffer is not mapped on the M1 Ultra Mac Studio
     if (DART_IS_ERR(fb_dva) || !fb_dva)
-        fb_dva = display_map_fb(0, pa, size);
+        fb_dva = v2 ? DART_PTR_ERR : display_map_fb(0, pa, size);
     if (DART_IS_ERR(fb_dva)) {
         printf("display: failed to find display DVA\n");
         fb_dva = 0;
@@ -753,26 +752,24 @@ void display_shutdown(dcp_shutdown_mode mode)
         return;
 
     if (iboot) {
-        int ret = dcp_ib_shutdown(iboot);
+        dcp_ib_shutdown(iboot);
         switch (mode) {
             case DCP_QUIESCED:
                 printf("display: Quiescing DCP (unconditional)\n");
-                ret |= dcp_shutdown(dcp, false);
+                dcp_shutdown(dcp, false);
                 break;
             case DCP_SLEEP_IF_EXTERNAL:
                 if (!display_is_external)
                     printf("display: Quiescing DCP (internal)\n");
                 else
                     printf("display: Sleeping DCP (external)\n");
-                ret |= dcp_shutdown(dcp, display_is_external);
+                dcp_shutdown(dcp, display_is_external);
                 break;
             case DCP_SLEEP:
                 printf("display: Sleeping DCP (unconditional)\n");
-                ret |= dcp_shutdown(dcp, true);
+                dcp_shutdown(dcp, true);
                 break;
         }
         iboot = NULL;
-        if (ret < 0)
-            dcp_abandoned = true;
     }
 }

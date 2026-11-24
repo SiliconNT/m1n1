@@ -122,6 +122,7 @@ enum AFKV2Report {
 struct afk_epic {
     rtkit_dev_t *rtk;
     bool v2;
+    bool failed; // an endpoint did not start, or did not shut down
 
     afk_epic_ep_t *endpoint[0x10];
 };
@@ -314,6 +315,10 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
             break;
         }
         case RBEP_START_ACK:
+            if (!epic->rx.ready || !epic->tx.ready) {
+                printf("EPIC: started without the ring buffers\n");
+                return -1;
+            }
             epic->started = true;
             break;
 
@@ -503,12 +508,12 @@ static bool afk_v2_is_report(struct afk_v2_msg *msg, u8 type)
 }
 
 /*
- * 1 and the next entry of the endpoint's ring, or 0 at the timeout. The time is looked at every
- * round, whatever comes meanwhile, and only this endpoint's ring is.
+ * 1 and the next entry of the endpoint's ring, or 0 at the timeout, or when it is shut down. The
+ * time is looked at every round, whatever comes meanwhile, and only this endpoint's ring is.
  */
 static int afk_v2_wait(afk_epic_ep_t *epic, struct afk_qe **qe, u64 timeout)
 {
-    while (!timeout_expired(timeout)) {
+    while (epic->started && !timeout_expired(timeout)) {
         if (*epic->rx.rptr != *epic->rx.wptr) {
             dma_rmb();
             return afk_epic_rx(epic, qe);
@@ -543,6 +548,11 @@ static void afk_v2_pass(afk_epic_ep_t *epic, struct afk_qe *qe)
 
 static int afk_v2_send(afk_epic_ep_t *epic, struct afk_v2_msg *msg, size_t size)
 {
+    if (!epic->started) {
+        printf("EPIC: endpoint 0x%02x is shut down\n", epic->ep);
+        return -1;
+    }
+
     msg->seq = epic->seq++;
     msg->len = size - offsetof(struct afk_v2_msg, timestamp);
 
@@ -866,6 +876,7 @@ afk_epic_ep_t *afk_epic_start_ep(afk_epic_t *afk, int endpoint, const afk_epic_s
          * another RBEP_INIT (SiliconNT docs/findings/0083, conclusion 4). It keeps its buffer.
          */
         printf("EPIC: endpoint 0x%02x did not start\n", endpoint);
+        afk->failed = true;
         goto err;
     }
 
@@ -880,8 +891,9 @@ err:
 int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
 {
     struct rtkit_message msg = {epic->ep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN)};
-    if (!rtkit_send(epic->afk->rtk, &msg)) {
+    if (epic->started && !rtkit_send(epic->afk->rtk, &msg)) {
         printf("EPIC: failed to send shutdown message\n");
+        epic->afk->failed = true;
         return -1;
     }
 
@@ -893,11 +905,10 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
             break;
     }
 
-    int ret = 0;
     if (epic->started) {
         /* It may use its buffers still */
         printf("EPIC: endpoint 0x%02x did not shut down\n", epic->ep);
-        ret = -1;
+        epic->afk->failed = true;
     } else {
         rtkit_free_buffer(epic->afk->rtk, &epic->buf);
         rtkit_free_buffer(epic->afk->rtk, &epic->rxbuf);
@@ -907,7 +918,7 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
     epic->afk->endpoint[epic->ep - 0x20] = NULL;
 
     free(epic);
-    return ret;
+    return 0;
 }
 
 static const afk_epic_service_ops_t *afk_match_service(afk_epic_ep_t *ep, const char *name)
@@ -1165,7 +1176,8 @@ int afk_epic_shutdown(afk_epic_t *afk)
         if (afk->endpoint[i])
             afk_epic_shutdown_ep(afk->endpoint[i]);
 
+    bool failed = afk->failed;
     free(afk);
 
-    return 0;
+    return failed ? -1 : 0;
 }
