@@ -95,7 +95,9 @@ typedef struct {
     u32 w, h, x, y;
 } PACKED dcp_rect_t;
 
-dcp_iboot_if_t *dcp_ib_init(dcp_dev_t *dcp);
+/* V2: the service has to be opened before any command */
+dcp_iboot_if_t *dcp_ib_init(dcp_dev_t *dcp, bool v2);
+int dcp_ib_open(dcp_iboot_if_t *iboot, u32 settle);
 int dcp_ib_shutdown(dcp_iboot_if_t *iboot);
 
 int dcp_ib_set_surface(dcp_iboot_if_t *iboot, dcp_layer_t *layer);

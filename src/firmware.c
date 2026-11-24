@@ -288,6 +288,23 @@ bool firmware_sfw_in_range(enum fw_version lower_bound, enum fw_version upper_bo
     return firmware_iboot_in_range(min, max, this);
 }
 
+/*
+ * OS firmware with which DCP was seen to change the format of the surface iBoot left (SiliconNT
+ * docs/findings/0083). Its iBoot interface has no stable ABI: exactly these versions.
+ */
+static const char *const dcp_set_surface_verified[] = {
+    "mBoot-20457.41.3", // macOS 27.2, T8132
+};
+
+bool firmware_dcp_set_surface_verified(void)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(dcp_set_surface_verified); i++)
+        if (os_firmware.iboot && !strcmp(os_firmware.iboot, dcp_set_surface_verified[i]))
+            return true;
+
+    return false;
+}
+
 int firmware_init(void)
 {
     int node = adt_path_offset(adt, "/chosen");

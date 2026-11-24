@@ -18,6 +18,9 @@
 #define DISPLAY_STATUS_DELAY         100
 #define DISPLAY_STATUS_RETRIES(dptx) ((dptx) ? 100 : 20)
 
+/* From the announcement of the service on, as SiliconNT docs/findings/0083 (R44c) has it */
+#define DISPLAY_SETTLE_USEC 2500000
+
 #define COMPARE(a, b)                                                                              \
     if ((a) > (b)) {                                                                               \
         *best = modes[i];                                                                          \
@@ -34,6 +37,7 @@ bool has_dcp;
 bool display_is_external;
 bool display_is_dptx;
 bool display_needs_power_cycle;
+static bool dcp_abandoned;
 
 static const display_config_t display_config_m1 = {
     .dcp = "/arm-io/dcp",
@@ -264,7 +268,7 @@ const display_config_t *display_get_config(void)
     return conf;
 }
 
-int display_start_dcp(void)
+static int display_do_start_dcp(bool v2)
 {
     if (iboot)
         return 0;
@@ -273,6 +277,11 @@ int display_start_dcp(void)
     printf("display: NO_DISPLAY!\n");
     return 0;
 #endif
+
+    if (dcp_abandoned) {
+        printf("display: DCP failed before, leaving it alone\n");
+        return -1;
+    }
 
     const display_config_t *disp_cfg = display_get_config();
 
@@ -311,7 +320,7 @@ int display_start_dcp(void)
         return -1;
     }
 
-    iboot = dcp_ib_init(dcp);
+    iboot = dcp_ib_init(dcp, v2);
     if (!iboot) {
         printf("display: failed to initialize DCP iBoot interface\n");
         dcp_shutdown(dcp, false);
@@ -319,6 +328,11 @@ int display_start_dcp(void)
     }
 
     return 0;
+}
+
+int display_start_dcp(void)
+{
+    return display_do_start_dcp(false);
 }
 
 struct display_options {
@@ -365,7 +379,7 @@ int display_parse_mode(const char *config, dcp_timing_mode_t *mode, struct displ
     return mode->valid;
 }
 
-static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
+static int display_swap(u64 iova, u32 stride, u32 width, u32 height, u32 format)
 {
     int ret;
 
@@ -378,7 +392,7 @@ static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
         .plane_cnt = 1,
         .width = width,
         .height = height,
-        .surface_fmt = FMT_w30r,
+        .surface_fmt = format,
         .colorspace = 2,
         .eotf = EOTF_GAMMA_SDR,
         .transform = XFRM_NONE,
@@ -527,7 +541,7 @@ int display_configure(const char *config)
 
         // Swap!
         u32 stride = tbest.width * 4;
-        ret = display_swap(tmp_dva, stride, tbest.width, tbest.height);
+        ret = display_swap(tmp_dva, stride, tbest.width, tbest.height, FMT_w30r);
         if (ret < 0)
             return ret;
 
@@ -567,7 +581,7 @@ int display_configure(const char *config)
 
     // Swap!
     u32 stride = tbest.width * 4;
-    ret = display_swap(fb_dva, stride, tbest.width, tbest.height);
+    ret = display_swap(fb_dva, stride, tbest.width, tbest.height, FMT_w30r);
     if (ret < 0)
         return ret;
 
@@ -610,6 +624,59 @@ int display_configure(const char *config)
     u64 msecs = ticks_to_msecs(get_ticks() - start_time);
     printf("display: Modeset took %ld ms\n", msecs);
 
+    return 1;
+}
+
+/*
+ * Has DCP scan out the framebuffer iBoot left with 8 bits per color instead of 10. Neither the
+ * mode nor the power of the display changes: the same framebuffer, as BGRA.
+ */
+static int display_set_bgra(void)
+{
+    struct boot_video *video = &cur_boot_args.video;
+
+#ifdef NO_DISPLAY
+    return 0;
+#endif
+
+    int ret = display_do_start_dcp(true);
+    if (ret < 0)
+        return ret;
+
+    /* iBoot's surface may go when the service is opened: from there on without a pause */
+    if ((ret = dcp_ib_open(iboot, DISPLAY_SETTLE_USEC)) < 0) {
+        printf("display: failed to open the DCP iBoot interface\n");
+        return ret;
+    }
+
+    int timing_cnt, color_cnt;
+    int hpd = dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt);
+    if (hpd < 0) {
+        printf("display: failed to get display status\n");
+        return hpd;
+    }
+    if (!hpd || !timing_cnt || !color_cnt) {
+        printf("display: connected:%d timing_cnt:%d color_cnt:%d\n", hpd, timing_cnt, color_cnt);
+        return -1;
+    }
+
+    ret = display_swap(fb_dva, video->stride, video->width, video->height, FMT_BGRA);
+    if (ret < 0)
+        return ret;
+
+    /* What iBoot has drawn is in the old format */
+    fb_clear_direct();
+
+    // See display_configure()
+    mdelay(150);
+
+    video->depth = (video->depth & ~FB_DEPTH_MASK) | 32;
+    fb_reinit();
+
+    /* Update for python / subsequent stages */
+    memcpy((void *)boot_args_addr, &cur_boot_args, sizeof(cur_boot_args));
+
+    printf("display: changed to BGRA\n");
     return 1;
 }
 
@@ -665,6 +732,14 @@ int display_init(void)
         return display_configure(NULL);
 #endif
     } else {
+        if (!display_is_external && (cur_boot_args.video.depth & FB_DEPTH_MASK) == 30 &&
+            firmware_dcp_set_surface_verified() && !dcp_abandoned) {
+            printf("display: Internal display with 10 bits per color, changing to BGRA\n");
+            if (display_set_bgra() > 0)
+                return 1;
+            printf("display: failed to change to BGRA, leaving the display as it is\n");
+            dcp_abandoned = true;
+        }
         printf("display: Display is already initialized (%ldx%ld)\n", cur_boot_args.video.width,
                cur_boot_args.video.height);
         return 0;
@@ -678,24 +753,26 @@ void display_shutdown(dcp_shutdown_mode mode)
         return;
 
     if (iboot) {
-        dcp_ib_shutdown(iboot);
+        int ret = dcp_ib_shutdown(iboot);
         switch (mode) {
             case DCP_QUIESCED:
                 printf("display: Quiescing DCP (unconditional)\n");
-                dcp_shutdown(dcp, false);
+                ret |= dcp_shutdown(dcp, false);
                 break;
             case DCP_SLEEP_IF_EXTERNAL:
                 if (!display_is_external)
                     printf("display: Quiescing DCP (internal)\n");
                 else
                     printf("display: Sleeping DCP (external)\n");
-                dcp_shutdown(dcp, display_is_external);
+                ret |= dcp_shutdown(dcp, display_is_external);
                 break;
             case DCP_SLEEP:
                 printf("display: Sleeping DCP (unconditional)\n");
-                dcp_shutdown(dcp, true);
+                ret |= dcp_shutdown(dcp, true);
                 break;
         }
         iboot = NULL;
+        if (ret < 0)
+            dcp_abandoned = true;
     }
 }

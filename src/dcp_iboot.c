@@ -33,6 +33,7 @@ struct dcp_iboot_if {
     afk_epic_ep_t *epic;
     int channel;
     bool enabled;
+    bool v2;
 
     union {
         u8 txbuf[TXBUF_LEN];
@@ -73,6 +74,11 @@ struct get_cmode_resp {
     u32 count;
     dcp_color_mode_t modes[];
 };
+
+struct set_surface_cmd_v2 {
+    dcp_layer_t layer;
+    u32 unk[2]; // possibly part of layer
+} PACKED;
 
 struct swap_start_resp {
     u32 unk1, unk2, unk3;
@@ -125,11 +131,15 @@ static const afk_epic_service_ops_t iboot_service_ops[] = {
     {},
 };
 
-dcp_iboot_if_t *dcp_ib_init(dcp_dev_t *dcp)
+dcp_iboot_if_t *dcp_ib_init(dcp_dev_t *dcp, bool v2)
 {
     dcp_iboot_if_t *iboot = calloc(1, sizeof(dcp_iboot_if_t));
     if (!iboot)
         return NULL;
+
+    iboot->v2 = v2;
+    if (v2)
+        afk_epic_set_v2(dcp->afk);
 
     iboot->dcp = dcp;
     iboot->epic = afk_epic_start_ep(dcp->afk, DCP_IBOOT_ENDPOINT, iboot_service_ops, false);
@@ -157,10 +167,15 @@ err_free:
 
 int dcp_ib_shutdown(dcp_iboot_if_t *iboot)
 {
-    afk_epic_shutdown_ep(iboot->epic);
+    int ret = afk_epic_shutdown_ep(iboot->epic);
 
     free(iboot);
-    return 0;
+    return ret;
+}
+
+int dcp_ib_open(dcp_iboot_if_t *iboot, u32 settle)
+{
+    return afk_epic_open(iboot->epic, iboot->channel, settle);
 }
 
 static int dcp_ib_cmd(dcp_iboot_if_t *iboot, int op, size_t in_size)
@@ -177,10 +192,11 @@ static int dcp_ib_cmd(dcp_iboot_if_t *iboot, int op, size_t in_size)
 
 int dcp_ib_set_surface(dcp_iboot_if_t *iboot, dcp_layer_t *layer)
 {
-    dcp_layer_t *cmd = (void *)iboot->txcmd.payload;
-    *cmd = *layer;
+    struct set_surface_cmd_v2 *cmd = (void *)iboot->txcmd.payload;
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->layer = *layer;
 
-    return dcp_ib_cmd(iboot, IBOOT_SET_SURFACE, sizeof(*layer));
+    return dcp_ib_cmd(iboot, IBOOT_SET_SURFACE, iboot->v2 ? sizeof(*cmd) : sizeof(*layer));
 }
 
 int dcp_ib_set_power(dcp_iboot_if_t *iboot, bool power)
