@@ -260,8 +260,10 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
     if (sleep) {
         rtkit_sleep(dcp->rtkit);
         pmgr_reset(dcp_die, dcp_pmgr_dev);
-    } else {
-        rtkit_quiesce(dcp->rtkit);
+    } else if (!rtkit_quiesce(dcp->rtkit)) {
+        /* It may use its buffers still */
+        printf("dcp: failed to quiesce\n");
+        return -1;
     }
     rtkit_free(dcp->rtkit);
     dart_shutdown(dcp->dart_disp);

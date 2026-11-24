@@ -345,9 +345,10 @@ static void rtkit_crashed(rtkit_dev_t *rtk)
     }
 
     struct crashlog_entry *p = (void *)(hdr + 1);
+    void *end = rtk->crashlog_bfr.bfr + rtk->crashlog_bfr.sz;
 
     rtkit_printf("== CRASH INFO ==\n");
-    while (p->type != 'CLHE') {
+    while ((void *)(p + 1) <= end && p->type != 'CLHE') {
         switch (p->type) {
             case 'Cstr':
                 rtkit_printf("  Message %d: %s\n", p->payload[0], &p->payload[4]);
@@ -356,6 +357,8 @@ static void rtkit_crashed(rtkit_dev_t *rtk)
                 rtkit_printf("  0x%x\n", p->type);
                 break;
         }
+        if (p->len < sizeof(*p))
+            break;
         p = ((void *)p) + p->len;
     }
 }
@@ -376,7 +379,10 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
     if (rtk->crashed)
         return -1;
 
-    while (asc_recv(rtk->asc, &asc_msg)) {
+    /* One that never stops talking to its system endpoints does not keep the caller forever */
+    u64 timeout = timeout_calculate(USEC_PER_SEC);
+
+    while (!timeout_expired(timeout) && asc_recv(rtk->asc, &asc_msg)) {
         if (asc_msg.msg1 >= 0x100) {
             rtkit_printf("WARNING: received message for invalid endpoint %x >= 0x100\n",
                          asc_msg.msg1);
@@ -730,8 +736,15 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
         return false;
     }
 
+    /* Within a second each, as Linux waits for them (drivers/soc/apple/rtkit.c) */
+    u64 timeout = timeout_calculate(USEC_PER_SEC);
     while (rtk->ap_power != RTKIT_POWER_QUIESCED) {
         struct rtkit_message rtk_msg;
+
+        if (timeout_expired(timeout)) {
+            rtkit_printf("AP power state was not acknowledged\n");
+            return false;
+        }
         int ret = rtkit_recv(rtk, &rtk_msg);
 
         if (ret > 0) {
@@ -750,8 +763,14 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
         return false;
     }
 
+    timeout = timeout_calculate(USEC_PER_SEC);
     while (rtk->iop_power != target) {
         struct rtkit_message rtk_msg;
+
+        if (timeout_expired(timeout)) {
+            rtkit_printf("IOP power state did not change\n");
+            return false;
+        }
         int ret = rtkit_recv(rtk, &rtk_msg);
 
         if (ret > 0) {
