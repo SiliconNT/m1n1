@@ -5,9 +5,11 @@
 #
 #   make               build/irqtest.bin, build/sgitest.bin, build/gictest.bin,
 #                      build/wfitest.bin, build/pscitest.bin, build/pmutest.bin,
-#                      build/xitest.bin and build/aictest.bin, the raw images that
-#                      run_irqtest.py and run_sgitest.py load under the hypervisor.
-#                      aictest needs AIC: run_sgitest.py --aic-line
+#                      build/xitest.bin, build/aictest.bin, build/cputest.bin and
+#                      build/aicroute.bin, the raw images that run_irqtest.py and
+#                      run_sgitest.py load under the hypervisor, and build/el2probe.bin,
+#                      which run_cpuregs.py puts into the memory of the target.
+#                      aictest and aicroute need AIC: run_sgitest.py --aic-line
 #   make build/stoptest.bin  a guest that only does what the hypervisor stops it for, with
 #                      the header of a firmware image: for run_firmware.py --loader m1n1
 #                      [--no-host] (R37)
@@ -30,7 +32,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 .PHONY: anstest all clean
 .SECONDARY:
 
-all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin
+all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin build/cputest.bin build/aicroute.bin build/el2probe.bin
 
 build/irqtest.o: irqtest.S
 	@mkdir -p build
@@ -46,15 +48,30 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o build/aictest.o: build/%.o: %.c sgitest.h gic.h
+build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o build/aictest.o build/aicroute.o build/cputest.o: build/%.o: %.c sgitest.h gic.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
-build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf build/aictest.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
+build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf build/aictest.elf build/aicroute.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
 	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/$*.o
 
-build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/aictest.bin: build/%.bin: build/%.elf
+build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/aictest.bin build/aicroute.bin build/cputest.bin build/el2probe.bin: build/%.bin: build/%.elf
 	$(OBJCOPY) -O binary $< $@
+
+# cputest reads the registers of cpuregs.h at EL1, and el2probe, which is no guest, at EL2
+build/cputest-regs.o: cputest-regs.S cpuregs.h
+	@mkdir -p build
+	$(CC) -c -Wall -Werror -o $@ $<
+
+build/cputest.elf: build/sgitest-head.o build/cputest.o build/cputest-regs.o sgitest.ld
+	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/cputest.o build/cputest-regs.o
+
+build/el2probe.o: el2probe.S cpuregs.h
+	@mkdir -p build
+	$(CC) -c -Wall -Werror -o $@ $<
+
+build/el2probe.elf: build/el2probe.o
+	$(LD) -Ttext=0 -e _start --build-id=none -o $@ $<
 
 # xitest: its instructions are assembled (LSE and RCPC among them), and nothing of it that is
 # written to shares a page with what is executed (xitest.ld)

@@ -21,7 +21,7 @@
 image_start:
     b       _start
     .word   0
-    .ascii  "SNTSGI02"              /* 0x08: magic */
+    .ascii  "SNTSGI03"              /* 0x08: magic */
     .globl  hdr_uart_base
 hdr_uart_base:
     .quad   0                       /* 0x10: virtual UART base, from the loader */

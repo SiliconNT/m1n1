@@ -48,13 +48,14 @@ enum {
     OP_SEND_ALL,  // write arg to ICC_SGI1R_EL1 with each of the 16 INTIDs
     OP_MASK,      // mask IRQs
     OP_UNMASK,    // unmask IRQs
-    OP_CROSSFIRE, // send SGI_CROSS_B arg times to the boot CPU, each time waiting for it to arrive
+    OP_CROSSFIRE, // send an SGI to a CPU over and over, see crossfire_arg()
 };
 
 /* SGIs with a special role in a test */
 #define SGI_RESEND  5  // sent again by its own handler, once
-#define SGI_CROSS_A 10 // crossfire, boot CPU to the other one
-#define SGI_CROSS_B 9  // crossfire, the other one to the boot CPU
+#define SGI_CROSS_A 10 // crossfire, the first of the two CPUs to the second
+#define SGI_CROSS_B 9  // crossfire, the second to the first
+#define SGI_RING    11 // crossfire, every CPU to the next one
 #define SGI_PING    14 // bounced between two CPUs
 
 /*
@@ -287,9 +288,10 @@ void bad_exception(u64 vector)
  */
 #define SLOW_US 250
 
-static void crossfire(u64 val, u32 intid, int target, u64 times)
+static void crossfire(int target, u32 intid, u64 times)
 {
     struct cpu *c = me();
+    u64 val = sgi_to(target, intid);
 
     c->slowest = c->slow = 0;
 
@@ -313,6 +315,12 @@ static void crossfire(u64 val, u32 intid, int target, u64 times)
         if (took * 1000 > SLOW_US * ticks_per_ms)
             c->slow++;
     }
+}
+
+/* What OP_CROSSFIRE is told: send this SGI so many times, each time waiting for it to arrive */
+static u64 crossfire_arg(int target, u32 intid, u64 times)
+{
+    return times | ((u64)target << 32) | ((u64)intid << 40);
 }
 
 static void put_latency(int from, int to)
@@ -345,7 +353,7 @@ static void execute(u64 op, u64 arg)
             irq_unmask();
             break;
         case OP_CROSSFIRE:
-            crossfire(sgi_to(0, SGI_CROSS_B), SGI_CROSS_B, 0, arg);
+            crossfire((arg >> 32) & 0xff, arg >> 40, arg & 0xffffffff);
             break;
     }
 }
@@ -682,8 +690,8 @@ static void tests_stress(int b)
      * Both write ICC_SGI1R_EL1 for each other at the same time, each waiting for its SGI to
      * be taken before it sends the next, so that none may be merged or lost.
      */
-    start_command(b, OP_CROSSFIRE, CROSS_ROUNDS);
-    crossfire(sgi_to(b, SGI_CROSS_A), SGI_CROSS_A, b, CROSS_ROUNDS);
+    start_command(b, OP_CROSSFIRE, crossfire_arg(0, SGI_CROSS_B, CROSS_ROUNDS));
+    crossfire(b, SGI_CROSS_A, CROSS_ROUNDS);
     if (!wait_command(b, 20000))
         cpus[b].cmd_failed = ~0UL;
     expect(0, SGI_CROSS_B, CROSS_ROUNDS);
@@ -691,6 +699,42 @@ static void tests_stress(int b)
     check("cpu @ and cpu #, both sending at the same time", 1000);
     put_latency(0, b);
     put_latency(b, 0);
+}
+
+/* The same for two CPUs neither of which is the boot CPU, which only looks on */
+static void tests_cross(int a, int b)
+{
+    test_a = a;
+    test_b = b;
+
+    start_command(a, OP_CROSSFIRE, crossfire_arg(b, SGI_CROSS_A, CROSS_ROUNDS));
+    start_command(b, OP_CROSSFIRE, crossfire_arg(a, SGI_CROSS_B, CROSS_ROUNDS));
+    if (!wait_command(a, 20000))
+        cpus[a].cmd_failed = ~0UL;
+    if (!wait_command(b, 20000))
+        cpus[b].cmd_failed = ~0UL;
+    expect(a, SGI_CROSS_B, CROSS_ROUNDS);
+    expect(b, SGI_CROSS_A, CROSS_ROUNDS);
+    check("cpu @ and cpu #, both sending at the same time", 1000);
+    put_latency(a, b);
+    put_latency(b, a);
+}
+
+/* Every CPU sends to the next one, all of them at the same time */
+static void tests_ring(void)
+{
+    for (u64 cpu = 1; cpu < nr_cpus; cpu++)
+        start_command(cpu, OP_CROSSFIRE,
+                      crossfire_arg((cpu + 1) % nr_cpus, SGI_RING, CROSS_ROUNDS));
+    crossfire(1, SGI_RING, CROSS_ROUNDS);
+    for (u64 cpu = 1; cpu < nr_cpus; cpu++)
+        if (!wait_command(cpu, 20000))
+            cpus[cpu].cmd_failed = ~0UL;
+    for (u64 cpu = 0; cpu < nr_cpus; cpu++)
+        expect(cpu, SGI_RING, CROSS_ROUNDS);
+    check("every cpu sending to the next one, all at the same time", 1000);
+    for (u64 cpu = 0; cpu < nr_cpus; cpu++)
+        put_latency(cpu, (cpu + 1) % nr_cpus);
 }
 
 /* A target list that names several CPUs of one cluster, the sender among them */
@@ -806,6 +850,12 @@ void boot_main(void)
         tests_list();
         for (u64 b = 1; b < nr_cpus; b++)
             tests_stress(b);
+    }
+    if (nr_cpus > 2) {
+        for (u64 a = 1; a < nr_cpus; a++)
+            for (u64 b = a + 1; b < nr_cpus; b++)
+                tests_cross(a, b);
+        tests_ring();
     }
 
 done:

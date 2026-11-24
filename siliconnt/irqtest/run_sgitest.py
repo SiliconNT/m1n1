@@ -32,13 +32,24 @@ hypervisor's PSCI, and the low four bits choose the call it ends with (0 SYSTEM_
 1 SYSTEM_RESET, 2 hvc #1, 3 CPU_ON, 4 CPU_OFF). None of those calls comes back: the
 hypervisor stops the guest and says why, and this script leaves the guest right then.
 
+build/cputest.bin (cputest.c) is an eighth: what a guest reads in the identification registers
+of every core, and what a core that has just started sees of what the boot core wrote before
+(SiliconNT R50). build/aicroute.bin (aicroute.c) is a ninth, about which core AIC reports a
+line to. It takes --aic-line as aictest does, and --guest-arg: bit 0 the cores spin while they
+wait, bit 1 they are in WFI, bits 31:8 the rounds for each pair of cores.
+
 Without --secondary the guest runs on the boot CPU only and no other CPU is touched. Each
---secondary N adds the CPU with that m1n1 index (the cpu-id of its ADT node): the script
+--secondary N adds the CPU with that m1n1 index (the cpu-id of its ADT node), --secondary all
+every CPU there is: the script
 starts it, one at a time and only after putting m1n1's idle loop into WFE mode, so that it
 never waits in WFI (M4 loses CPU state there, src/kboot.c). The guest gets onto it the way
 upstream gets an Apple guest onto its secondary CPUs: it writes the CPU start register of the
 power manager, the hypervisor intercepts that, and this script answers with
 hv_start_secondary(). It does not use the CPU_ON of the hypervisor's PSCI.
+
+--park N (or all) starts a CPU in the same way and leaves it in m1n1's idle loop, where it never
+enters the guest. With --aic-line, and --parked-trials, the script raises that line itself
+once the guest has been stopped, and looks at which core gets the IRQ (aic_parked.py).
 
 The guest sets up the GIC itself, the way the Windows kernel does: the script tells it where
 the hypervisor emulates the Distributor and the Redistributors.
@@ -57,10 +68,21 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.append(str(HERE.parents[1] / "proxyclient"))
 
 parser = argparse.ArgumentParser(description="Run the vGIC SGI test guest")
-parser.add_argument("--secondary", type=int, action="append", default=[], metavar="N",
-                    help="also run the guest on the CPU with this m1n1 index (repeatable)")
+parser.add_argument("--secondary", action="append", default=[], metavar="N",
+                    help="also run the guest on the CPU with this m1n1 index (repeatable), or "
+                         "on all of them")
+parser.add_argument("--park", action="append", default=[], metavar="N",
+                    help="start the CPU with this m1n1 index, or all that are not given with "
+                         "--secondary, and leave it in m1n1's idle loop (repeatable). It must not "
+                         "have been in the hypervisor before in this boot")
+parser.add_argument("--parked-trials", type=int, default=0, metavar="N",
+                    help="with --park and --aic-line: raise the line this often after the guest "
+                         "has been stopped, and look at which core gets the IRQ")
 parser.add_argument("--seconds", type=int, default=60,
                     help="how long the guest may run before it is stopped (default 60)")
+parser.add_argument("--stop-after-done", type=float, metavar="S",
+                    help="stop the guest this long after it has printed \"DONE pass fail = \", "
+                         "if that is before --seconds are over")
 parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "build" / "m1n1.bin",
                     help="the raw m1n1.bin that is supposed to be running on the target")
 parser.add_argument("--guest-arg", type=lambda s: int(s, 0), default=0, metavar="N",
@@ -79,13 +101,13 @@ parser.add_argument("payload", type=pathlib.Path, nargs="?",
 args = parser.parse_args()
 
 # Layout of the image header, see sgitest-head.S
-MAGIC = b"SNTSGI02"
+MAGIC = b"SNTSGI03"
 MAGIC_OFF = 0x08
 UART_BASE_OFF = 0x10
 NR_CPUS_OFF = 0x18
 SECONDARY_OFF = 0x20
 START_REG_OFF = 0x28
-MAX_CPUS = 4
+MAX_CPUS = 16
 START_VAL_OFF = START_REG_OFF + 8 * MAX_CPUS
 GICD_BASE_OFF = START_VAL_OFF + 8 * MAX_CPUS
 GICR_BASE_OFF = GICD_BASE_OFF + 8
@@ -102,16 +124,29 @@ GICR_BASE = 0x51_0000_0000
 
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
-    sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest, pscitest, pmutest, xitest "
-             "or aictest image of this tree")
+    sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest, pscitest, pmutest, xitest, "
+             "aictest, cputest or aicroute image of this tree")
 if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
     sys.exit(f"{args.payload}: UART base already filled in")
 secondary_entry_off = struct.unpack_from("<Q", image, SECONDARY_OFF)[0]
 
-if len(set(args.secondary)) != len(args.secondary):
-    sys.exit("--secondary: the same CPU twice")
-if len(args.secondary) > MAX_CPUS - 1:
-    sys.exit(f"--secondary: the guest has room for {MAX_CPUS} CPUs")
+if args.parked_trials and (not args.park or args.aic_line is None):
+    sys.exit("--parked-trials needs --park and --aic-line")
+
+def pick_cpus(option, names, candidates):
+    """The CPUs an option names, out of the candidates (m1n1 indices, in their order)"""
+    if names == ["all"]:
+        return list(candidates)
+    try:
+        picked = [int(n) for n in names]
+    except ValueError:
+        sys.exit(f"{option}: a number, or all and nothing else")
+    if len(set(picked)) != len(picked):
+        sys.exit(f"{option}: the same CPU twice")
+    for index in picked:
+        if index not in candidates:
+            sys.exit(f"{option} {index}: no such secondary CPU")
+    return picked
 
 from m1n1.proxy import *
 from m1n1.proxyutils import *
@@ -159,18 +194,22 @@ for node in u.adt["cpus"]:
           f"{getattr(node, 'cluster_type', '?')}  {node.state}")
 print(f"Boot CPU: {boot_index}")
 
+others = [index for index in sorted(cpu_nodes) if index != boot_index]
+args.secondary = pick_cpus("--secondary", args.secondary, others)
+args.park = pick_cpus("--park", args.park, [i for i in others if i not in args.secondary])
+if len(args.secondary) > MAX_CPUS - 1:
+    sys.exit(f"--secondary: the guest has room for {MAX_CPUS} CPUs")
+
 # A secondary CPU starts executing at its RVBAR. Where that is locked (M4), it has to be the
 # start of the m1n1 that is running now, which is the case after chainloading the raw image
 # onto the base of the one iBoot loaded. Only the registers of the CPUs asked for are read;
 # reading one changes nothing, m1n1 does the same before it starts a CPU (src/smp.c).
 RVBAR_ADDR = 0xfffffffff000
-for index in args.secondary:
-    if index not in cpu_nodes or index == boot_index:
-        sys.exit(f"--secondary {index}: no such secondary CPU")
+for index in args.secondary + args.park:
     rvbar = p.read64(cpu_nodes[index].cpu_impl_reg[0])
     print(f"CPU {index}: RVBAR register 0x{rvbar:x}, m1n1 base 0x{u.base:x}")
     if not u.cpu_features.apple_sysregs_unlocked and (rvbar & RVBAR_ADDR) != u.base:
-        sys.exit(f"--secondary {index}: its RVBAR is locked to 0x{rvbar & RVBAR_ADDR:x}, which is "
+        sys.exit(f"CPU {index}: its RVBAR is locked to 0x{rvbar & RVBAR_ADDR:x}, which is "
                  "not where this m1n1 starts. It would not come up in this image.")
 
 if args.check_only:
@@ -179,11 +218,18 @@ if args.check_only:
 # slot in the guest -> m1n1 CPU index; slot 0 is the boot CPU
 slots = [boot_index] + args.secondary
 
-if args.secondary:
-    # Before any secondary CPU exists: its idle loop is to use WFE, never WFI
+def heap_top():
+    """Asking for 0 bytes returns the top of m1n1's heap (src/heapblock.c)"""
+    return p.heapblock_alloc(0)
+
+print(f"heap top before the hypervisor: 0x{heap_top():x}")
+
+if args.secondary or args.park:
+    # Before any secondary CPU exists: its idle loop is to use WFE, never WFI. A CPU that is
+    # running m1n1 already (an earlier run in this boot) is left as it is
     print("m1n1 idle loop: WFE mode")
     p.smp_set_wfe_mode(True)
-    for index in args.secondary:
+    for index in args.secondary + args.park:
         print(f"Starting CPU {index}...")
         alive = p.smp_start_secondary(index)
         print(f"CPU {index}: {'running m1n1' if alive else 'did NOT start'}")
@@ -195,6 +241,7 @@ hv = HV(iface, p, u)
 # guest's device tree is to have the boot CPU only.
 hv.smp = False
 hv.init()
+print(f"heap top after hv_init(): 0x{heap_top():x}")
 
 def dump_state(title):
     # The registers of the CPU the proxy is running on: the boot CPU before the guest runs,
@@ -274,6 +321,10 @@ def aic_line(line):
         sw_clr = sw_set + words
         mask_set = sw_clr + words
         mask_clr = mask_set + words
+        cfg_addr = base + config + 4 * (line % max_irq) + \
+            (line // max_irq) * prop32("extintrcfg-stride", 4 * max_irq + 5 * words)
+        value = p.read32(cfg_addr)
+        print(f"IRQ_CFG of AIC line {line}: 0x{value:08x} at 0x{cfg_addr:x} (target {value & 0xf})")
         die_size = 4 * max_irq + 5 * words
         set_stride = prop32("intmaskset-stride", die_size)
         clr_stride = prop32("intmaskclear-stride", die_size)
@@ -286,16 +337,22 @@ def aic_line(line):
           f"at 0x{set_addr:x} and cleared at 0x{clr_addr:x}, bit {num % 32}")
     print(f"  it is masked at 0x{base + mask_set + die * set_stride + word:x} and unmasked at "
           f"0x{base + mask_clr + die * clr_stride + word:x}, the same bit")
+    aic_regs.update(
+        sw_set=set_addr, sw_clr=clr_addr, bit=1 << (num % 32),
+        mask_set=base + mask_set + die * set_stride + word,
+        mask_clr=base + mask_clr + die * clr_stride + word,
+        event=None if config_addr is None else base + prop32("aic-iack-offset"))
     return spi, set_addr, clr_addr, 1 << (num % 32), config_addr
 
 aic_config_addr = None
+aic_regs = {}
 
 def print_aic_config(when):
     """AIC's global configuration, read only; bit 0 enables AIC"""
     if aic_config_addr is not None:
         value = p.read32(aic_config_addr)
         print(f"AIC global configuration {when}: 0x{value:08x} at 0x{aic_config_addr:x} "
-              f"(enable bit {value & 1})")
+              f"(enable bit {value & 1}, prefer-pcpu bit {(value >> 28) & 1})")
 
 if args.aic_line is not None:
     spi, set_addr, clr_addr, bit, aic_config_addr = aic_line(args.aic_line)
@@ -364,14 +421,53 @@ def stop_guest(entry_msg=None, exit_msg=None):
     # GUEST_HVC: the hypervisor has stopped the guest for good (src/hv/hv_psci.c)
     print(f"Guest stopped: {hv.exc_reason.name}/{getattr(hv.exc_code, 'name', hv.exc_code)}")
     dump_state(f"guest stopped, on CPU {cpu}")
+    if args.parked_trials and cpu == boot_index and aic_regs.get("event"):
+        # hv.start() has the serial port wait forever; a core that does not answer must not
+        timeout, iface.dev.timeout = iface.dev.timeout, 10
+        try:
+            import aic_parked
+            blob = (HERE / "build" / "el2probe.bin").read_bytes()
+            print_aic_config("with the guest stopped")
+            aic_parked.probe(
+                aic_parked.Parked(p, u, iface, boot_index, args.park, aic_regs, blob,
+                                  lambda: u.mrs(ISR_EL1)), args.parked_trials)
+        except Exception as e:
+            print(f"The parked CPUs could not be looked at: {type(e).__name__}: {e}")
+        finally:
+            iface.dev.timeout = timeout
     return EXC_RET.EXIT_GUEST
 
 hv.run_shell = stop_guest
 
 # Count from the moment the guest is entered: HV.start() has installed its SIGINT handler by
 # then, and the setup before that takes a while.
-timer = threading.Timer(args.seconds, lambda: os.kill(os.getpid(), signal.SIGINT))
-timer.daemon = True
+def interrupt_after(seconds):
+    t = threading.Timer(seconds, lambda: os.kill(os.getpid(), signal.SIGINT))
+    t.daemon = True
+    return t
+
+timer = interrupt_after(args.seconds)
+
+class DoneWatch:
+    """Gets what m1n1 prints, in place of a log file; the last line of a guest ends the run"""
+    def __init__(self):
+        self.line = ""
+
+    def write(self, text):
+        self.line += text
+        if not self.line.endswith("\n"):
+            return
+        if "DONE pass fail = " in self.line:
+            timer.cancel()
+            interrupt_after(args.stop_after_done).start()
+            iface.tty_log = None
+        self.line = ""
+
+    def flush(self):
+        pass
+
+if args.stop_after_done is not None:
+    iface.tty_log = DoneWatch()
 enter_guest = p.hv_start
 
 def enter_guest_timed(*hv_start_args):
@@ -387,3 +483,4 @@ print_aic_config("after the guest")
 print("Hypervisor exited.")
 if args.secondary:
     print(f"CPUs {args.secondary} are back in m1n1's idle loop (WFE).")
+print(f"heap top after the hypervisor: 0x{heap_top():x}")

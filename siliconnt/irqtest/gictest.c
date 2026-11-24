@@ -7,6 +7,10 @@
  * once it is, with the priority the guest gave it; an SPI that the guest requests by writing
  * GICD_ISPENDR must arrive at the CPU GICD_IROUTER names.
  *
+ * hdr_arg is the first of the SPIs it uses, a multiple of 8; 0 is 40. Under the hypervisor it
+ * should be above the SPIs that are AIC lines (hv_aicmap()), so that enabling one does not let
+ * a device in.
+ *
  * Only the boot CPU prints, on the hypervisor's virtual UART; lines start with "HVLOG: " so
  * that the hypervisor copies them to its own console. Nothing here waits with WFI. Entry
  * points and vectors are those of sgitest (sgitest-head.S).
@@ -15,21 +19,22 @@
 #include "sgitest.h"
 #include "gic.h"
 
-/* Interrupts that are counted one by one: SGIs, PPIs and the first SPIs */
-#define NR_COUNTED 64
+/* Interrupts that are counted one by one: all there are */
+#define NR_COUNTED 1020
 
 #define PPI_VTIMER 27
 #define SGI_A      1
 #define SGI_LOW    2 /* gets a low priority in one test */
 #define SGI_HIGH   3
-#define SPI_A      40
-#define SPI_B      41
-#define SPI_REG    44 /* only its registers are used */
+#define SPI_A      spi_first
+#define SPI_B      (spi_first + 1)
+#define SPI_REG    (spi_first + 4) /* only its registers are used */
 
 /* Written by the loader, see sgitest-head.S */
 extern u64 hdr_nr_cpus;
 extern u64 hdr_start_reg[MAX_CPUS];
 extern u64 hdr_start_val[MAX_CPUS];
+extern u64 hdr_arg;
 
 void uart_putc(int c);
 void mmio_write32(u64 addr, u32 val);
@@ -83,6 +88,7 @@ static u32 seen[MAX_CPUS][NR_COUNTED]; // counts already accounted for
 static u64 nr_cpus;
 static u64 ticks_per_ms;
 static u32 nr_pass, nr_fail;
+static u32 spi_first;
 
 /* ---- output ---- */
 
@@ -618,6 +624,7 @@ void boot_main(void)
     nr_cpus = hdr_nr_cpus;
     if (nr_cpus < 1 || nr_cpus > MAX_CPUS)
         nr_cpus = 1;
+    spi_first = hdr_arg ? hdr_arg : 40;
 
     /* The Distributor first, as HalpGic3InitializeIoUnit comes before the first local unit */
     dist = gic_dist_init();
@@ -625,6 +632,8 @@ void boot_main(void)
 
     line("start, cpus=");
     put_dec(nr_cpus);
+    put(" SPIs from ");
+    put_dec(spi_first);
     put("\n");
     if (dist) {
         line("FAIL Distributor not usable, check ");
