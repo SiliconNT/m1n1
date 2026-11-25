@@ -4,8 +4,8 @@
  * Host-side model test for src/hv/hv_psci.c. The file under test is the real one, compiled
  * against the stand-in headers of this directory; this file plays the guest (the registers of
  * an hvc), the host of the hypervisor (hv_exc_proxy(), which is where a guest that is not to
- * run again ends up) and the cores of the machine (src/smp.c, and hv_start_secondary() of
- * src/hv/hv.c).
+ * run again ends up) and the cores of the machine (src/smp.c, and hv_start_secondary() and
+ * hv_cpu_off() of src/hv/hv.c).
  *
  * What the answers have to be comes from what the Windows kernel does with them
  * (10.0.26300.9457): it reads PSCI_VERSION and takes six functions for granted on 1.1, asks
@@ -84,6 +84,21 @@ bool hv_start_secondary(int cpu, void *entry, u64 regs[4])
     return start_works;
 }
 
+static int offs; /* hv_cpu_off() calls, and what the last of them was given */
+static struct exc_info off_ctx;
+
+/* Does not return, but on the last core the guest runs on */
+void hv_cpu_off(struct exc_info *ctx)
+{
+    offs++;
+    off_ctx = *ctx;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        if (hv_started_cpus[cpu] && cpu != (int)ctx->cpu_id) {
+            hv_started_cpus[ctx->cpu_id] = false;
+            longjmp(left_guest, 2);
+        }
+}
+
 static void reset_cpus(void)
 {
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
@@ -91,6 +106,7 @@ static void reset_cpus(void)
     hv_started_cpus[boot_cpu_idx] = true;
     starts = 0;
     start_works = true;
+    offs = 0;
 }
 
 /* ---- the guest ---- */
@@ -98,6 +114,7 @@ static void reset_cpus(void)
 enum outcome {
     RETURNED,  /* the guest goes on behind the hvc */
     STOPPED,   /* the guest was handed to the host and never ran again */
+    OFF,       /* the core has left the guest */
     UNHANDLED, /* hv_psci_hvc() said the hvc is not its business */
 };
 
@@ -118,9 +135,14 @@ static void fill(u64 x0, u64 x1)
 static enum outcome hvc(u16 imm)
 {
     proxy_calls = 0;
-    if (setjmp(left_guest))
-        return STOPPED;
-    return hv_psci_hvc(&ctx, imm) ? RETURNED : UNHANDLED;
+    switch (setjmp(left_guest)) {
+        case 0:
+            return hv_psci_hvc(&ctx, imm) ? RETURNED : UNHANDLED;
+        case 1:
+            return STOPPED;
+        default:
+            return OFF;
+    }
 }
 
 static enum outcome psci(u64 x0, u64 x1)
@@ -256,7 +278,7 @@ static enum outcome cpu_on(u64 target)
 /* What was printed while the guest was stopped */
 static char printed[16384];
 
-static enum outcome cpu_on_printed(u64 target)
+static enum outcome call_printed(enum outcome (*call)(u64), u64 arg)
 {
     FILE *f = tmpfile();
     int out = dup(1);
@@ -265,7 +287,7 @@ static enum outcome cpu_on_printed(u64 target)
 
     fflush(stdout);
     dup2(fileno(f), 1);
-    ret = cpu_on(target);
+    ret = call(arg);
     fflush(stdout);
     dup2(out, 1);
     close(out);
@@ -274,6 +296,11 @@ static enum outcome cpu_on_printed(u64 target)
     printed[len] = 0;
     fclose(f);
     return ret;
+}
+
+static enum outcome cpu_on_printed(u64 target)
+{
+    return call_printed(cpu_on, target);
 }
 
 static int count_lines(const char *start)
@@ -381,8 +408,6 @@ static void stop_tests(void)
     } calls[] = {
         {FN_SYSTEM_RESET, HV_GUEST_RESET},
         {FN_SYSTEM_OFF, HV_GUEST_OFF},
-        /* Until the hypervisor can stop cores: no answer is better than a wrong one */
-        {FN_CPU_OFF, HV_GUEST_HVC},
     };
 
     for (size_t i = 0; i < COUNT(calls); i++) {
@@ -396,6 +421,73 @@ static void stop_tests(void)
         CHECK(proxy_calls == 4);
         proxy_handled = 0;
     }
+}
+
+static enum outcome report(u64 unused)
+{
+    UNUSED(unused);
+    hv_psci_report();
+    return RETURNED;
+}
+
+/* CPU_OFF of a core. It has no parameters: what is in x1 does not count */
+static enum outcome cpu_off(u64 cpu)
+{
+    fill(FN_CPU_OFF, 0xdeadbeef);
+    ctx.cpu_id = cpu;
+    before = ctx;
+    offs = 0;
+    return hvc(0);
+}
+
+static void cpu_off_tests(void)
+{
+    char line[80];
+
+    /* Every core can turn itself off, the boot core too, while the guest runs on another */
+    for (int cpu = 0; cpu < M4_CPUS; cpu++) {
+        reset_cpus();
+        for (int i = 0; i < M4_CPUS; i++)
+            hv_started_cpus[i] = true;
+        CHECK(call_printed(cpu_off, cpu) == OFF);
+        CHECK(offs == 1 && !memcmp(&off_ctx, &before, sizeof(before)));
+        CHECK(!proxy_calls && !starts);
+        CHECK(!hv_started_cpus[cpu]);
+        /* Nothing is said of it: the guest may do this over and over */
+        CHECK(!printed[0]);
+
+        /* ...and is turned on again, by another one */
+        CHECK_ANSWER(cpu_on(m4_mpidr[cpu]), 0);
+        CHECK(starts == 1 && start_cpu == cpu);
+    }
+
+    /* One after the other, until there is one left, whichever that is: it is SYSTEM_OFF there */
+    for (int last = 0; last < M4_CPUS; last++) {
+        reset_cpus();
+        for (int i = 0; i < M4_CPUS; i++)
+            hv_started_cpus[i] = true;
+        for (int i = 1; i < M4_CPUS; i++)
+            CHECK(cpu_off((last + i) % M4_CPUS) == OFF);
+        CHECK(!proxy_calls);
+        CHECK_STOPPED(call_printed(cpu_off, last), HV_GUEST_OFF);
+        CHECK(proxy_calls == 1 && offs == 1);
+        CHECK(hv_started_cpus[last]);
+        snprintf(line, sizeof(line), "HV: PSCI: CPU_OFF from the guest on CPU %d, its last one",
+                 last);
+        CHECK(count_lines(line) == 1);
+
+        /* A host that says "handled" does not get the guest going again either */
+        proxy_handled = 3;
+        CHECK_STOPPED(cpu_off(last), HV_GUEST_OFF);
+        CHECK(proxy_calls == 4 && offs == 1);
+        proxy_handled = 0;
+    }
+    reset_cpus();
+
+    /* The report has the number of calls */
+    CHECK(call_printed(report, 0) == RETURNED);
+    snprintf(line, sizeof(line), ", %d CPU_OFF", M4_CPUS + M4_CPUS * (M4_CPUS + 1));
+    CHECK(strstr(printed, line));
 }
 
 /*
@@ -435,6 +527,7 @@ int main(void)
     cpu_on_tests();
     cpu_on_stop_tests();
     stop_tests();
+    cpu_off_tests();
     immediate_tests();
     hv_psci_report();
 

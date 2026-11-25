@@ -368,7 +368,7 @@ static const struct {
     {START_HV, HV_VIRTIO, "an event for a host"},
     {START_HV, HV_PANIC, "the hypervisor cannot go on"},
     {START_HV, HV_GUEST_RESET, "the guest called PSCI SYSTEM_RESET"},
-    {START_HV, HV_GUEST_OFF, "the guest called PSCI SYSTEM_OFF"},
+    {START_HV, HV_GUEST_OFF, "the guest called PSCI SYSTEM_OFF, or CPU_OFF on its last core"},
     {START_HV, HV_GUEST_HVC, "the guest made a call that the hypervisor cannot carry out"},
     /* Not events there are, but what they would be is not a restart or a power off */
     {START_EXCEPTION_LOWER, HV_GUEST_RESET, "an event for a host"},

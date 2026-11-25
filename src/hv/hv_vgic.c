@@ -132,7 +132,7 @@
  *  - enable, cfg1, priority: see vgic_load() above.
  *  - ppi_level: written by its core, read by any.
  *  - present, affinity: written by the boot core in vgic_init_global(), before the guest runs
- *    anywhere; a core writes its affinity once more, with the same value, in hv_vgic_init().
+ *    anywhere; a core writes its affinity once more, with the same value, in hv_vgic_init_cpu().
  */
 struct hv_vgic_pcpu {
     u64 injected;
@@ -146,7 +146,8 @@ struct hv_vgic_pcpu {
     u64 sgi_writes;   // writes to ICC_SGI1R_EL1 by the guest on this core
     u64 sgi_deferred; // returns to the guest with SGIs left waiting for a list register
     u64 spi_deferred; // ...and with SPIs left waiting
-    u64 inits;        // hv_vgic_init() on this core
+    u64 inits;        // hv_vgic_init_cpu() on this core
+    u64 off_active;   // SPIs the guest had not ended when it turned this core off
     u64 affinity;     // what the guest on this core reads from MPIDR_EL1, affinity fields only
     u32 sgi_pending;  // SGIs 0-15 for the guest on this core that are not in a list register
     u32 ppi_level;    // PPIs whose source is high
@@ -179,7 +180,6 @@ static u64 vgic_unhandled_reads;
 static bool vgic_group0_reported;
 
 static int vgic_nr_frames; // Redistributors: one per core index up to the last that runs m1n1
-static int vgic_boot_cpu;
 
 /* The AIC lines that are SPIs, from hv_aicmap(); none if there was no table */
 static struct hv_aicmap vgic_aicmap;
@@ -199,6 +199,12 @@ enum vgic_line {
 static u8 vgic_lines[HV_AICMAP_MAX];
 
 extern bool hv_started_cpus[MAX_CPUS];
+
+/* Whether the guest runs on a core. That changes while others look: CPU_ON and CPU_OFF. */
+static bool vgic_started(int cpu)
+{
+    return vgic_load(hv_started_cpus[cpu]);
+}
 
 #define VGIC_PERCPU(x) vgic_pcpu[mrs(TPIDR_EL2)].x
 
@@ -315,7 +321,6 @@ static void vgic_init_global(void)
 {
     int self = smp_id();
 
-    vgic_boot_cpu = self;
     vgic_nr_frames = 0;
     vgic_nr_unhandled = 0;
     vgic_unhandled_writes = 0;
@@ -359,7 +364,7 @@ static void vgic_init_global(void)
         p->injected = p->maintenance = p->unmapped = p->spurious = p->retracted = 0;
         p->forwarded = p->late = p->spurious_run = 0;
         p->sgi_writes = p->sgi_deferred = p->spi_deferred = 0;
-        p->inits = 0;
+        p->inits = p->off_active = 0;
     }
 
     /*
@@ -418,14 +423,20 @@ void hv_vgic_stop(void)
     vgic_aic_config_saved = false;
 }
 
-/* Bring up the virtual CPU interface of the core this runs on, with nothing pending */
+/* hv_init(), on the boot core, before the guest is entered anywhere */
 void hv_vgic_init(void)
 {
-    u64 sre = mrs(SYS_ICC_SRE_EL2);
+    vgic_init_global();
+    hv_vgic_init_cpu();
+}
 
-    /* hv_init() runs on the boot core, before the guest is entered anywhere */
-    if (smp_id() == boot_cpu_idx)
-        vgic_init_global();
+/*
+ * Bring up the virtual CPU interface of the core this runs on, with nothing pending: every time
+ * the guest starts on it, the boot core too once the guest has turned that off
+ */
+void hv_vgic_init_cpu(void)
+{
+    u64 sre = mrs(SYS_ICC_SRE_EL2);
 
     /*
      * The Redistributors were laid out when the hypervisor started. A core that only began to
@@ -578,7 +589,7 @@ static void vgic_kick(int cpu)
      * be told. The flag is set, and made visible to the other cores, before the IPI is sent,
      * and the target acknowledges the IPI before it looks at the flag, so nothing is missed.
      */
-    if (cpu != smp_id() && hv_started_cpus[cpu]) {
+    if (cpu != smp_id() && vgic_started(cpu)) {
         sysop("dsb ishst");
         smp_send_ipi(cpu);
     }
@@ -590,7 +601,7 @@ static void vgic_kick_all(void)
     int self = smp_id();
 
     for (int cpu = 0; cpu < MAX_CPUS; cpu++)
-        if (cpu == self || hv_started_cpus[cpu])
+        if (cpu == self || vgic_started(cpu))
             vgic_kick(cpu);
 }
 
@@ -601,14 +612,14 @@ static bool vgic_grp1_enabled(void)
 
 /*
  * The core an SPI goes to, -1 if GICD_IROUTER names none. With Interrupt_Routing_Mode set
- * any core will do; the boot core is one the guest is always on.
+ * any core the guest runs on will do.
  */
 static int vgic_spi_target(u32 intid)
 {
     u32 router = vgic_load(vgic_dist.router[intid]);
 
     if (router & GICD_IROUTER_IRM)
-        return vgic_boot_cpu;
+        return hv_lead_cpu();
 
     for (int cpu = 0; cpu < vgic_nr_frames; cpu++)
         if (vgic_pcpu[cpu].present &&
@@ -642,7 +653,7 @@ static void vgic_pend_spi(u32 intid, bool tell_self)
     cpu = vgic_spi_target(intid);
     if (cpu < 0)
         return;
-    if (cpu == smp_id() ? tell_self : hv_started_cpus[cpu])
+    if (cpu == smp_id() ? tell_self : vgic_started(cpu))
         vgic_kick(cpu);
 }
 
@@ -723,8 +734,8 @@ void hv_vgic_send_sgi(u64 val)
     VGIC_PERCPU(sgi_writes)++;
 
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
-        /* The PEs of the guest's system are the cores it has been entered on */
-        if (!hv_started_cpus[cpu])
+        /* The PEs of the guest's system are the cores it runs on */
+        if (!vgic_started(cpu))
             continue;
 
         if (val & ICC_SGI1R_IRM) {
@@ -1372,8 +1383,8 @@ void hv_vgic_report(void)
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
         struct hv_vgic_pcpu *p = &vgic_pcpu[cpu];
 
-        if (!p->injected && !p->sgi_writes && !p->maintenance && !p->late && !p->unmapped &&
-            !p->spurious)
+        if (!p->injected && !p->sgi_writes && !p->maintenance && !p->forwarded && !p->late &&
+            !p->unmapped && !p->spurious)
             continue;
 
         printf("HV: vGIC: CPU %d: %ld ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, "
@@ -1405,8 +1416,9 @@ void hv_vgic_report(void)
 }
 
 /*
- * A physical IRQ arrived while the guest was running. Returns false if it could not be
- * accounted for, in which case the caller should stop and tell the host.
+ * A physical IRQ arrived while the guest was running, or on a core the guest has turned off.
+ * Returns false if it could not be accounted for, in which case the caller should stop and tell
+ * the host.
  *
  * On Apple SoCs the vGIC maintenance interrupt is an IRQ that does not go through AIC and
  * cannot be masked there (Linux drivers/irqchip/irq-apple-aic.c, aic_handle_irq()), so it
@@ -1489,4 +1501,53 @@ bool hv_vgic_handle_irq(void)
     }
 
     return true;
+}
+
+/*
+ * The guest has turned this core off (PSCI CPU_OFF), and it is not one of those the guest runs on
+ * any more. What is in its list registers would be gone with them, and what AIC has told only
+ * this core would not be heard of again.
+ *
+ *  - An SPI that the guest has not taken is pending again, for the core it goes to now; it waits
+ *    for this one if that is still where it goes.
+ *  - One that the guest has taken and not ended counts as ended: an AIC line would stay masked
+ *    for good. The guest is to have moved its interrupts away ("The calling OS must have migrated
+ *    all threads and interrupts away from the core", DEN 0022 F.b 5.5.2), so there is none.
+ *  - SGIs and PPIs are this core's alone.
+ *
+ * Called with the hypervisor lock held.
+ */
+void hv_vgic_cpu_off(void)
+{
+    int nr_lr = vgic_nr_lr();
+
+    for (int i = 0; i < nr_lr; i++) {
+        u64 lr = vgic_read_lr(i);
+        u64 state = FIELD_GET(ICH_LR_STATE, lr);
+        u32 intid = FIELD_GET(ICH_LR_VINTID, lr);
+
+        vgic_write_lr(i, 0);
+        if (intid < VGIC_NR_LOCAL)
+            continue;
+        if ((state & ICH_LR_STATE_ACTIVE) && vgic_should_log(++VGIC_PERCPU(off_active)))
+            printf("HV: vGIC: CPU %d is turned off with SPI %u active (#%ld)\n", smp_id(), intid,
+                   VGIC_PERCPU(off_active));
+        if (state & ICH_LR_STATE_PENDING)
+            vgic_pend_spi(intid, false);
+        /* Active, or ended with the maintenance interrupt for it still to come; not pending */
+        if (state != ICH_LR_STATE_PENDING)
+            vgic_line_ended(intid);
+    }
+    msr(SYS_ICH_HCR_EL2, 0);
+    sysop("isb");
+
+    while ((mrs(ISR_EL1) & ISR_I) && hv_vgic_handle_irq())
+        ;
+
+    /*
+     * The SPIs that go to any core and waited for this one. The IPI also has that core take over
+     * the tick (hv_exc_fiq()).
+     */
+    if (hv_lead_cpu() >= 0)
+        vgic_kick(hv_lead_cpu());
 }

@@ -27,7 +27,8 @@
  * to QEMU's serial port after "LOG> ", whether a console takes it or not.
  *
  * HOST: whether a host listens on the port of the proxy. STOP_ARG: what the guest does
- * (stoptest.S): 0 hvc #1, 1 SYSTEM_OFF, 2 SYSTEM_RESET, 3 CPU_ON of a CPU that is not there.
+ * (stoptest.S): 0 hvc #1, 1 SYSTEM_OFF, 2 SYSTEM_RESET, 3 CPU_ON of a CPU that is not there,
+ * 4 CPU_OFF.
  * Without a host the core stays in EL2, and QEMU runs until the Makefile stops it.
  */
 
@@ -350,6 +351,12 @@ bool hv_start_secondary(int cpu, void *entry, u64 regs[4])
     shim_puts("nohost-qemu: hv_start_secondary() was called\n");
     shim_off();
     return false;
+}
+
+/* hv.c: the core does not leave the guest if it is the last one there */
+void hv_cpu_off(struct exc_info *ctx)
+{
+    UNUSED(ctx);
 }
 
 static const struct fake_adt_places places = {

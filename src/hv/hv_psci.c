@@ -25,6 +25,11 @@
  * are not those of this machine. The guest would only find that a call failed; it is stopped
  * instead, and what it asked for and what there is is printed.
  *
+ * CPU_OFF: the core leaves the guest and waits in EL2, where CPU_ON finds it. Any core, the boot
+ * core too, which goes on taking the AIC lines for the guest there (hv.c, hv_boot_cpu_waits()).
+ * The last core the guest runs on would turn off the machine ("if all cores in a topology node
+ * call CPU_OFF, the last core will power the node down", 5.5.2), so there it is SYSTEM_OFF.
+ *
  * The firmware calls SYSTEM_RESET and SYSTEM_OFF from its ResetSystem service and asks
  * PSCI_FEATURES about SYSTEM_RESET2 before a warm reset; nothing else.
  *
@@ -35,8 +40,7 @@
  * SYSTEM_RESET and SYSTEM_OFF stop the guest for good (hv_exc_proxy()). With a host, the host
  * of the hypervisor is told, and the machine does not restart or power off: that is where a
  * machine that is run from another one over USB wants to end up. Without one, the machine
- * restarts or powers off (hv_stop.c). CPU_OFF is not written yet. A guest that calls it is
- * stopped the same way, because no answer it could be given is true.
+ * restarts or powers off (hv_stop.c).
  *
  * An hvc with another immediate is not PSCI ("the immediate value used with an SMC (or HVC)
  * instruction must be 0", DEN 0022 5.2.1). Windows has two: hvc #1 is a hypercall to the
@@ -80,6 +84,7 @@ extern bool hv_started_cpus[MAX_CPUS];
 static struct {
     u64 cpu_on;         // CPU_ON calls...
     u64 cpu_on_already; // ...of which were for a core the guest runs on
+    u64 cpu_off;
     u64 version;
     u64 features;        // PSCI_FEATURES calls...
     u64 features_absent; // ...of which were about a function that is not there
@@ -91,6 +96,7 @@ void hv_psci_init(void)
 {
     psci_stats.cpu_on = 0;
     psci_stats.cpu_on_already = 0;
+    psci_stats.cpu_off = 0;
     psci_stats.version = 0;
     psci_stats.features = 0;
     psci_stats.features_absent = 0;
@@ -208,10 +214,12 @@ bool hv_psci_hvc(struct exc_info *ctx, u16 imm)
             ret = hv_psci_cpu_on(ctx);
             break;
         case PSCI_FN_CPU_OFF:
-            printf("HV: PSCI: CPU_OFF from the guest on CPU %ld: not written yet, stopping the "
-                   "guest\n",
+            psci_stats.cpu_off++;
+            hv_cpu_off(ctx);
+            printf("HV: PSCI: CPU_OFF from the guest on CPU %ld, its last one: as SYSTEM_OFF, "
+                   "stopping the guest\n",
                    ctx->cpu_id);
-            hv_psci_stop(ctx, HV_GUEST_HVC);
+            hv_psci_stop(ctx, HV_GUEST_OFF);
         default:
             if (psci_stats.absent++ < PSCI_LOG_ABSENT)
                 printf("HV: PSCI: function 0x%x called from the guest on CPU %ld at 0x%lx, "
@@ -228,8 +236,8 @@ bool hv_psci_hvc(struct exc_info *ctx, u16 imm)
 
 void hv_psci_report(void)
 {
-    printf("HV: PSCI: %ld CPU_ON (%ld said already on)\n", psci_stats.cpu_on,
-           psci_stats.cpu_on_already);
+    printf("HV: PSCI: %ld CPU_ON (%ld said already on), %ld CPU_OFF\n", psci_stats.cpu_on,
+           psci_stats.cpu_on_already, psci_stats.cpu_off);
     printf("HV: PSCI: %ld PSCI_VERSION, %ld PSCI_FEATURES (%ld said not supported), %ld calls of "
            "functions that are not there",
            psci_stats.version, psci_stats.features, psci_stats.features_absent, psci_stats.absent);

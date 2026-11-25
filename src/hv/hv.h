@@ -60,7 +60,7 @@ typedef enum _hv_entry_type {
     HV_VIRTIO,
     HV_PANIC,
     HV_GUEST_RESET, // the guest called PSCI SYSTEM_RESET
-    HV_GUEST_OFF,   // the guest called PSCI SYSTEM_OFF
+    HV_GUEST_OFF,   // the guest called PSCI SYSTEM_OFF, or CPU_OFF on its last core
     HV_GUEST_HVC,   // the guest executed an hvc that must not return and cannot be carried out
 } hv_entry_type;
 
@@ -142,6 +142,8 @@ bool hv_aic_hook(void);
 #define HV_VGIC_REDIST_BASE 0x5100000000UL
 #define HV_VGIC_REDIST_SIZE 0x20000UL
 void hv_vgic_init(void);
+void hv_vgic_init_cpu(void);
+void hv_vgic_cpu_off(void);
 /* AIC enabled for the guest, right before it is entered; as it was, once it has been left */
 void hv_vgic_start(void);
 void hv_vgic_stop(void);
@@ -229,7 +231,10 @@ void hv_power_reset(void);
 void hv_power_off(void);
 
 /* Exceptions */
+void hv_exc_init_cpu(int cpu);
 void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type, void *extra);
+void hv_maybe_switch_cpu(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type,
+                         void *extra);
 void hv_set_time_stealing(bool enabled, bool reset);
 void hv_add_time(s64 time);
 void hv_write_cntvoff(void);
@@ -277,12 +282,18 @@ bool hv_cpus_ready(void);
 bool hv_cpu_power_init(void);
 void hv_start(void *entry, u64 regs[4]);
 bool hv_start_secondary(int cpu, void *entry, u64 regs[4]);
+void hv_cpu_off(struct exc_info *ctx);
 void hv_exit_cpu(int cpu);
+void hv_exit_all(void) __attribute__((noreturn));
+void hv_leave_guest(void) __attribute__((noreturn));
+bool hv_is_leaving(void);
 void hv_rendezvous(void);
 u64 hv_get_started_cpus(void);
+int hv_lead_cpu(void);
 bool hv_switch_cpu(int cpu);
 void hv_pin_cpu(int cpu);
 void hv_arm_tick(bool secondary);
+void hv_take_over_tick(void);
 void hv_rearm(void);
 void hv_maybe_exit(void);
 void hv_tick(struct exc_info *ctx);

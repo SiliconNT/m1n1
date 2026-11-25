@@ -20,17 +20,17 @@
 #   make aic    only the one for aic_mask(), aic_unmask() and aic_mask_all() of src/aic.c
 #   make psci   only the PSCI one, and test_hv_events.py: that the host has a handler for
 #               every event the hypervisor sends (needs the Python of the proxy client)
-#   make psci-broken  the PSCI one against hv_psci.c with one thing wrong in CPU_ON at a
-#               time: it must fail on each
-#   make cpus   only the one for how the cores get into EL2 and into the guest: src/hv/hv.c and
-#               src/smp.c, and a few functions of src/memory.c and src/hv/hv_exc.c (cpus_test.c,
-#               with what is in cpus/); and test_hv_cpus.py: what the host knows of them (needs
-#               the Python of the proxy client)
+#   make psci-broken  the PSCI one against hv_psci.c with one thing wrong in CPU_ON or CPU_OFF
+#               at a time: it must fail on each
+#   make cpus   only the one for how the cores get into EL2, into the guest and out of it, and who
+#               ticks: src/hv/hv.c and src/smp.c, and a few functions of src/memory.c and
+#               src/hv/hv_exc.c (cpus_test.c, with what is in cpus/); and test_hv_cpus.py: what the
+#               host knows of them (needs the Python of the proxy client)
 #   make cpus-broken  ...against one of those with one thing wrong at a time: it must fail on
 #               each, with a failed check or by hanging
 #   make tsan   test.c under ThreadSanitizer, with fewer rounds
-#   make vgic-broken  test.c against hv_vgic.c with one thing wrong in how it forwards AIC
-#               lines at a time: it must fail on each
+#   make vgic-broken  test.c against hv_vgic.c with one thing wrong at a time, in how it forwards
+#               AIC lines or in what it does when the guest turns a core off: it must fail on each
 
 CC := gcc
 PYTHON ?= $(HOME)/src/m1n1-venv/bin/python
@@ -178,7 +178,8 @@ psci: build/psci-model
 
 # Every change must change something (cmp), or the source has moved on
 PSCI_BROKEN := every-index no-boot-cpu whole-x1 no-aff3 not-already-on wrong-cpu wrong-entry \
-	wrong-context failure-ignored unknown-returns no-table start-forgotten
+	wrong-context failure-ignored unknown-returns no-table start-forgotten \
+	off-forgotten last-off-event last-off-returns off-not-counted
 BREAK_PSCI_every-index := s/return cpu == boot_cpu_idx || smp_is_alive(cpu);/return true;/
 BREAK_PSCI_no-boot-cpu := s/return cpu == boot_cpu_idx || smp_is_alive(cpu);/return smp_is_alive(cpu);/
 BREAK_PSCI_whole-x1 := s/u64 affinity = ctx->regs\[1\] & PSCI_AFFINITY;/u64 affinity = ctx->regs[1];/
@@ -191,6 +192,10 @@ BREAK_PSCI_failure-ignored := s/    if (cpu >= 0 \&\& hv_start_secondary(\(.*\))
 BREAK_PSCI_unknown-returns := /^    hv_psci_print_cpus();$$/,/^}/s/hv_psci_stop(ctx, HV_GUEST_HVC);/return -2;/
 BREAK_PSCI_no-table := /^    hv_psci_print_cpus();$$/d
 BREAK_PSCI_start-forgotten := s/hv_start_secondary(cpu, (void \*)ctx->regs\[2\], regs)/1/
+BREAK_PSCI_off-forgotten := /^            hv_cpu_off(ctx);$$/d
+BREAK_PSCI_last-off-event := /its last one/,/^        default:/s/HV_GUEST_OFF/HV_GUEST_HVC/
+BREAK_PSCI_last-off-returns := /its last one/,/^        default:/s/hv_psci_stop(ctx, HV_GUEST_OFF);/ret = 0; break;/
+BREAK_PSCI_off-not-counted := /^            psci_stats.cpu_off++;$$/d
 
 build/hv_psci-broken-%.c: build/hv_psci.c Makefile
 	sed -e '$(BREAK_PSCI_$*)' $< > $@
@@ -249,12 +254,19 @@ build/cpus/mmu.c: cpus/mmu_head.c $(SRC)/memory.c
 build/cpus/%.o: build/cpus/%.c build/cpus/utils.h cpus/hw.h $(wildcard $(SRC)/*.h $(SRC)/hv/*.h)
 	$(CC) -c $(CPUS_CFLAGS) -Werror -o $@ $<
 
-# The way of a core into EL2 and out of it: a function to the end of which is the first line
-# that is nothing but a closing brace
-build/cpus/exc.c: cpus/exc_head.c cpus/exc_tail.c $(SRC)/hv/hv_exc.c
+# The ways of a core into EL2 and out of it, and the host's: what hv_exc.c keeps, and functions, to
+# the end of which is the first line that is nothing but a closing brace
+EXC_ARGS := (struct exc_info \*ctx, uartproxy_boot_reason_t reason, u32 type,
+build/cpus/exc.c: cpus/exc_head.c cpus/exc_tail.c $(SRC)/hv/hv_exc.c Makefile
 	@mkdir -p build/cpus
 	cp $< $@
-	for f in 'void hv_write_cntvoff(void)' 'static void hv_exc_entry(void)' 'static void hv_exc_exit(struct exc_info \*ctx)'; do \
+	test $$(grep -c '^#define PERCPU(x)\|^static bool time_stealing = true;$$' $(SRC)/hv/hv_exc.c) = 2
+	sed -n '/^#define PERCPU(x)/,/^static bool time_stealing = true;$$/p' $(SRC)/hv/hv_exc.c >> $@
+	for f in 'void hv_write_cntvoff(void)' 'static void _hv_exc_proxy$(EXC_ARGS)' \
+		'void hv_maybe_switch_cpu$(EXC_ARGS)' 'void hv_exc_proxy$(EXC_ARGS) void \*extra)' \
+		'void hv_exc_init_cpu(int cpu)' 'static void hv_get_context(struct exc_info \*ctx)' \
+		'static void hv_exc_entry(void)' 'static void hv_exc_exit(struct exc_info \*ctx)' \
+		'static int hv_interruptible_cpu(void)' 'void hv_exc_fiq(struct exc_info \*ctx)'; do \
 		test $$(grep -c "^$$f$$" $(SRC)/hv/hv_exc.c) = 1 || exit 1; \
 		sed -n "/^$$f$$/,/^}$$/p" $(SRC)/hv/hv_exc.c >> $@; \
 	done
@@ -273,11 +285,16 @@ cpus: build/cpus-model
 CPUS_BROKEN_hv := not-started after-vgic before-wfe-mode ready-ignored line-ignored busy-ignored \
 	beyond-ignored no-idle-wait not-copied no-leaving exit-kept masks sctlr-kept vbar-kept \
 	dbg-kept pmu-kept aborts-kept bit-after-lock started-not-set twice-in not-in-guest-bit \
-	log-all no-reason boot-cntvoff cntvoff mask-shifted boot-bit-after-lock
+	log-all no-reason boot-cntvoff cntvoff mask-shifted \
+	last-leaves off-not-shown want-kept pin-kept exit-one exit-no-ipi started-kept tick-kept \
+	vtimer-kept vgic-not-off last-exit-ignored off-log-all boot-waits-for-lock boot-no-irq \
+	boot-not-parked lead-boot-only lead-not-boot tick-slow-on-entry no-exc-init back-not-awaited \
+	global-again boot-refused tick-no-host
 CPUS_BROKEN_smp := rvbar-ignored start-again no-wait-result beyond-not-counted idle-always \
-	invalid-started boot-rvbar-kept boot-rvbar-locked
+	invalid-started boot-rvbar-kept boot-rvbar-locked boot-not-called boot-stays-alive
 CPUS_BROKEN_mmu := mmu-again
-CPUS_BROKEN_exc := bit-after-unlock bit-not-set exit-cntvoff
+CPUS_BROKEN_exc := bit-after-unlock bit-not-set exit-cntvoff take-over-forgotten stale-lead \
+	told-while-leaving exit-alone records-kept pmcr0-kept no-host-ignored
 CPUS_BROKEN := $(foreach f,hv smp mmu exc,$(CPUS_BROKEN_$(f)))
 BREAK_CPUS_not-started := /^void hv_init(void)/,/^}/{/^    hv_start_cpus();$$/d}
 BREAK_CPUS_after-vgic := /^void hv_init(void)/,/^}/{/^    hv_start_cpus();$$/d;s/^    hv_vgic_init();$$/&\n    hv_start_cpus();/}
@@ -288,7 +305,7 @@ BREAK_CPUS_busy-ignored := s/if (!hv_cpu_missing\[cpu\] \&\& .* !hv_cpu_waits(cp
 BREAK_CPUS_beyond-ignored := s/    if (smp_cpus_beyond()) {/    if (0) {/
 BREAK_CPUS_no-idle-wait := s/    if (!hv_cpu_waits(cpu)) {/    if (0) {/
 BREAK_CPUS_not-copied := /^    memcpy(e->regs, regs, sizeof(e->regs));$$/d
-BREAK_CPUS_no-leaving := s/    if (hv_leaving) {/    if (0) {/
+BREAK_CPUS_no-leaving := /^bool hv_start_secondary(/,/^}/{s/    if (hv_leaving)$$/    if (0)/}
 BREAK_CPUS_exit-kept := /^    hv_should_exit\[cpu\] = false;$$/d
 BREAK_CPUS_masks := s/(SPSR_D | SPSR_A | SPSR_I | SPSR_F | SPSR_M_EL1H)/(SPSR_I | SPSR_F | SPSR_M_EL1H)/
 BREAK_CPUS_sctlr-kept := s/\& ~(SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_EE)/\& ~(SCTLR_M | SCTLR_C | SCTLR_EE)/
@@ -296,8 +313,8 @@ BREAK_CPUS_vbar-kept := /^static void hv_init_secondary(/,/^}/{/^    msr(VBAR_EL
 BREAK_CPUS_dbg-kept := /^    hv_dbg_init_cpu(cpu);$$/d
 BREAK_CPUS_pmu-kept := /^    hv_pmu_init_cpu(cpu);$$/d
 BREAK_CPUS_aborts-kept := /^    hv_xtrack_init_cpu(cpu);$$/d
-BREAK_CPUS_bit-after-lock := /^static void hv_enter_secondary(/,/^}/{/^    __atomic_and_fetch(/d;s/^    hv_started_cpus\[smp_id()\] = false;$$/&\n    __atomic_and_fetch(\&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);/}
-BREAK_CPUS_started-not-set := /^    hv_started_cpus\[cpu\] = true;$$/d
+BREAK_CPUS_bit-after-lock := /^void hv_maybe_exit(/,/^}/{/^    __atomic_and_fetch(/d;s/^    spin_lock(&bhl);$$/&\n    __atomic_and_fetch(\&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);/}
+BREAK_CPUS_started-not-set := /^    __atomic_store_n(&hv_started_cpus\[cpu\], true, __ATOMIC_SEQ_CST);$$/d
 BREAK_CPUS_twice-in := /^bool hv_start_secondary(/,/^}/{s/    if (hv_started_cpus\[cpu\]) {/    if (0) {/}
 BREAK_CPUS_not-in-guest-bit := /^    __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);$$/d
 BREAK_CPUS_log-all := s/    if (!(e->count \& (e->count - 1)))/    if (1)/
@@ -312,7 +329,38 @@ BREAK_CPUS_boot-rvbar-kept := /^        smp_set_boot_rvbar(&cpu_info\[cpu\]);$$/
 BREAK_CPUS_boot-rvbar-locked := /if (FIELD_GET(RVBAR_LOCK, read64(cpu->impl_reg)))/,+1d
 BREAK_CPUS_boot-cntvoff := /^void hv_start(/,/^}/{/^    hv_write_cntvoff();$$/d}
 BREAK_CPUS_cntvoff := /^static void hv_init_secondary(/,/^}/{/^    hv_write_cntvoff();$$/d}
-BREAK_CPUS_boot-bit-after-lock := /^void hv_start(/,/^}/{/^    __atomic_and_fetch(/d;s/^    hv_leaving = true;$$/&\n    __atomic_and_fetch(\&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);/}
+BREAK_CPUS_last-leaves := /^void hv_cpu_off(/,/^}/{s/    if (!hv_leaving \&\& .*/    if (0)/}
+BREAK_CPUS_off-not-shown := /^void hv_cpu_off(/,/^}/{/^    hv_maybe_switch_cpu(/d}
+BREAK_CPUS_want-kept := /^    if (hv_want_cpu == cpu)$$/,+1d
+BREAK_CPUS_pin-kept := /^    if (hv_pinned_cpu == cpu)$$/,+1d
+BREAK_CPUS_exit-one := /^void hv_exit_all(/,/^}/{/^    hv_leave();$$/d}
+BREAK_CPUS_exit-no-ipi := /^static void hv_leave(void)/,/^}/{s/smp_send_ipi(i);/;/}
+BREAK_CPUS_started-kept := /^    __atomic_store_n(&hv_started_cpus\[cpu\], false, __ATOMIC_SEQ_CST);$$/d
+BREAK_CPUS_tick-kept := /^    msr(CNTP_CTL_EL0, 0);$$/d
+BREAK_CPUS_vtimer-kept := /^    msr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0);$$/d
+BREAK_CPUS_vgic-not-off := s/^        hv_vgic_cpu_off();$$/        ;/
+BREAK_CPUS_last-exit-ignored := s/    if (hv_lead_cpu() < 0)/    if (0)/
+BREAK_CPUS_off-log-all := s/    if (hv_leaving || !(count \& (count - 1)))/    if (1)/
+BREAK_CPUS_boot-waits-for-lock := s/        if (hv_try_lock()) {/        spin_lock(\&bhl); {/
+BREAK_CPUS_boot-no-irq := s/    if (mrs(ISR_EL1) \& ISR_I) {/    if (0) {/
+BREAK_CPUS_boot-not-parked := /^    smp_boot_cpu_wait(hv_boot_cpu_waits);$$/d
+BREAK_CPUS_lead-boot-only := /^int hv_lead_cpu(/,/^}/{s/^    if (boot_cpu_idx >= 0 .*/    if (1)/}
+BREAK_CPUS_lead-not-boot := /^int hv_lead_cpu(/,/^}/{s/^    if (boot_cpu_idx >= 0 .*/    if (0)/}
+BREAK_CPUS_tick-slow-on-entry := s/hv_arm_tick(smp_id() != hv_lead_cpu());/hv_arm_tick(true);/
+BREAK_CPUS_no-exc-init := /^    hv_exc_init_cpu(cpu);$$/d
+BREAK_CPUS_back-not-awaited := /^void hv_start(/,/^}/{/^        smp_wait(i);$$/d}
+BREAK_CPUS_global-again := s/^    hv_vgic_init_cpu();$$/    if (cpu == boot_cpu_idx) hv_vgic_init();\n&/
+BREAK_CPUS_boot-refused := s/    if (cpu != boot_cpu_idx \&\& !smp_is_alive(cpu)) {/    if (!smp_is_alive(cpu) || cpu == boot_cpu_idx) {/
+BREAK_CPUS_boot-not-called := s/    if (cpu == boot_cpu_idx \&\& !target->flag)/    if (cpu == boot_cpu_idx)/
+BREAK_CPUS_boot-stays-alive := /^void smp_boot_cpu_wait(/,/^}/{/^    me->flag = 0;$$/d}
+BREAK_CPUS_take-over-forgotten := s/^            hv_take_over_tick();$$/            ;/
+BREAK_CPUS_stale-lead := /^void hv_exc_fiq(/,/^}/{s/^    hv_exc_entry();$$/    int stale = hv_interruptible_cpu();\n&/;s/^    if (smp_id() == hv_interruptible_cpu()) {$$/    if (smp_id() == stale) {/}
+BREAK_CPUS_tick-no-host := s/if (hv_has_host() \&\& iodev_can_read/if (iodev_can_read/
+BREAK_CPUS_no-host-ignored := /^    hv_stop_if_no_host(ctx, reason, type);$$/d
+BREAK_CPUS_told-while-leaving := s/^    if (hv_is_leaving())$$/    if (0)/
+BREAK_CPUS_exit-alone := s/^            hv_exit_all();.*/            hv_leave_guest();/
+BREAK_CPUS_records-kept := /^    pcpu\[cpu\] = (struct hv_pcpu_data){0};$$/d
+BREAK_CPUS_pmcr0-kept := /^void hv_exc_init_cpu(/,/^}/{/^    reg_clr(/d}
 BREAK_CPUS_mask-shifted := /^u64 hv_get_started_cpus(/,/^}/{s/BIT(i)/BIT(i + 1)/}
 BREAK_CPUS_bit-after-unlock := /^static void hv_exc_exit(/,/^}/{/^    __atomic_or_fetch(/d;s/^    hv_maybe_exit();$$/&\n    __atomic_or_fetch(\&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);/}
 BREAK_CPUS_bit-not-set := /^static void hv_exc_exit(/,/^}/{/^    __atomic_or_fetch(/d}
@@ -404,9 +452,24 @@ build/model: $(MODEL_DEPS) build/hv_vgic.c
 build/model-tsan: $(MODEL_DEPS) build/hv_vgic.c
 	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o $@ test.c build/hv_vgic.c build/hv_wfi.c
 
-# hv_vgic.c with one thing wrong in how it forwards AIC lines, at a time. test.c must fail on
-# each, in its AIC tests (build/model aic runs only those). Every change must change
-# something (cmp), or the source has moved on.
+# hv_vgic.c with one thing wrong in how it forwards AIC lines, or in what it does when the guest
+# turns a core off, at a time. test.c must fail on each, in its tests of that (build/model aic and
+# build/model off run only those). Every change must change something (cmp), or the source has
+# moved on.
+VGIC_BROKEN_OFF := lr-kept spi-lost sgi-kept-pending active-not-ended ended-not-seen active-only \
+	hcr-kept events-kept lead-not-told irm-boot-only global-again off-sent-to
+BREAK_VGIC_lr-kept := /^void hv_vgic_cpu_off(void)/,/^}/{/vgic_write_lr(i, 0);/d}
+BREAK_VGIC_spi-lost := /^void hv_vgic_cpu_off(void)/,/^}/{s/if (state \& ICH_LR_STATE_PENDING)/if (0)/}
+BREAK_VGIC_sgi-kept-pending := /^void hv_vgic_init_cpu(void)/,/^}/{/sgi_pending), 0, __ATOMIC_SEQ_CST);/d}
+BREAK_VGIC_active-not-ended := /^void hv_vgic_cpu_off(void)/,/^}/{s/if (state != ICH_LR_STATE_PENDING)/if (!state)/}
+BREAK_VGIC_ended-not-seen := /^void hv_vgic_cpu_off(void)/,/^}/{s/if (state != ICH_LR_STATE_PENDING)/if (state \& ICH_LR_STATE_ACTIVE)/}
+BREAK_VGIC_active-only := /^void hv_vgic_cpu_off(void)/,/^}/{s/if (state \& ICH_LR_STATE_PENDING)/if (state == ICH_LR_STATE_PENDING)/}
+BREAK_VGIC_hcr-kept := /^void hv_vgic_cpu_off(void)/,/^}/{/msr(SYS_ICH_HCR_EL2, 0);/d}
+BREAK_VGIC_events-kept := /^void hv_vgic_cpu_off(void)/,/^}/{s/while (.*hv_vgic_handle_irq())/while (0)/}
+BREAK_VGIC_lead-not-told := /^void hv_vgic_cpu_off(void)/,/^}/{s/if (hv_lead_cpu() >= 0)/if (0)/}
+BREAK_VGIC_irm-boot-only := s/return hv_lead_cpu();/return boot_cpu_idx;/
+BREAK_VGIC_global-again := /^void hv_vgic_init_cpu(void)/,/^}/{s/^    u64 sre = .*$$/&\n    if (smp_id() == boot_cpu_idx) vgic_init_global();/}
+BREAK_VGIC_off-sent-to := s/if (cpu != smp_id() \&\& vgic_started(cpu)) {/if (cpu != smp_id()) {/
 VGIC_BROKEN := unmask-on-enable mask-on-disable unmask-when-ended mask-when-ended-disabled \
 	forward-any-state wrong-spi no-die no-mask-all end-not-seen last-line-missed \
 	unmask-in-flight no-table-check late-is-stray stray-without-limit spurious-not-reset \
@@ -438,16 +501,17 @@ build/hv_vgic-broken-%.c: build/hv_vgic.c Makefile
 build/model-broken-%: $(MODEL_DEPS) build/hv_vgic-broken-%.c
 	$(CC) $(CFLAGS) -Wno-error -o $@ test.c build/hv_vgic-broken-$*.c build/hv_wfi.c
 
-vgic-broken: $(VGIC_BROKEN:%=build/model-broken-%)
-	@for n in $(VGIC_BROKEN); do \
-		if timeout 60 build/model-broken-$$n aic > build/model-broken-$$n.log 2>&1; then \
+vgic-broken: $(VGIC_BROKEN:%=build/model-broken-%) $(VGIC_BROKEN_OFF:%=build/model-broken-%)
+	@for n in $(VGIC_BROKEN:%=aic-%) $(VGIC_BROKEN_OFF:%=off-%); do \
+		what=$${n%%-*}; n=$${n#*-}; \
+		if timeout 60 build/model-broken-$$n $$what > build/model-broken-$$n.log 2>&1; then \
 			echo "vgic-broken-$$n: the test passes and must not"; exit 1; \
 		fi; \
 		grep -q -m1 '^FAIL\|^CHECK FAILED' build/model-broken-$$n.log || \
 			{ echo "vgic-broken-$$n: ended without a failed check"; exit 1; }; \
 	done
-	@$(foreach n,$(VGIC_BROKEN),echo "vgic-broken: $(n): $$(grep -m1 '^FAIL\|^CHECK FAILED' build/model-broken-$(n).log)";)
-	@echo "vgic-broken: all $(words $(VGIC_BROKEN)) failed, as they must"
+	@$(foreach n,$(VGIC_BROKEN) $(VGIC_BROKEN_OFF),echo "vgic-broken: $(n): $$(grep -m1 '^FAIL\|^CHECK FAILED' build/model-broken-$(n).log)";)
+	@echo "vgic-broken: all $(words $(VGIC_BROKEN) $(VGIC_BROKEN_OFF)) failed, as they must"
 
 clean:
 	rm -rf build

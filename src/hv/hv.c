@@ -44,7 +44,7 @@ enum hv_sptm_mode hv_sptm_mode = SPTM_NONE;
 bool hv_genter_trap_enabled = false;
 
 static bool hv_has_ecv;
-static bool hv_leaving; // the boot core has left the guest, and the other cores are made to
+static bool hv_leaving; // every core is to leave the guest, and the hypervisor ends
 static bool hv_should_exit[MAX_CPUS];
 bool hv_started_cpus[MAX_CPUS];
 u64 hv_cpus_in_guest;
@@ -331,6 +331,127 @@ static void hv_set_gxf_vbar(void)
     msr(SYS_IMP_APL_VBAR_GL1, _hv_vectors_start);
 }
 
+/*
+ * The core that does what one of them has to do for all: the tick (hv_exc_fiq()), and the SPIs
+ * that go to any core (hv_vgic.c). The boot core; while the guest has that turned off, the one
+ * with the lowest index that the guest runs on. -1 if it runs on none.
+ */
+int hv_lead_cpu(void)
+{
+    if (boot_cpu_idx >= 0 && __atomic_load_n(&hv_started_cpus[boot_cpu_idx], __ATOMIC_SEQ_CST))
+        return boot_cpu_idx;
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (__atomic_load_n(&hv_started_cpus[i], __ATOMIC_SEQ_CST))
+            return i;
+    return -1;
+}
+
+/* Whether the guest is being left. Nothing but that is to happen with it then. */
+bool hv_is_leaving(void)
+{
+    return __atomic_load_n(&hv_leaving, __ATOMIC_SEQ_CST);
+}
+
+/*
+ * The guest is left: every core is to leave it, and then the hypervisor ends on the boot core, in
+ * hv_start(). Called with the hypervisor lock held, on whichever core it is that has been told.
+ */
+static void hv_leave(void)
+{
+    __atomic_store_n(&hv_leaving, true, __ATOMIC_SEQ_CST);
+
+    /* Those in the guest, and those that wait in EL2 for a WFI of the guest to end (hv_wfi.c) */
+    sysop("dsb ishst");
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (i != smp_id() && hv_started_cpus[i])
+            smp_send_ipi(i);
+    /* The boot core, should the guest have turned it off */
+    sysop("sev");
+}
+
+/*
+ * This core leaves the guest and goes back to where it was let in from, hv_start() or
+ * hv_enter_secondary(): it has been told to, or the guest has turned it off. Called with the
+ * hypervisor lock held, which is let go of. From then on it is not one of the cores the guest
+ * runs on, and can become one again.
+ */
+void hv_leave_guest(void)
+{
+    int cpu = smp_id();
+    u64 count = hv_cpu_entry[cpu].count;
+
+    __atomic_store_n(&hv_started_cpus[cpu], false, __ATOMIC_SEQ_CST);
+
+    /* A core the host wanted to see is not going to get there: nobody is to wait for it */
+    if (hv_want_cpu == cpu)
+        hv_want_cpu = -1;
+    if (hv_pinned_cpu == cpu)
+        hv_pinned_cpu = -1;
+
+    /* Neither the tick nor the timers of the guest are for a core that waits */
+    msr(CNTP_CTL_EL0, 0);
+    msr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0);
+    sysop("isb");
+
+    /* The last one: there is nobody left to turn another one on */
+    if (hv_lead_cpu() < 0)
+        hv_leave();
+    if (!hv_leaving)
+        hv_vgic_cpu_off();
+
+    /* As for the way in, hv_start_secondary(): the guest may do this over and over */
+    if (hv_leaving || !(count & (count - 1)))
+        printf("HV: Exiting from CPU %d\n", cpu);
+
+    spin_unlock(&bhl);
+    hv_exit_guest();
+}
+
+/* spin_lock(&bhl), unless another core has it */
+static bool hv_try_lock(void)
+{
+    s64 nobody = -1;
+
+    if (!__atomic_compare_exchange_n(&bhl.lock, &nobody, (s64)smp_id(), false, __ATOMIC_ACQUIRE,
+                                     __ATOMIC_RELAXED))
+        return false;
+    bhl.count++;
+    return true;
+}
+
+/*
+ * What has made the boot core leave the guest may be PSCI CPU_OFF (hv_cpu_off()): until the guest
+ * is left, it waits for CPU_ON then, as the other cores do in smp_secondary_entry(), and this is
+ * called every time before it sleeps.
+ */
+static bool hv_boot_cpu_waits(void)
+{
+    if (hv_is_leaving())
+        return false;
+
+    /*
+     * AIC tells the boot core of its lines, in the guest or not (R50: SiliconNT
+     * docs/findings/0098), so it goes on taking them for the guest. An IRQ is masked here; the
+     * event stream (hv_wfi.c) is what ends the WFE. There is no maintenance interrupt among them:
+     * the list registers are empty (hv_vgic_cpu_off()).
+     *
+     * It does not wait for the lock: who has it may be waiting for this core, to let it into the
+     * guest. There may be another line as well. So it does not sleep before it has looked again.
+     */
+    if (mrs(ISR_EL1) & ISR_I) {
+        if (hv_try_lock()) {
+            /* Who had the lock may have masked the line since */
+            if ((mrs(ISR_EL1) & ISR_I) && !hv_vgic_handle_irq())
+                hv_panic("HV: CPU %d: an IRQ that is nobody's, the guest has it turned off\n",
+                         smp_id());
+            spin_unlock(&bhl);
+        }
+        sysop("sevl");
+    }
+
+    return true;
+}
+
 void hv_start(void *entry, u64 regs[4])
 {
     if (boot_cpu_idx == -1) {
@@ -430,11 +551,13 @@ void hv_start(void *entry, u64 regs[4])
     hv_vgic_start();
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry, mrs(DAIF) | SPSR_M_EL1H);
 
-    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
-    spin_lock(&bhl);
+    /*
+     * The guest has turned this core off, or it is all over. In the first case this goes on when
+     * it is all over: the guest may have had the core back in the meantime.
+     */
+    smp_boot_cpu_wait(hv_boot_cpu_waits);
 
-    /* Below, a core that is not in the guest is not looked at again: none is to go in now */
-    hv_leaving = true;
+    spin_lock(&bhl);
 
     hv_wdt_stop();
 
@@ -445,20 +568,15 @@ void hv_start(void *entry, u64 regs[4])
     udelay(200000);
     spin_lock(&bhl);
 
-    hv_started_cpus[boot_cpu_idx] = false;
-
     for (int i = 0; i < MAX_CPUS; i++) {
-        if (i == boot_cpu_idx) {
+        /* One that is not in the guest any more may not be back where it waits yet */
+        if (i == boot_cpu_idx || !hv_cpu_entry[i].count)
             continue;
-        }
-        hv_should_exit[i] = true;
-        if (hv_started_cpus[i]) {
+        if (hv_started_cpus[i])
             printf("HV: Waiting for CPU %d to exit\n", i);
-            spin_unlock(&bhl);
-            smp_wait(i);
-            spin_lock(&bhl);
-            hv_started_cpus[i] = false;
-        }
+        spin_unlock(&bhl);
+        smp_wait(i);
+        spin_lock(&bhl);
     }
 
     printf("HV: All CPUs exited\n");
@@ -494,7 +612,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     msr(MDCR_EL2, info->mdcr);
     msr(MDSCR_EL1, info->mdscr);
 
-    hv_vgic_init();
+    hv_vgic_init_cpu();
 
     if (cpu_features->apple_sysregs_unlocked) {
         msr(SYS_IMP_APL_AMX_CTL_EL2, info->amx_ctl);
@@ -533,6 +651,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     /* As on the boot core: no guest vectors. What was there may be m1n1's (src/exception.c). */
     msr(VBAR_EL12, 0);
 
+    hv_exc_init_cpu(cpu);
     hv_xtrack_init_cpu(cpu);
     hv_dbg_init_cpu(cpu);
     hv_pmu_init_cpu(cpu);
@@ -544,24 +663,14 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
 
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);
-
-    hv_arm_tick(true);
 }
 
 static void hv_enter_secondary(void)
 {
     const struct hv_cpu_entry *e = &hv_cpu_entry[smp_id()];
 
+    hv_arm_tick(smp_id() != hv_lead_cpu());
     hv_enter_guest(e->regs[0], e->regs[1], e->regs[2], e->regs[3], e->entry, HV_CPU_ON_SPSR);
-
-    /* Before the lock, as in hv_start(): who has it may wait for this in hv_rendezvous() */
-    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
-    spin_lock(&bhl);
-
-    printf("HV: Exiting from CPU %d\n", smp_id());
-
-    hv_started_cpus[smp_id()] = false;
-    spin_unlock(&bhl);
 }
 
 /*
@@ -573,23 +682,18 @@ bool hv_start_secondary(int cpu, void *entry, u64 regs[4])
 {
     struct hv_cpu_entry *e;
 
-    /*
-     * The boot core has left the guest and makes the others leave it (hv_start()). The one
-     * that asks for another now, whichever that is, leaves on its way back.
-     */
-    if (hv_leaving) {
-        hv_should_exit[smp_id()] = true;
+    /* The guest is being left. This core leaves too, on its way back. */
+    if (hv_leaving)
         return true;
-    }
-
-    /* Not the boot core either: it is not one that waits for smp_call4() */
-    if (!smp_is_alive(cpu)) {
-        printf("HV: CPU %d is not waiting in m1n1, cannot enter the guest on it\n", cpu);
-        return false;
-    }
 
     if (hv_started_cpus[cpu]) {
         printf("HV: CPU %d is in the guest already\n", cpu);
+        return false;
+    }
+
+    /* The boot core gets to where it waits once the guest has turned it off (hv_start()) */
+    if (cpu != boot_cpu_idx && !smp_is_alive(cpu)) {
+        printf("HV: CPU %d is not waiting in m1n1, cannot enter the guest on it\n", cpu);
         return false;
     }
 
@@ -615,11 +719,27 @@ bool hv_start_secondary(int cpu, void *entry, u64 regs[4])
     smp_wait(cpu);
 
     hv_should_exit[cpu] = false;
-    hv_started_cpus[cpu] = true;
+    __atomic_store_n(&hv_started_cpus[cpu], true, __ATOMIC_SEQ_CST);
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);
 
     smp_call0(cpu, hv_enter_secondary);
     return true;
+}
+
+/*
+ * The guest turns this core off: it leaves the guest, with the lock held, and waits in EL2 until
+ * hv_start_secondary() lets it in again. Returns only on the last core the guest runs on, which
+ * stays in it.
+ */
+void hv_cpu_off(struct exc_info *ctx)
+{
+    /* The host is switching to this core: it gets to see it, in this call, before it is gone */
+    hv_maybe_switch_cpu(ctx, START_HV, HV_CPU_SWITCH, NULL);
+
+    if (!hv_leaving && !(hv_get_started_cpus() & ~BIT(smp_id())))
+        return;
+
+    hv_leave_guest();
 }
 
 /* The cores the guest runs on, a bit for each: the host asks, it is not told (P_HV_STARTED_CPUS) */
@@ -639,7 +759,18 @@ void hv_exit_cpu(int cpu)
         cpu = smp_id();
 
     printf("HV: Requesting exit of CPU#%d from the guest\n", cpu);
-    hv_should_exit[cpu] = true;
+    /* The hypervisor ends with the boot core, in the guest or not */
+    if (cpu == boot_cpu_idx)
+        hv_leave();
+    else
+        hv_should_exit[cpu] = true;
+}
+
+/* The host leaves the guest. Called with the hypervisor lock held, on the core it has stopped. */
+void hv_exit_all(void)
+{
+    hv_leave();
+    hv_leave_guest();
 }
 
 void hv_rendezvous(void)
@@ -773,11 +904,24 @@ void hv_arm_tick(bool secondary)
     hv_sprr_timer_arm();
 }
 
+/* The core that has become the one to tick: the next tick may still be far away */
+void hv_take_over_tick(void)
+{
+    s32 left = mrs(CNTP_TVAL_EL0);
+
+    if (left > (s64)hv_tick_interval)
+        hv_arm_tick(false);
+}
+
 void hv_maybe_exit(void)
 {
-    if (hv_should_exit[smp_id()]) {
-        hv_exit_guest();
-    }
+    if (!hv_is_leaving() && !hv_should_exit[smp_id()])
+        return;
+
+    /* Before the lock: who has it may wait for this in hv_rendezvous() */
+    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
+    spin_lock(&bhl);
+    hv_leave_guest();
 }
 
 void hv_tick(struct exc_info *ctx)

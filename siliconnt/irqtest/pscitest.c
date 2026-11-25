@@ -17,8 +17,13 @@
  *
  * Bits 3:0 of the argument choose the call it ends with, see enum last_call.
  *
- * It runs on the boot CPU only, with interrupts masked, and touches neither the GIC nor a
- * timer. It prints on the hypervisor's virtual UART; lines start with "HVLOG: " so that the
+ * Bits 31:16 are a number of times: so often each other CPU is turned on and turns itself off,
+ * and then the boot CPU turns itself off and is turned on by another one. 0: the test stays on
+ * the boot CPU. The other CPUs are those that have a Redistributor, and are off when this
+ * starts; one of them is on at a time (`make qemu-psci-smp`).
+ *
+ * It runs with interrupts masked, and of the GIC and the timer it only reads GICR_TYPER and the
+ * counter. It prints on the hypervisor's virtual UART; lines start with "HVLOG: " so that the
  * hypervisor copies them to its own console. Entry points and vectors are those of sgitest
  * (sgitest-head.S).
  */
@@ -29,19 +34,25 @@
 /* Written by the loader, see sgitest-head.S */
 extern u64 hdr_arg;
 
-#define ARG_LAST   0xf
-#define ARG_STRICT 0x100
+#define ARG_LAST         0xf
+#define ARG_STRICT       0x100
+#define ARG_ROUNDS_SHIFT 16
+#define ARG_ROUNDS_MASK  0xffff
 
 enum last_call {
     LAST_SYSTEM_OFF,
     LAST_SYSTEM_RESET,
     LAST_HVC_1,   // hvc #1 with PSCI_VERSION in x0: not PSCI, the hypervisor must not answer
     LAST_CPU_ON,  // a CPU that is not there. Only under the hypervisor, which must not answer
-    LAST_CPU_OFF, // only under the hypervisor, which cannot do it yet and must not answer
+    LAST_CPU_OFF, // only under the hypervisor, where it is SYSTEM_OFF on the last CPU that is on
     LAST_NONE,
 };
 
 void uart_putc(int c);
+
+/* sgitest-head.S: where the image is, and the word of its header that says where a CPU enters */
+extern char image_start[];
+#define HDR_SECONDARY_OFF 0x20
 
 #define read_sysreg(r)                                                                             \
     ({                                                                                             \
@@ -61,6 +72,7 @@ void uart_putc(int c);
 
 /* 5.2.2, and the fields of MPIDR_EL1 that the target_cpu of CPU_ON has (5.1.4) */
 #define ALREADY_ON     (-4)
+#define ON_PENDING     (-5)
 #define MPIDR_AFFINITY 0xff00ffffffUL
 
 /* The six the kernel takes for granted on PSCI 1.1 (PsciPlatformInfo_v1_1, state 2) */
@@ -317,13 +329,6 @@ void bad_exception(u64 vector)
         ;
 }
 
-void secondary_main(int slot)
-{
-    (void)slot;
-    for (;;)
-        ;
-}
-
 /* ---- the tests ---- */
 
 /* From which register on a call has to leave things alone */
@@ -452,6 +457,211 @@ static void test_strict(void)
     result("the upper halves of x0 and x1 do not count", ok);
 }
 
+/*
+ * ---- CPUs on and off ----
+ *
+ * The MMU is off: every CPU sees what another has written. A CPU that is turned on gets the
+ * context of the call in x0, which sgitest-head.S takes for its slot, that is for which stack it
+ * runs on.
+ */
+
+#define SLOT_OTHER 1 /* the one other CPU that is on */
+#define SLOT_BOOT  2 /* the boot CPU, after it was off */
+
+#define SCTLR_M_C_I ((1 << 0) | (1 << 2) | (1 << 12))
+
+static u32 rounds;     /* how often */
+static u64 boot_mpidr; /* the CPU this started on */
+static u64 other_mpidr, nr_others;
+static u32 boot_rounds;
+static int boot_bad;
+
+/* What the other CPU found when it came: written by it, and the count last */
+static volatile u32 came;
+static volatile u64 came_el, came_sctlr, came_mpidr;
+/* What it is to do before it turns itself off again */
+static volatile u32 wake_boot;
+
+static void barrier(void)
+{
+    asm volatile("dsb sy; isb" : : : "memory");
+}
+
+/* A call that does not look at what becomes of the registers, for any CPU at any time */
+static int psci(u64 fn, u64 arg1, u64 arg2, u64 arg3)
+{
+    register u64 x0 asm("x0") = fn;
+    register u64 x1 asm("x1") = arg1;
+    register u64 x2 asm("x2") = arg2;
+    register u64 x3 asm("x3") = arg3;
+
+    asm volatile("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
+    return (int)x0;
+}
+
+static u64 ms_since(u64 start)
+{
+    barrier();
+    return (read_sysreg(cntvct_el0) - start) / (read_sysreg(cntfrq_el0) / 1000);
+}
+
+/* CPU_ON, over again while the CPU is still on its way out. The answer, as w0 has it */
+static int turn_on(u64 mpidr, u64 slot)
+{
+    u64 entry = (u64)image_start + *(u64 *)(image_start + HDR_SECONDARY_OFF);
+    u64 start = read_sysreg(cntvct_el0);
+    int ret;
+
+    barrier();
+    do {
+        ret = psci(FN_CPU_ON, mpidr, entry, slot);
+    } while ((ret == ALREADY_ON || ret == ON_PENDING) && ms_since(start) < 1000);
+    return ret;
+}
+
+static int came_again(u32 before)
+{
+    u64 start = read_sysreg(cntvct_el0);
+
+    while (came == before)
+        if (ms_since(start) >= 1000)
+            return 0;
+    barrier();
+    return 1;
+}
+
+/* At EL1, with the MMU and the caches off */
+static int state_ok(u64 el, u64 sctlr)
+{
+    return ((el >> 2) & 3) == 1 && !(sctlr & SCTLR_M_C_I);
+}
+
+static void on_off(u64 mpidr)
+{
+    u32 n, done = 0;
+    int ret = 0, bad = 0;
+
+    wake_boot = 0;
+    for (n = 0; n < rounds; n++) {
+        u32 before = came;
+
+        ret = turn_on(mpidr, SLOT_OTHER);
+        if (ret || !came_again(before))
+            break;
+        if (came != before + 1 || came_mpidr != mpidr || !state_ok(came_el, came_sctlr))
+            bad++;
+        done++;
+    }
+
+    result("a CPU was turned on, and turned itself off", done == rounds && !bad);
+    line("     MPIDR ");
+    put_hex(mpidr, 10);
+    put(": ");
+    put_dec(done);
+    put(" of ");
+    put_dec(rounds);
+    put(" times, ");
+    put_dec(bad);
+    put(" wrong; the last answer ");
+    put_hex((u32)ret, 8);
+    put("\n");
+}
+
+/* Each CPU that has a Redistributor, but this one. Afterwards none of them is on */
+static void test_on_off(void)
+{
+    u64 gicr = hdr_gicr_base, typer;
+
+    do {
+        u64 mpidr;
+
+        typer = rd64(gicr + GICR_TYPER);
+        mpidr = ((typer >> 56) << 32) | ((typer >> 32) & 0xffffff);
+        if (mpidr != boot_mpidr) {
+            on_off(mpidr);
+            other_mpidr = mpidr;
+            nr_others++;
+        }
+        gicr += GICR_STRIDE;
+    } while (!(typer & (1 << 4))); /* Last */
+}
+
+static void finish(void);
+
+static void boot_off_result(int ok)
+{
+    result("the boot CPU turned itself off, and was turned on", ok);
+    line("     ");
+    put_dec(boot_rounds);
+    put(" of ");
+    put_dec(rounds);
+    put(" times, ");
+    put_dec(boot_bad);
+    put(" wrong\n");
+    finish();
+}
+
+/*
+ * The boot CPU turns itself off, and the other one turns it on. It goes on in secondary_main(),
+ * on the stack of another slot.
+ */
+static void boot_off(void)
+{
+    u32 before = came;
+
+    wake_boot = 1;
+    if (turn_on(other_mpidr, SLOT_OTHER) || !came_again(before)) {
+        boot_off_result(0);
+        return;
+    }
+    psci(FN_CPU_OFF, 0, 0, 0);
+    line("FAIL CPU_OFF of the boot CPU came back\n");
+    nr_fail++;
+    finish();
+}
+
+static void boot_back(void)
+{
+    boot_rounds++;
+    if ((read_sysreg(mpidr_el1) & MPIDR_AFFINITY) != boot_mpidr ||
+        !state_ok(read_sysreg(CurrentEL), read_sysreg(sctlr_el1)))
+        boot_bad++;
+    if (boot_rounds < rounds)
+        boot_off();
+    else
+        boot_off_result(!boot_bad);
+}
+
+void secondary_main(int slot)
+{
+    int ret;
+
+    if (slot == SLOT_BOOT) {
+        boot_back();
+        return;
+    }
+
+    came_el = read_sysreg(CurrentEL);
+    came_sctlr = read_sysreg(sctlr_el1);
+    came_mpidr = read_sysreg(mpidr_el1) & MPIDR_AFFINITY;
+    barrier();
+    came = came + 1;
+    barrier();
+
+    if (wake_boot) {
+        ret = turn_on(boot_mpidr, SLOT_BOOT);
+        if (ret) {
+            line("FAIL the boot CPU could not be turned on: ");
+            put_hex((u32)ret, 8);
+            put("\n");
+            return;
+        }
+    }
+
+    psci(FN_CPU_OFF, 0, 0, 0);
+    line("FAIL CPU_OFF came back\n");
+}
+
 /* A call that must not come back. If it does, say so */
 static void last_call(void)
 {
@@ -511,12 +721,26 @@ static void last_call(void)
     put("\n");
 }
 
+/* Whatever was tried, at the end of it */
+static void finish(void)
+{
+    line("DONE pass fail = ");
+    put_dec(nr_pass);
+    put(" ");
+    put_dec(nr_fail);
+    put("\n");
+
+    last_call();
+}
+
 void boot_main(void)
 {
     strict = !!(hdr_arg & ARG_STRICT);
+    rounds = (hdr_arg >> ARG_ROUNDS_SHIFT) & ARG_ROUNDS_MASK;
+    boot_mpidr = read_sysreg(mpidr_el1) & MPIDR_AFFINITY;
 
     line("start, arg=");
-    put_hex(hdr_arg, 4);
+    put_hex(hdr_arg, 8);
     put(strict ? ", expecting the hypervisor's answers\n" : ", expecting any PSCI\n");
     line("CurrentEL = ");
     put_dec((read_sysreg(CurrentEL) >> 2) & 3);
@@ -527,12 +751,11 @@ void boot_main(void)
     test_cpu_on();
     if (strict)
         test_strict();
+    if (rounds)
+        test_on_off();
 
-    line("DONE pass fail = ");
-    put_dec(nr_pass);
-    put(" ");
-    put_dec(nr_fail);
-    put("\n");
-
-    last_call();
+    if (nr_others)
+        boot_off(); /* goes on elsewhere */
+    else
+        finish();
 }

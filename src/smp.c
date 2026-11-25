@@ -80,6 +80,19 @@ extern u8 _stack_bot[0];
 int boot_cpu_idx SMP_SHARED = -1;
 u64 boot_cpu_mpidr SMP_SHARED = 0;
 
+/* What another CPU has left for this one to do, smp_call4() */
+static void smp_take_call(struct spin_table *me, u64 target)
+{
+    sysop("dmb sy");
+    me->flag++;
+    sysop("dmb sy");
+    me->retval = ((u64 (*)(u64 a, u64 b, u64 c, u64 d))target)(me->args[0], me->args[1],
+                                                               me->args[2], me->args[3]);
+    sysop("dmb sy");
+    me->target = 0;
+    sysop("dmb sy");
+}
+
 void smp_secondary_entry(void)
 {
     u64 mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
@@ -133,15 +146,35 @@ void smp_secondary_entry(void)
             }
             sysop("isb");
         }
-        sysop("dmb sy");
-        me->flag++;
-        sysop("dmb sy");
-        me->retval = ((u64 (*)(u64 a, u64 b, u64 c, u64 d))target)(me->args[0], me->args[1],
-                                                                   me->args[2], me->args[3]);
-        sysop("dmb sy");
-        me->target = 0;
-        sysop("dmb sy");
+        smp_take_call(me, target);
     }
+}
+
+/*
+ * The boot CPU waits for the others to call something on it, as they do above, for as long as
+ * more() says so, which is asked before it sleeps and after each call. In the meantime it is one
+ * of the CPUs that smp_is_alive(), smp_call4() and smp_wait() are for. Whoever ends this, so that
+ * more() says no, has to see to it that nobody calls anything any more, and send an event.
+ */
+void smp_boot_cpu_wait(bool (*more)(void))
+{
+    struct spin_table *me = &spin_table[boot_cpu_idx];
+    u64 target;
+
+    me->flag = 1;
+    sysop("dsb sy");
+
+    while (more()) {
+        target = me->target;
+        if (target)
+            smp_take_call(me, target);
+        else
+            sysop("wfe");
+        sysop("isb");
+    }
+
+    me->flag = 0;
+    sysop("dsb sy");
 }
 
 void smp_secondary_prep_el3(void)
@@ -545,7 +578,8 @@ void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 
     struct spin_table *target = &spin_table[cpu];
 
-    if (cpu == boot_cpu_idx)
+    /* Unless it is in smp_boot_cpu_wait() */
+    if (cpu == boot_cpu_idx && !target->flag)
         return;
 
     u64 flag = target->flag;

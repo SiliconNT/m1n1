@@ -10,7 +10,8 @@
  * host that wait never ends. Both call hv_stop_if_no_host() first. With a host it returns,
  * and everything goes on as before; without one the guest does not run again:
  *
- *  - PSCI SYSTEM_RESET restarts the machine, and SYSTEM_OFF powers it off (hv_power.c);
+ *  - PSCI SYSTEM_RESET restarts the machine, and SYSTEM_OFF, or CPU_OFF on the last core of the
+ *    guest, powers it off (hv_power.c);
  *  - everything else, and a restart or power off that did not happen, leaves the machine
  *    showing what m1n1 printed last and the registers of the guest on the screen, with every
  *    core in EL2, until its owner holds the power button. It does not restart by itself:
@@ -65,7 +66,7 @@ static const char *hv_stop_what(uartproxy_boot_reason_t reason, u32 type)
             case HV_GUEST_RESET:
                 return "the guest called PSCI SYSTEM_RESET";
             case HV_GUEST_OFF:
-                return "the guest called PSCI SYSTEM_OFF";
+                return "the guest called PSCI SYSTEM_OFF, or CPU_OFF on its last core";
             case HV_GUEST_HVC:
                 return "the guest made a call that the hypervisor cannot carry out";
             case HV_PANIC:

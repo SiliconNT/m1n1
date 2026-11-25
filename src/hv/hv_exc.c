@@ -29,7 +29,6 @@ struct hv_pcpu_data {
 
 struct hv_pcpu_data pcpu[MAX_CPUS];
 
-void hv_exit_guest(void) __attribute__((noreturn));
 void hv_gexit(void);
 
 static u64 stolen_time = 0;
@@ -47,6 +46,10 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
     int from_el = FIELD_GET(SPSR_M, ctx->spsr) >> 2;
 
     hv_wdt_breadcrumb('P');
+
+    /* The host is leaving the guest, on another CPU: it is not there to be told of this */
+    if (hv_is_leaving())
+        hv_leave_guest(); // does not return
 
     /*
      * Get all the CPUs into the HV before running the proxy, to make sure they all exit to
@@ -85,8 +88,7 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
             break;
         case EXC_EXIT_GUEST:
             hv_rendezvous();
-            spin_unlock(&bhl);
-            hv_exit_guest(); // does not return
+            hv_exit_all(); // does not return
         default:
             printf("Guest exception not handled, rebooting.\n");
             print_regs(ctx->regs, 0);
@@ -94,8 +96,8 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
     }
 }
 
-static void hv_maybe_switch_cpu(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type,
-                                void *extra)
+void hv_maybe_switch_cpu(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type,
+                         void *extra)
 {
     while (hv_want_cpu != -1) {
         if (hv_want_cpu == smp_id()) {
@@ -139,6 +141,16 @@ void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type
      * to the guest.
      */
     hv_maybe_switch_cpu(ctx, reason, type, extra);
+}
+
+/*
+ * On a core that is about to be let into the guest, every time: nothing is pending for it, and
+ * the registers that are kept here read as after a reset. PMCR0 is behind one of them.
+ */
+void hv_exc_init_cpu(int cpu)
+{
+    pcpu[cpu] = (struct hv_pcpu_data){0};
+    reg_clr(SYS_IMP_APL_PMCR0, PMCR0_IACT | PMCR0_IMODE_MASK);
 }
 
 void hv_set_time_stealing(bool enabled, bool reset)
@@ -736,6 +748,12 @@ void hv_exc_irq(struct exc_info *ctx)
     hv_wdt_breadcrumb('i');
 }
 
+/* The CPU that polls for HV events */
+static int hv_interruptible_cpu(void)
+{
+    return hv_pinned_cpu != -1 ? hv_pinned_cpu : hv_lead_cpu();
+}
+
 void hv_exc_fiq(struct exc_info *ctx)
 {
     bool tick = false;
@@ -747,11 +765,7 @@ void hv_exc_fiq(struct exc_info *ctx)
         tick = true;
     }
 
-    int interruptible_cpu = hv_pinned_cpu;
-    if (interruptible_cpu == -1)
-        interruptible_cpu = boot_cpu_idx;
-
-    if (smp_id() != interruptible_cpu && !(mrs(ISR_EL1) & 0x40) && hv_want_cpu == -1) {
+    if (smp_id() != hv_interruptible_cpu() && !(mrs(ISR_EL1) & 0x40) && hv_want_cpu == -1) {
         // Non-interruptible CPU and it was just a timer tick (or spurious), so just update FIQs
         hv_update_fiq();
         hv_arm_tick(true);
@@ -763,14 +777,17 @@ void hv_exc_fiq(struct exc_info *ctx)
     hv_get_context(ctx);
     hv_exc_entry();
 
-    // Only poll for HV events in the interruptible CPU
-    if (tick) {
-        if (smp_id() == interruptible_cpu) {
+    // Only poll for HV events in the interruptible CPU. Asked with the lock held: the one that was
+    // may have been turned off while this one waited for it, and its IPI is acknowledged below
+    if (smp_id() == hv_interruptible_cpu()) {
+        if (tick) {
             hv_tick(ctx);
             hv_arm_tick(false);
         } else {
-            hv_arm_tick(true);
+            hv_take_over_tick();
         }
+    } else if (tick) {
+        hv_arm_tick(true);
     }
 
     if (mrs(CNTV_CTL_EL0) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {

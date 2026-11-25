@@ -50,6 +50,7 @@ struct core {
     atomic_int ipi; /* the Apple IPI: stays pending until acknowledged */
     bool masked;
     u32 pmr;        /* ICC_PMR_EL1: only priorities below this are taken */
+    u64 ich_hcr;    /* ICH_HCR_EL2 */
     bool timer;     /* the output of the guest's virtual timer */
     bool timer_fiq; /* ...raises a FIQ when high: VM_TMR_FIQ_ENA_EL2, see hv_update_fiq() */
     atomic_uint count[NR_INTIDS];
@@ -64,6 +65,27 @@ static __thread int cur;
 
 bool hv_started_cpus[MAX_CPUS];
 int boot_cpu_idx = 6;
+
+static bool is_started(int cpu)
+{
+    return __atomic_load_n(&hv_started_cpus[cpu], __ATOMIC_SEQ_CST);
+}
+
+static void set_started(int cpu, bool on)
+{
+    __atomic_store_n(&hv_started_cpus[cpu], on, __ATOMIC_SEQ_CST);
+}
+
+/* src/hv/hv.c */
+int hv_lead_cpu(void)
+{
+    if (is_started(boot_cpu_idx))
+        return boot_cpu_idx;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        if (is_started(cpu))
+            return cpu;
+    return -1;
+}
 
 /* ---- AIC: two dies of 2048 lines, 4096 apart, as die * max_irq + line ---- */
 
@@ -109,9 +131,14 @@ static void aic_op(enum aic_op op, u32 val)
     }
 }
 
-/* A physical IRQ is pending */
+/* The one core that AIC tells of its lines, as the M4 does (R50); -1: whichever looks first */
+static int aic_told = -1;
+
+/* A physical IRQ is pending, on the core that looks */
 static bool aic_irq(void)
 {
+    if (aic_told >= 0 && aic_told != cur)
+        return false;
     return atomic_load(&aic_on) && atomic_load(&lines_ready);
 }
 
@@ -339,6 +366,8 @@ void mock_msr(int reg, u64 val)
 {
     if (lr_index(reg) >= 0)
         cores[cur].lr[lr_index(reg)] = val;
+    else if (reg == SYS_ICH_HCR_EL2)
+        cores[cur].ich_hcr = val;
     else if (reg == CNTHCTL_EL2)
         cnthctl = val;
 }
@@ -636,14 +665,18 @@ static void reset_raw(int lrs)
         cores[i].pmr = 0x100;
         cores[i].timer_fiq = true;
     }
+    /* hv_init() on the boot core, and hv_start_secondary() for the others */
     for (int i = 0; i < NR_STARTED; i++) {
         cur = started[i];
-        hv_vgic_init();
-        hv_started_cpus[started[i]] = true;
+        if (cur == boot_cpu_idx)
+            hv_vgic_init();
+        else
+            hv_vgic_init_cpu();
+        set_started(cur, true);
     }
     /* A core the guest is not on, but which has an affinity: must never be a target */
     cur = 8;
-    hv_vgic_init();
+    hv_vgic_init_cpu();
     CHECK(nr_hooks == 2);
 }
 
@@ -2135,6 +2168,538 @@ static void stress(int lrs, int n, bool spis)
     hv_vgic_report();
 }
 
+/*
+ * ---- the guest turns cores off and on ----
+ */
+
+/* PSCI CPU_OFF on this core: hv_cpu_off() and hv_leave_guest() of src/hv/hv.c */
+static void guest_cpu_off(int cpu)
+{
+    cur = cpu;
+    pthread_mutex_lock(&bhl);
+    set_started(cpu, false);
+    hv_vgic_cpu_off();
+    pthread_mutex_unlock(&bhl);
+    for (int i = 0; i < nr_lr; i++)
+        CHECK(!cores[cpu].lr[i]);
+    CHECK(!cores[cpu].ich_hcr);
+}
+
+/* PSCI CPU_ON of a core, by another one: hv_start_secondary() */
+static void guest_cpu_on(int cpu)
+{
+    cur = cpu;
+    pthread_mutex_lock(&bhl);
+    hv_vgic_init_cpu();
+    set_started(cpu, true);
+    pthread_mutex_unlock(&bhl);
+    CHECK(cores[cpu].ich_hcr == ICH_HCR_EN);
+}
+
+/* What the boot core does about an IRQ while the guest has it turned off: hv_boot_cpu_waits() */
+static bool boot_takes_irq(void)
+{
+    bool irq;
+
+    cur = boot_cpu_idx;
+    irq = mock_mrs(ISR_EL1) & ISR_I;
+    if (irq) {
+        pthread_mutex_lock(&bhl);
+        CHECK(hv_vgic_handle_irq());
+        pthread_mutex_unlock(&bhl);
+    }
+    /* The virtual CPU interface is as hv_vgic_cpu_off() has left it: off, and empty */
+    for (int i = 0; i < nr_lr; i++)
+        CHECK(!cores[cur].lr[i]);
+    CHECK(!cores[cur].ich_hcr);
+    return irq;
+}
+
+static void off_expect(const char *what, u32 intid, int c6, int c0, int c7, int c1)
+{
+    int want[] = {c6, c0, c7, c1};
+
+    for (int round = 0; round < 3; round++)
+        for (int i = 0; i < NR_STARTED; i++)
+            if (is_started(started[i]))
+                settle(started[i]);
+    for (int i = 0; i < NR_STARTED; i++)
+        if ((int)taken(started[i], intid) != want[i]) {
+            printf("FAIL %s: cpu %d intid %u got %u want %d\n", what, started[i], intid,
+                   taken(started[i], intid), want[i]);
+            exit(1);
+        }
+    printf("ok   %s\n", what);
+}
+
+/* How many list registers of this core hold something the guest has ended and not told yet */
+static int nr_ended(int cpu)
+{
+    return __builtin_popcountl(eisr(&cores[cpu]));
+}
+
+static void off_tests(void)
+{
+    u32 was;
+
+    /* An AIC line that waits in a list register of core 0, and the guest moves it to core 7 */
+    aic_reset(true, 8);
+    device(33, LINE_B, 1);
+    cur = 6;
+    windows_enable_spi(33, 0x80, 0, false);
+    cores[0].masked = true;
+    line_raise(LINE_B, true);
+    settle(6);
+    settle(0);
+    CHECK(lr_of(0, 33) && line_masked[LINE_B]);
+    cur = 6;
+    wr64(GICD(GICD_IROUTER + 8 * 33), aff_of(7));
+    guest_cpu_off(0);
+    off_expect("off: a line in a list register goes to the core it is routed to by then", 33, 0, 0,
+               1, 0);
+    CHECK(!line_masked[LINE_B]);
+    /* ...and it comes again, on that core */
+    device(33, LINE_B, 1);
+    line_raise(LINE_B, true);
+    off_expect("off: ...and comes again there", 33, 0, 0, 2, 0);
+
+    /* Still routed to the core that is off: it waits, and comes when the guest moves it */
+    cores[0].masked = false;
+    guest_cpu_on(0);
+    cur = 6;
+    wr64(GICD(GICD_IROUTER + 8 * 33), aff_of(0));
+    settle_all();
+    cores[0].masked = true;
+    device(33, LINE_B, 1);
+    line_raise(LINE_B, true);
+    settle(6);
+    settle(0);
+    CHECK(lr_of(0, 33));
+    guest_cpu_off(0);
+    off_expect("off: a line that is still routed to the core waits", 33, 0, 0, 2, 0);
+    cur = 6;
+    CHECK(spi_pending(33) && line_masked[LINE_B]);
+    wr64(GICD(GICD_IROUTER + 8 * 33), aff_of(1));
+    off_expect("off: ...until it is moved", 33, 0, 0, 2, 1);
+    CHECK(!line_masked[LINE_B]);
+
+    /* ...or for the core to come back */
+    cores[0].masked = false;
+    guest_cpu_on(0);
+    cur = 6;
+    wr64(GICD(GICD_IROUTER + 8 * 33), aff_of(0));
+    settle_all();
+    guest_cpu_off(0);
+    device(33, LINE_B, 1);
+    line_raise(LINE_B, true);
+    off_expect("off: a line for a core that is off waits", 33, 0, 0, 2, 1);
+    guest_cpu_on(0);
+    CHECK(!lr_of(0, 33)); /* in nobody's list register: the first return to the guest looks */
+    cur = 0;
+    hv_exit();
+    CHECK(lr_of(0, 33));
+    off_expect("off: ...and is there when it is on again", 33, 0, 1, 2, 1);
+    CHECK(!line_masked[LINE_B]);
+
+    /* The guest has taken it and not ended it: it counts as ended, and the line is not lost */
+    cur = 6;
+    wr64(GICD(GICD_IROUTER + 8 * 33), aff_of(0));
+    settle_all();
+    device(33, LINE_B, 1);
+    line_raise(LINE_B, true);
+    settle(6);
+    cur = 0;
+    CHECK(physical_interrupt() && guest_ack() == 33);
+    CHECK(line_masked[LINE_B]);
+    cur = 6;
+    wr64(GICD(GICD_IROUTER + 8 * 33), aff_of(7));
+    settle(6);
+    settle(7);
+    guest_cpu_off(0);
+    off_expect("off: one that was not ended counts as ended, and comes again", 33, 0, 1, 3, 1);
+    CHECK(!line_masked[LINE_B]);
+
+    /* Ended, with the maintenance interrupt still to come */
+    guest_cpu_on(0);
+    cur = 6;
+    wr64(GICD(GICD_IROUTER + 8 * 33), aff_of(0));
+    settle_all();
+    device(33, LINE_B, 1);
+    line_raise(LINE_B, true);
+    settle(6);
+    cur = 0;
+    CHECK(physical_interrupt() && guest_irq() == 33);
+    CHECK(nr_ended(0) == 1 && line_masked[LINE_B] && !line_high[LINE_B]);
+    guest_cpu_off(0);
+    CHECK(!line_masked[LINE_B]);
+    cur = 6;
+    CHECK(!spi_pending(33));
+    off_expect("off: one that was ended, but for the maintenance interrupt", 33, 0, 2, 3, 1);
+
+    /* Taken, and pending again: what is pending goes on */
+    guest_cpu_on(0);
+    cur = 6;
+    windows_enable_spi(104, 0x80, 0, true);
+    settle_all();
+    cur = 6;
+    windows_request_spi(104);
+    cur = 0;
+    CHECK(physical_interrupt() && guest_ack() == 104);
+    cur = 6;
+    windows_request_spi(104);
+    cur = 0;
+    CHECK(physical_interrupt());
+    CHECK(FIELD_GET(ICH_LR_STATE, lr_of(0, 104)) ==
+          (ICH_LR_STATE_PENDING | ICH_LR_STATE_ACTIVE));
+    cur = 6;
+    wr64(GICD(GICD_IROUTER + 8 * 104), aff_of(1));
+    settle(1);
+    guest_cpu_off(0);
+    off_expect("off: active and pending: the second one arrives elsewhere", 104, 0, 0, 0, 1);
+
+    /* SGIs and the timer are gone with the core, and it starts with none */
+    guest_cpu_on(0);
+    settle_all();
+    cores[0].masked = true;
+    cores[0].timer = true;
+    was = taken(0, 3);
+    cur = 6;
+    guest_send(sgi_to(0, 3));
+    settle(0);
+    cur = 0;
+    hv_exit();
+    CHECK(lr_of(0, 3) && lr_of(0, HV_VGIC_INTID_VTIMER));
+    cur = 6;
+    for (u32 i = 0; i < NR_SGIS; i++) /* more than there are list registers */
+        guest_send(sgi_to(0, i));
+    settle(0);
+    guest_cpu_off(0);
+    cores[0].timer = false;
+    cores[0].masked = false;
+    /* Nobody sends to it, or calls it, while it is off */
+    atomic_store(&cores[0].ipi, 0);
+    cur = 6;
+    guest_send(sgi_to(0, 3));
+    guest_send(BIT(40) | (4UL << 24));
+    wr32(GICD(GICD_ISENABLER + 4 * 3), BIT(9));
+    wr32(GICR(0, GICR_ICENABLER0), BIT(9));
+    wr32(GICR(0, GICR_ISENABLER0), BIT(9));
+    CHECK(!atomic_load(&cores[0].ipi));
+    guest_cpu_on(0);
+    settle(0);
+    CHECK(taken(0, 3) == was && !taken(0, HV_VGIC_INTID_VTIMER) && nr_valid_lrs(0) == 0);
+    cur = 6;
+    guest_send(sgi_to(0, 3));
+    settle(0);
+    CHECK(taken(0, 3) == was + 1);
+    printf("ok   off: SGIs and the timer do not outlast it\n");
+
+    /* An SPI that any core may take goes to the boot core, and without that to the first */
+    aic_reset(true, 1);
+    cur = 6;
+    for (u32 i = 104; i < 108; i++) {
+        windows_enable_spi(i, 0x80, 6, true);
+        wr64(GICD(GICD_IROUTER + 8 * i), BIT(31));
+    }
+    settle_all();
+    cur = 6;
+    windows_request_spi(104);
+    off_expect("off: an SPI for any core goes to the boot core", 104, 1, 0, 0, 0);
+    /* Four that wait for the only list register, which has something else in it */
+    cores[6].masked = true;
+    cur = 6;
+    guest_send(sgi_to(6, 1));
+    for (u32 i = 104; i < 108; i++)
+        windows_request_spi(i);
+    settle(6);
+    CHECK(nr_valid_lrs(6) == 1 && lr_of(6, 1));
+    for (int i = 1; i < NR_STARTED; i++) {
+        settle(started[i]);
+        CHECK(!atomic_load(&cores[started[i]].ipi) && nr_valid_lrs(started[i]) == 0);
+    }
+    guest_cpu_off(6);
+    CHECK(atomic_load(&cores[0].ipi)); /* the tick too, hv_exc_fiq() */
+    CHECK(!atomic_load(&cores[7].ipi) && !atomic_load(&cores[1].ipi));
+    off_expect("off: ...and when that is off to the first one", 104, 1, 1, 0, 0);
+    for (u32 i = 105; i < 108; i++)
+        CHECK(taken(0, i) == 1);
+    /* The boot core is on again: those that come from then on are its */
+    cores[6].masked = false;
+    guest_cpu_on(6);
+    cur = 7;
+    windows_request_spi(105);
+    off_expect("off: ...and to the boot core once that is on again", 105, 1, 1, 0, 0);
+    /* Two off: the next one. This one was in a list register of each of them */
+    cores[6].masked = cores[0].masked = true;
+    cur = 7;
+    windows_request_spi(106);
+    settle(6);
+    CHECK(lr_of(6, 106));
+    guest_cpu_off(6);
+    settle(0);
+    CHECK(lr_of(0, 106));
+    guest_cpu_off(0);
+    off_expect("off: ...and to the next one if the first is off as well", 106, 0, 1, 0, 1);
+    cores[6].masked = cores[0].masked = false;
+    guest_cpu_on(0);
+    guest_cpu_on(6);
+
+    /* AIC has told this core of a line, and nobody else */
+    aic_reset(true, 8);
+    device(35, LINE_D, 1);
+    cur = 6;
+    windows_enable_spi(35, 0x80, 7, false);
+    settle_all();
+    line_raise(LINE_D, true);
+    guest_cpu_off(0);
+    CHECK(line_masked[LINE_D]); /* its event has been read */
+    off_expect("off: a line that AIC has told the core of is forwarded first", 35, 0, 0, 1, 0);
+    CHECK(aic_events(0).forwarded == 1);
+
+    /* The boot core is off, and goes on taking the lines for the guest */
+    guest_cpu_on(0);
+    settle_all();
+    guest_cpu_off(6);
+    CHECK(!boot_takes_irq());
+    for (int n = 0; n < 5; n++) {
+        device(35, LINE_D, 1);
+        line_raise(LINE_D, true);
+        CHECK(boot_takes_irq());
+        CHECK(!boot_takes_irq());
+        CHECK(atomic_load(&cores[7].ipi));
+        settle(7);
+    }
+    off_expect("off: the boot core takes the lines of the others while it is off", 35, 0, 0, 6, 0);
+    CHECK(!line_masked[LINE_D] && nr_valid_lrs(6) == 0);
+    CHECK(aic_events(6).forwarded == 5);
+    /* One that is routed to the boot core waits for it */
+    device(32, LINE_A, 1);
+    cur = 7;
+    windows_enable_spi(32, 0x80, 6, false);
+    line_raise(LINE_A, true);
+    CHECK(boot_takes_irq());
+    off_expect("off: a line for the boot core waits for it", 32, 0, 0, 0, 0);
+    guest_cpu_on(6);
+    cur = 6;
+    hv_exit();
+    off_expect("off: ...and is there when it is on again", 32, 1, 0, 0, 0);
+
+    /* What the guest has set up for itself is there after CPU_ON of the boot core as well */
+    cur = 0;
+    CHECK(rd32(GICD(GICD_CTLR)) & 2);
+    CHECK(rd32(GICR(6, GICR_ISENABLER0)) == (0xffff | BIT(HV_VGIC_INTID_VTIMER)));
+    CHECK(rd32(GICD(GICD_ISENABLER + 4)) & BIT(0));
+    CHECK(nr_hooks == 2);
+    cur = 0;
+    guest_send(sgi_to(6, 5));
+    off_expect("off: nothing the guest has set up is lost", 5, 1, 0, 0, 0);
+
+    guest_handler = NULL;
+}
+
+/*
+ * Cores 6 and 0 are turned on and off over and over, and 7 and 1 make SPIs that any core may
+ * take pending, and have the lines of AIC raised: each arrives once, wherever it is taken, and
+ * none is lost on the way.
+ */
+static struct {
+    atomic_int on;    /* CPU_ON: the core is to come */
+    atomic_int came;  /* ...and has */
+    u64 times;        /* it was turned off so often */
+} toggled[MAX_CPUS];
+static atomic_int toggling_over;
+static u64 off_sent[MAX_CPUS];
+
+/* The lines of the table: the device lets go of the line */
+static void off_handler(u32 intid)
+{
+    if (intid >= 32 && intid < 34)
+        line_raise(table_lines[intid - 32], false);
+}
+
+static bool line_is_high(u32 line)
+{
+    bool high;
+
+    pthread_mutex_lock(&bhl);
+    high = line_high[line];
+    pthread_mutex_unlock(&bhl);
+    return high;
+}
+
+static u32 taken_anywhere(u32 intid)
+{
+    u32 n = 0;
+
+    for (int i = 0; i < NR_STARTED; i++)
+        n += taken(started[i], intid);
+    return n;
+}
+
+static void *toggled_thread(void *arg)
+{
+    int cpu = (long)arg;
+    unsigned seed = 99 + cpu;
+
+    cur = cpu;
+    while (!atomic_load(&failed)) {
+        /* In the guest for a while */
+        for (int n = rand_r(&seed) % 60; n; n--)
+            serve();
+        if (atomic_load(&toggling_over)) {
+            if (!is_started(cpu))
+                break;
+            serve();
+            if (atomic_load(&done_threads) == 2)
+                return NULL;
+            continue;
+        }
+        /* ...and off, until another core turns it on */
+        guest_cpu_off(cpu);
+        toggled[cpu].times++;
+        while (!atomic_load(&toggled[cpu].on)) {
+            if (cpu == boot_cpu_idx && pthread_mutex_trylock(&bhl) == 0) {
+                if (mock_mrs(ISR_EL1) & ISR_I)
+                    CHECK(hv_vgic_handle_irq());
+                pthread_mutex_unlock(&bhl);
+            }
+            sched_yield();
+            if (atomic_load(&failed))
+                return NULL;
+        }
+        /* The caller has the lock: hv_init_secondary() */
+        atomic_store(&toggled[cpu].on, 0);
+        hv_vgic_init_cpu();
+        atomic_store(&toggled[cpu].came, 1);
+        while (!is_started(cpu))
+            sched_yield();
+    }
+    return NULL;
+}
+
+static void toggle_on(int cpu)
+{
+    pthread_mutex_lock(&bhl);
+    if (!is_started(cpu)) {
+        atomic_store(&toggled[cpu].came, 0);
+        atomic_store(&toggled[cpu].on, 1);
+        while (!atomic_load(&toggled[cpu].came))
+            sched_yield();
+        set_started(cpu, true);
+    }
+    pthread_mutex_unlock(&bhl);
+}
+
+static void *sender_thread(void *arg)
+{
+    int slot = (long)arg; /* 2 or 3 of started[]: cores 7 and 1 */
+    unsigned seed = 7 + slot;
+
+    cur = started[slot];
+    for (int round = 0; round < rounds && !atomic_load(&failed); round++) {
+        u32 intid = 64 + 32 * slot + rand_r(&seed) % 4;
+        bool line = rand_r(&seed) % 4 == 0;
+        u32 before, spins = 0;
+        double start = seconds();
+
+        if (line)
+            intid = 32 + (slot - 2); /* a line of its own */
+        before = taken_anywhere(intid);
+        if (line)
+            line_raise(table_lines[intid - 32], true);
+        else
+            windows_request_spi(intid);
+        off_sent[cur]++;
+        while (taken_anywhere(intid) == before) {
+            serve();
+            if (rand_r(&seed) % 64 == 0)
+                toggle_on(rand_r(&seed) % 2 ? 6 : 0);
+            if (!(++spins & 0xffff) && seconds() - start > 20) {
+                printf("FAIL off stress: SPI %u of cpu %d is lost (on: %d %d)\n", intid, cur,
+                       is_started(6), is_started(0));
+                atomic_store(&failed, 1);
+                return NULL;
+            }
+        }
+        /* Whoever has it lets go of the line before it ends it */
+        while (line && line_is_high(table_lines[intid - 32]))
+            serve();
+        for (int n = rand_r(&seed) % 8; n; n--)
+            serve();
+        if (taken_anywhere(intid) != before + 1) {
+            printf("FAIL off stress: SPI %u was taken %u times\n", intid,
+                   taken_anywhere(intid) - before);
+            atomic_store(&failed, 1);
+        }
+        if (rand_r(&seed) % 8 == 0)
+            toggle_on(rand_r(&seed) % 2 ? 6 : 0);
+    }
+
+    /* The two others are on at the end */
+    atomic_store(&toggling_over, 1);
+    toggle_on(6);
+    toggle_on(0);
+    atomic_fetch_add(&done_threads, 1);
+    while (atomic_load(&done_threads) < 2 && !atomic_load(&failed)) {
+        serve();
+        toggle_on(6);
+        toggle_on(0);
+    }
+    return NULL;
+}
+
+static void off_stress(int lrs, int n)
+{
+    pthread_t threads[NR_STARTED];
+    u64 sent_total = 0, taken_total = 0;
+
+    aic_reset(true, lrs);
+    memset(toggled, 0, sizeof(toggled));
+    memset(off_sent, 0, sizeof(off_sent));
+    atomic_store(&done_threads, 0);
+    atomic_store(&toggling_over, 0);
+    rounds = n;
+    guest_handler = off_handler;
+    aic_told = boot_cpu_idx;
+    cur = 6;
+    for (int slot = 2; slot < NR_STARTED; slot++)
+        for (u32 i = 0; i < 4; i++) {
+            windows_enable_spi(64 + 32 * slot + i, 0x40 + 0x10 * i, 6, true);
+            wr64(GICD(GICD_IROUTER + 8 * (64 + 32 * slot + i)), BIT(31));
+        }
+    for (u32 i = 32; i < 34; i++) {
+        windows_enable_spi(i, 0x80, 6, false);
+        wr64(GICD(GICD_IROUTER + 8 * i), BIT(31));
+    }
+    settle_all();
+
+    pthread_create(&threads[0], NULL, toggled_thread, (void *)6L);
+    pthread_create(&threads[1], NULL, toggled_thread, (void *)0L);
+    pthread_create(&threads[2], NULL, sender_thread, (void *)2L);
+    pthread_create(&threads[3], NULL, sender_thread, (void *)3L);
+    for (int i = 0; i < NR_STARTED; i++)
+        pthread_join(threads[i], NULL);
+    if (atomic_load(&failed))
+        exit(1);
+
+    for (int i = 0; i < NR_STARTED; i++) {
+        if (is_started(started[i]))
+            settle(started[i]);
+        sent_total += off_sent[started[i]];
+        for (u32 intid = 32; intid < NR_INTIDS; intid++)
+            taken_total += taken(started[i], intid);
+    }
+    if (sent_total != taken_total) {
+        printf("FAIL off stress: %lu SPIs were sent, %lu were taken\n", sent_total, taken_total);
+        exit(1);
+    }
+    CHECK(toggled[6].times > 1 && toggled[0].times > 1);
+    printf("ok   off stress, %d list registers: %lu SPIs, core 6 was off %lu times, core 0 %lu\n",
+           lrs, sent_total, toggled[6].times, toggled[0].times);
+    guest_handler = NULL;
+    aic_told = -1;
+}
+
 /* ---- a timer handler that ends the interrupt before it lowers the line ---- */
 
 struct vgic_counts {
@@ -2688,12 +3253,21 @@ int main(int argc, char **argv)
         printf("ALL OK\n");
         return 0;
     }
+    /* "off": only those of the cores that are turned off (make vgic-broken) */
+    if (argc > 1 && !strcmp(argv[1], "off")) {
+        off_tests();
+        off_stress(8, 1000);
+        off_stress(1, 1000);
+        printf("ALL OK\n");
+        return 0;
+    }
     sgi_tests();
     dist_tests();
     aic_tests();
     aic_config_tests();
     aic_limit_tests();
     aic_order_tests();
+    off_tests();
     level_timer_tests();
     wfi_tests();
     stress(8, n, false);
@@ -2702,6 +3276,9 @@ int main(int argc, char **argv)
     stress(8, n / 4, true);
     stress(2, n / 4, true);
     stress(1, n / 8, true);
+    off_stress(8, n / 4);
+    off_stress(2, n / 8);
+    off_stress(1, n / 8);
     wfi_stress(8, n / 4);
     wfi_stress(1, n / 8);
     printf("ALL OK\n");

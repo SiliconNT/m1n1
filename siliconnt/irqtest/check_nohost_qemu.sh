@@ -6,11 +6,11 @@
 #   check_nohost_qemu.sh <run> <log> <exit status of timeout>
 #
 # <run> is host-<n> or nohost-<n>, n the STOP_ARG of stoptest.S: 0 hvc #1, 1 SYSTEM_OFF,
-# 2 SYSTEM_RESET, 3 CPU_ON of a CPU that is not there. With a host the host is told, with the
-# event of src/hv/hv.h (HV_GUEST_HVC 10, HV_GUEST_OFF 9, HV_GUEST_RESET 8), and nothing is
-# shown on the screen. Without one the devices of nohost-qemu.c do not answer: what is tried is
-# tried and given up on, the screen says why and has the guest's registers, and the core stays
-# in EL2, so that QEMU has to be stopped (timeout says 124).
+# 2 SYSTEM_RESET, 3 CPU_ON of a CPU that is not there, 4 CPU_OFF on the last core. With a host the
+# host is told, with the event of src/hv/hv.h (HV_GUEST_HVC 10, HV_GUEST_OFF 9, HV_GUEST_RESET 8),
+# and nothing is shown on the screen. Without one the devices of nohost-qemu.c do not answer: what
+# is tried is tried and given up on, the screen says why and has the guest's registers, and the
+# core stays in EL2, so that QEMU has to be stopped (timeout says 124).
 set -u
 run=$1
 log=$2
@@ -35,7 +35,7 @@ host-*)
     [ "$status" = 0 ] || fail "QEMU did not end by itself (status $status)"
     case $run in
     host-0 | host-3) event=10 ;;
-    host-1) event=9 ;;
+    host-1 | host-4) event=9 ;;
     host-2) event=8 ;;
     *) fail "not a run" ;;
     esac
@@ -72,6 +72,14 @@ nohost-*)
         has "^SCREEN> HV: power: PMU byte 0xf801 was not written"
         has "^SCREEN> HV: the watchdog has not restarted the machine within 500 ms"
         hasnt "powering"
+        ;;
+    nohost-4)
+        has "^SCREEN> HV: PSCI: CPU_OFF from the guest on CPU 0, its last one"
+        has "^SCREEN> HV: the guest called PSCI SYSTEM_OFF, or CPU_OFF on its last core"
+        has "^SCREEN> HV: powering the machine off"
+        has "^SCREEN> HV: power: the SMC cannot be used"
+        has "^SCREEN> x0-x3: 0000000084000002 "
+        hasnt "PMU byte|restarting"
         ;;
     nohost-3)
         has "^SCREEN> HV: PSCI: CPU_ON from the guest on CPU 0"

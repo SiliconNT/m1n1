@@ -8,8 +8,9 @@
  *  - the machine: the device tree as far as smp_init() reads it, the registers of the power
  *    manager that start a core, RVBAR, the system registers of each core, the IPIs;
  *  - the guest: hv_enter_guest() runs a function on that thread until hv_exit_guest(). Its
- *    way into EL2 and out of it is hv_exc_entry() and hv_exc_exit() of src/hv/hv_exc.c, the real
- *    ones;
+ *    ways into EL2 and out of it are hv_exc_entry(), hv_exc_exit(), hv_exc_fiq() and
+ *    hv_exc_proxy() of src/hv/hv_exc.c, the real ones;
+ *  - the host, which is told what has stopped the guest and answers (uartproxy_run());
  *  - the rest of the hypervisor, which hv_init() and hv_start() call: nothing, most of it.
  *
  * Every test runs in a process of its own, because a core never ends, and is taken to hang
@@ -62,6 +63,8 @@ void smp_start_secondaries(void);
 bool smp_start_secondary(int cpu);
 void smp_secondary_entry(void);
 bool smp_is_alive(int cpu);
+bool smp_is_idle(int cpu);
+void smp_send_ipi(int cpu);
 void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
 u64 smp_wait(int cpu);
 void hv_init(void);
@@ -72,11 +75,30 @@ void hv_maybe_exit(void);
 void hv_exit_cpu(int cpu);
 void hv_rendezvous(void);
 u64 hv_get_started_cpus(void);
+bool hv_switch_cpu(int cpu);
+void hv_pin_cpu(int cpu);
+int hv_lead_cpu(void);
+bool hv_is_leaving(void);
+extern int hv_want_cpu, hv_pinned_cpu;
 
 /* src/hv/hv_exc.c, by cpus/exc_head.c and cpus/exc_tail.c */
 void model_exc_entry(void);
 void model_exc_exit(void);
+void model_exc_fiq(void);
+void model_exc_proxy(int reason, u32 type);
+void model_cpu_off(void);
 void model_steal_time(u64 ticks);
+u64 model_stolen_time(void);
+void model_records_fill(int cpu);
+bool model_records_clear(int cpu);
+
+/* src/uartproxy.h and src/hv/hv.h */
+#define START_HV          3
+#define EXC_RET_HANDLED   2
+#define EXC_EXIT_GUEST    3
+#define HV_USER_INTERRUPT 3
+#define HV_CPU_SWITCH     5
+#define HV_GUEST_RESET    8
 
 /* cpus/stubs.c */
 void set_sysregs_unlocked(bool unlocked);
@@ -142,6 +164,18 @@ static int lines_with(const char *text)
 /* Names as they are in the assembly: sr_tkn() of src/utils.h */
 #define R_SCTLR_EL12    "s3_5_c1_c0_0"
 #define R_IPI_RR_GLOBAL "s3_5_c15_c0_1"
+#define R_IPI_SR        "s3_5_c15_c1_1"
+#define R_VM_TMR_FIQ    "s3_5_c15_c1_3"
+#define R_PMCR0         "s3_1_c15_c0_0"
+
+#define PMCR0_IRQ 0xf00UL /* PMCR0_IACT, PMCR0_IMODE_MASK */
+
+/* CNTP_CTL_EL0 and ISR_EL1 */
+#define CTL_ENABLE  BIT(0)
+#define CTL_IMASK   BIT(1)
+#define CTL_ISTATUS BIT(2)
+#define ISR_F       BIT(6)
+#define ISR_I       BIT(7)
 
 #define SCTLR_M  BIT(0)
 #define SCTLR_C  BIT(2)
@@ -167,8 +201,12 @@ static struct core {
         u64 val;
     } regs[128];
     int nr_regs;
+    /* Its interrupts: the IPI, the tick, and one that AIC tells it of */
+    int ipi, irq;
+    u64 cval; // when the tick comes
+    /* What it did about them */
+    int ticks, irqs;
     /* The guest on it */
-    int ipi;
     int entered;
     bool in_guest; // ...or in EL2, to come back
     bool in_el2;   // in EL2, to come back
@@ -180,7 +218,9 @@ static struct core {
     } got;
     /* What was called on it since it was last in the guest */
     int vgic_inits, dbg_inits, pmu_inits, xtrack_inits;
-    /* ...and ever: its MMU is turned on, its stack thrown out of the caches */
+    /* ...and ever: turned off by the guest, its MMU is turned on, its stack thrown out of the
+     * caches */
+    int vgic_offs;
     int mmu_inits, ivacs;
     /* What the one that let it in gave it */
     u64 want_x0;
@@ -188,7 +228,12 @@ static struct core {
 } cores[EXTRA];
 
 static void (*guest)(int cpu); /* what the guest does on each core */
-static u64 stolen;             /* what the host took of the time of the guest */
+static int (*host)(int reason, u32 code); /* what the host answers; NULL: leave the guest */
+static int host_calls;
+static bool host_byte; /* the host wants the guest stopped */
+static bool no_host;   /* nobody is there to be told */
+static int stopped_on; /* the core that has stopped the guest then */
+static bool slow_back; /* a core that has left the guest takes a while */
 static u64 alive_at_vgic_init;
 static bool wfi_used;
 static bool sysregs_unlocked;
@@ -213,8 +258,35 @@ static u64 now(void)
     return ts.tv_sec * 1000000000UL + ts.tv_nsec;
 }
 
+/* The tick of this core, CNTP_CTL_EL0: is its time come */
+static bool tick_due(struct core *c)
+{
+    return (*reg_slot(c, "CNTP_CTL_EL0") & CTL_ENABLE) && now() >= c->cval;
+}
+
+/* ISR_EL1: what is pending on this core, masked or not */
+static u64 isr(struct core *c)
+{
+    u64 val = 0;
+
+    if (__atomic_load_n(&c->ipi, __ATOMIC_SEQ_CST) ||
+        (tick_due(c) && !(*reg_slot(c, "CNTP_CTL_EL0") & CTL_IMASK)))
+        val |= ISR_F;
+    if (__atomic_load_n(&c->irq, __ATOMIC_SEQ_CST))
+        val |= ISR_I;
+    return val;
+}
+
 u64 mock_mrs(const char *name)
 {
+    if (!strcmp(name, "ISR_EL1"))
+        return isr(&cores[me]);
+    if (!strcmp(name, "CNTP_CTL_EL0"))
+        return *reg_slot(&cores[me], name) | (tick_due(&cores[me]) ? CTL_ISTATUS : 0);
+    if (!strcmp(name, "CNTP_TVAL_EL0"))
+        return (u32)(cores[me].cval - now());
+    if (!strcmp(name, R_IPI_SR))
+        return __atomic_load_n(&cores[me].ipi, __ATOMIC_SEQ_CST);
     if (!strcmp(name, "CurrentEL"))
         return 2 << 2;
     if (!strcmp(name, "MPIDR_EL1"))
@@ -238,6 +310,17 @@ void mock_msr(const char *name, u64 val)
                 __atomic_store_n(&cores[i].ipi, 1, __ATOMIC_SEQ_CST);
         return;
     }
+    if (!strcmp(name, R_IPI_SR)) {
+        if (val & 1)
+            __atomic_store_n(&cores[me].ipi, 0, __ATOMIC_SEQ_CST);
+        return;
+    }
+    if (!strcmp(name, "CNTP_TVAL_EL0")) {
+        cores[me].cval = now() + val;
+        return;
+    }
+    if (!strcmp(name, "CNTP_CTL_EL0"))
+        val &= CTL_ENABLE | CTL_IMASK;
     *reg_slot(&cores[me], name) = val;
 }
 
@@ -482,16 +565,68 @@ u64 hv_xtrack_line(void)
     return cores[me].line;
 }
 
-/* On the boot core from hv_init(): the Redistributors are laid out */
+/* On the boot core from hv_init(), and only there: the Redistributors are laid out */
+static int vgic_global_inits;
+
 void hv_vgic_init(void)
 {
-    cores[me].vgic_inits++;
-    if (me != BOOT)
-        return;
+    CHECK(me == BOOT, "core %d", me);
+    vgic_global_inits++;
     alive_at_vgic_init = 0;
     for (int i = 0; i < MAX_CPUS; i++)
         if (smp_is_alive(i))
             alive_at_vgic_init |= BIT(i);
+}
+
+void hv_vgic_init_cpu(void)
+{
+    cores[me].vgic_inits++;
+}
+
+/* Of the core that is turned off, with the lock held. The IPI is for the tick, as in hv_vgic.c */
+void hv_vgic_cpu_off(void)
+{
+    CHECK(bhl.lock == me && bhl.count == 1, "core %d: the lock is %ld's", me, (long)bhl.lock);
+    CHECK(!hv_started_cpus[me], "core %d is still one the guest runs on", me);
+    CHECK(hv_lead_cpu() >= 0 && hv_lead_cpu() != me, "core %d", hv_lead_cpu());
+    cores[me].vgic_offs++;
+    smp_send_ipi(hv_lead_cpu());
+}
+
+/* An IRQ of this core, with the lock held */
+bool hv_vgic_handle_irq(void)
+{
+    CHECK(bhl.lock == me && bhl.count == 1, "core %d: the lock is %ld's", me, (long)bhl.lock);
+    __atomic_store_n(&cores[me].irq, 0, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&cores[me].irqs, 1, __ATOMIC_SEQ_CST);
+    return true;
+}
+
+/* The tick, by which the watchdog of m1n1 knows that the hypervisor is alive */
+void hv_wdt_pet(void)
+{
+    __atomic_add_fetch(&cores[me].ticks, 1, __ATOMIC_SEQ_CST);
+}
+
+/*
+ * src/hv/hv_stop.c: without a host, the core that has stopped the guest stays where it is, with the
+ * lock. What it does before that has siliconnt/nohost-model
+ */
+void model_stop(int reason, u32 code)
+{
+    if (!no_host)
+        return;
+    CHECK(reason == START_HV && code == HV_GUEST_RESET, "stopped for %d, %d", reason, code);
+    __atomic_store_n(&stopped_on, me, __ATOMIC_SEQ_CST);
+    for (;;)
+        usleep(1000);
+}
+
+int model_host(int reason, u32 code)
+{
+    CHECK(bhl.lock == me && bhl.count == 1, "core %d: the lock is %ld's", me, (long)bhl.lock);
+    __atomic_add_fetch(&host_calls, 1, __ATOMIC_SEQ_CST);
+    return host ? host(reason, code) : EXC_EXIT_GUEST;
 }
 
 void hv_dbg_init_cpu(int cpu)
@@ -538,7 +673,6 @@ void hv_sprr_init(void) {}
 void hv_sprr_init_secondary(int cpu) { UNUSED(cpu); }
 void hv_sprr_timer_arm(void) {}
 void hv_wdt_init(void) {}
-void hv_wdt_pet(void) {}
 void hv_wdt_stop(void) {}
 void hv_wfi_init(void) {}
 void hv_wfi_report(void) {}
@@ -551,11 +685,10 @@ void hv_dbg_report(void) {}
 void hv_xtrack_init(void) {}
 void hv_xtrack_report(void) {}
 void hv_vuart_poll(void) {}
-bool hv_has_host(void) { return false; }
-void hv_exc_proxy(void *ctx, int reason, u32 type, void *extra) { UNUSED(ctx); UNUSED(reason); UNUSED(type); UNUSED(extra); abort(); }
+bool hv_has_host(void) { return !no_host; }
 void iodev_console_flush(void) {}
 void iodev_handle_events(int id) { UNUSED(id); }
-s64 iodev_can_read(int id) { UNUSED(id); return 0; }
+s64 iodev_can_read(int id) { UNUSED(id); return __atomic_load_n(&host_byte, __ATOMIC_SEQ_CST); }
 void aic_write(u32 reg, u32 val) { UNUSED(reg); UNUSED(val); abort(); }
 u32 aic_ack(void) { abort(); }
 void cpu_sleep(bool deep) { UNUSED(deep); abort(); }
@@ -586,6 +719,15 @@ void hv_enter_guest(u64 x0, u64 x1, u64 x2, u64 x3, void *entry, u64 spsr)
         CHECK(0, "core %d: the guest came to its end", me);
     }
     __atomic_store_n(&cores[me].in_guest, false, __ATOMIC_SEQ_CST);
+
+    /* Whichever way it has left: nobody is kept waiting for it, and nothing is to interrupt it */
+    CHECK(bhl.lock != me, "core %d has the lock", me);
+    CHECK(!(__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_SEQ_CST) & BIT(me)) || hv_started_cpus[me],
+          "core %d is still waited for", me);
+    CHECK(!*reg_slot(&cores[me], "CNTP_CTL_EL0"), "core %d has a tick", me);
+    CHECK(!*reg_slot(&cores[me], R_VM_TMR_FIQ), "core %d: the timers of the guest", me);
+    if (slow_back)
+        usleep(30000);
 }
 
 static u32 rnd(u32 n)
@@ -633,31 +775,66 @@ static void rendezvous(void)
     }
 }
 
-/* hv_exc_fiq(), for an IPI */
-static void take_ipi(void)
-{
-    hv_maybe_exit();
-    exc_entry();
-    __atomic_store_n(&cores[me].ipi, 0, __ATOMIC_SEQ_CST);
-    exc_exit();
-}
-
 /* The guest goes on for a bit; on some core it would do something else in the meantime */
 static void run_a_bit(void)
 {
-    if (__atomic_load_n(&cores[me].ipi, __ATOMIC_SEQ_CST))
-        take_ipi();
+    u64 pending = isr(&cores[me]);
+
+    if (pending & ISR_F) {
+        /* The IPI or the tick: hv_exc_fiq() */
+        __atomic_store_n(&cores[me].in_el2, true, __ATOMIC_SEQ_CST);
+        model_exc_fiq();
+        __atomic_store_n(&cores[me].in_el2, false, __ATOMIC_SEQ_CST);
+    } else if (pending & ISR_I) {
+        exc_entry();
+        hv_vgic_handle_irq();
+        exc_exit();
+    }
     sched_yield();
 }
 
 static void spin_in_guest(int cpu)
 {
     UNUSED(cpu);
-    for (;;) {
+    for (;;)
         run_a_bit();
-        /* The tick of hv_exc_fiq(): once a second on the machine */
-        hv_maybe_exit();
-    }
+}
+
+/* Something stops the guest on this core, and the host is told. Returns if it says "handled" */
+static void stop_guest(u32 code)
+{
+    exc_entry();
+    model_exc_proxy(START_HV, code);
+    exc_exit();
+}
+
+/* ...and the host leaves the guest */
+static void __attribute__((noreturn)) host_leaves(void)
+{
+    stop_guest(HV_USER_INTERRUPT);
+    CHECK(0, "core %d is in the guest, which the host has left", me);
+    abort();
+}
+
+/* The guest executes WFI: hv_handle_wfx() of hv_wfi.c */
+static void wait_in_wfi(void)
+{
+    exc_entry();
+    spin_unlock(&bhl);
+    while (!(isr(&cores[me]) & (ISR_F | ISR_I)))
+        sched_yield();
+    spin_lock(&bhl);
+    exc_exit();
+}
+
+/* PSCI CPU_OFF, as hv_psci.c has it. Returns on the last core, which is in the guest still */
+static void cpu_off(void)
+{
+    exc_entry();
+    model_cpu_off();
+    CHECK(hv_get_started_cpus() == BIT(me), "core %d is not the last one: 0x%lx", me,
+          hv_get_started_cpus());
+    exc_exit();
 }
 
 /* CPU_ON as hv_psci.c carries it out. The caller's stack is gone once the call is over. */
@@ -693,8 +870,18 @@ static void reset(void)
     sysregs_unlocked = false;
     set_sysregs_unlocked(false);
     guest = spin_in_guest;
-    /* What exception_initialize() leaves on the boot core: nothing masked */
+    /* What exception_initialize() leaves on the boot core: nothing masked; and its MMU is on */
     *reg_slot(&cores[BOOT], "DAIF") = 0;
+    *reg_slot(&cores[BOOT], "SCTLR_EL1") = SCTLR_M;
+    /* FEAT_ECV: the cores that do not tick for all have one tick a second */
+    *reg_slot(&cores[BOOT], "ID_AA64MMFR0_EL1") = 1UL << 60;
+    host = NULL;
+    host_calls = 0;
+    host_byte = false;
+    no_host = false;
+    stopped_on = -1;
+    slow_back = false;
+    vgic_global_inits = 0;
     /* UNKNOWN after a reset (Arm DDI 0487) */
     for (int i = 0; i < NR; i++)
         *reg_slot(&cores[i], "CNTVOFF_EL2") = 0xbad0000 + i;
@@ -709,7 +896,7 @@ static void boot_leaves(int cpu)
     CHECK(cpu == BOOT, "core %d is in the guest", cpu);
     CHECK(*reg_slot(&cores[cpu], "CNTVOFF_EL2") == 0, "CNTVOFF_EL2 is 0x%lx",
           *reg_slot(&cores[cpu], "CNTVOFF_EL2"));
-    hv_exit_guest();
+    host_leaves();
 }
 
 static void check_all_up(void)
@@ -901,16 +1088,24 @@ static void check_state(int cpu)
           "core %d: set up %d %d %d %d times", cpu, c->vgic_inits, c->dbg_inits, c->pmu_inits,
           c->xtrack_inits);
     c->vgic_inits = c->dbg_inits = c->pmu_inits = c->xtrack_inits = 0;
-    /* ...and these once for all times it was in the guest, since it came up */
-    CHECK(c->mmu_inits == 1 && c->ivacs == 1, "core %d: its MMU %d times, its stack %d times", cpu,
-          c->mmu_inits, c->ivacs);
+    /* ...and these once for all times it was in the guest, since it came up; not the boot core */
+    CHECK(c->mmu_inits == (cpu != BOOT) && c->ivacs == (cpu != BOOT),
+          "core %d: its MMU %d times, its stack %d times", cpu, c->mmu_inits, c->ivacs);
     CHECK(*reg_slot(c, "SCTLR_EL1") & SCTLR_M, "core %d: the MMU of EL2 is off", cpu);
     CHECK(__atomic_load_n(&hv_started_cpus[cpu], __ATOMIC_SEQ_CST), "core %d is not started", cpu);
-    CHECK(*reg_slot(c, "CNTVOFF_EL2") == stolen, "core %d: CNTVOFF_EL2 0x%lx, not 0x%lx", cpu,
-          *reg_slot(c, "CNTVOFF_EL2"), stolen);
+    CHECK(*reg_slot(c, "CNTVOFF_EL2") == model_stolen_time(),
+          "core %d: CNTVOFF_EL2 0x%lx, not 0x%lx", cpu, *reg_slot(c, "CNTVOFF_EL2"),
+          model_stolen_time());
+    /* What hv_exc.c keeps of it, and what is behind that */
+    CHECK(model_records_clear(cpu), "core %d: something is left of the last time", cpu);
+    CHECK(!(*reg_slot(c, R_PMCR0) & PMCR0_IRQ), "core %d: PMCR0 0x%lx", cpu,
+          *reg_slot(c, R_PMCR0));
+    CHECK(*reg_slot(c, "CNTP_CTL_EL0") == CTL_ENABLE, "core %d: no tick", cpu);
     /* The guest turns things on, as Windows would have left them when the core stops */
     *reg_slot(c, R_SCTLR_EL12) |= SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_EE;
     *reg_slot(c, "VBAR_EL12") = 0xfffff80000000000;
+    *reg_slot(c, R_PMCR0) |= PMCR0_IRQ;
+    model_records_fill(cpu);
 }
 
 static void guest_cpu_on(int cpu)
@@ -926,10 +1121,10 @@ static void guest_cpu_on(int cpu)
         /* The host takes some time: the cores that come in have the same offset as this one */
         exc_entry();
         model_steal_time(1000);
-        stolen += 1000;
         exc_exit();
-        CHECK(*reg_slot(&cores[BOOT], "CNTVOFF_EL2") == stolen, "CNTVOFF_EL2 is 0x%lx",
-              *reg_slot(&cores[BOOT], "CNTVOFF_EL2"));
+        CHECK(*reg_slot(&cores[BOOT], "CNTVOFF_EL2") == model_stolen_time() &&
+                  model_stolen_time() == 1000UL * round,
+              "CNTVOFF_EL2 is 0x%lx", *reg_slot(&cores[BOOT], "CNTVOFF_EL2"));
 
         for (int n = 1; n < NR; n++) {
             int target = (BOOT + n) % NR;
@@ -986,7 +1181,7 @@ static void guest_cpu_on(int cpu)
     CHECK(cpu_on(0, (void *)0x8000400000, 0xc0de0000) == 0, "CPU_ON of core 0 at the end");
     exc_exit();
     wait_entered(0, 4);
-    hv_exit_guest();
+    host_leaves();
 }
 
 static void test_cpu_on(void)
@@ -1033,13 +1228,13 @@ static void guest_refused(int cpu)
     CHECK(!hv_start_secondary(3, (void *)0x8000400000, regs), "core 3 is let in twice");
     CHECK(cpu_on(4, (void *)0x8000400000, 1) == -1, "CPU_ON of a core that is busy");
     CHECK(!hv_started_cpus[4], "core 4 is started");
-    /* The boot core, if it were not in the guest; a core that is not there */
+    /* The boot core, if it were on its way to where it waits for good; one that is not there */
     hv_started_cpus[BOOT] = false;
     CHECK(cpu_on(BOOT, (void *)0x8000400000, 1) == -1, "CPU_ON of the boot core");
     hv_started_cpus[BOOT] = true;
     CHECK(cpu_on(20, (void *)0x8000400000, 1) == -1, "CPU_ON of a core that is not there");
     exc_exit();
-    hv_exit_guest();
+    host_leaves();
 }
 
 static void test_refused(void)
@@ -1107,7 +1302,7 @@ static void guest_on_off(int cpu)
         }
     }
 
-    hv_exit_guest();
+    host_leaves();
 }
 
 static void test_on_off(void)
@@ -1201,7 +1396,7 @@ static void guest_leaving(int cpu)
         for (int i = 0; i < NR; i++)
             wait_entered(i, 1);
         __atomic_store_n(&boot_has_left, true, __ATOMIC_SEQ_CST);
-        hv_exit_guest();
+        host_leaves();
     }
 
     for (;;) {
@@ -1220,7 +1415,6 @@ static void guest_leaving(int cpu)
             exc_exit();
         }
         run_a_bit();
-        hv_maybe_exit();
     }
 }
 
@@ -1248,6 +1442,581 @@ static void test_leaving(void)
         CHECK(!hv_started_cpus[i] && !cores[i].in_guest, "core %d is still in the guest", i);
 }
 
+/* ---- the guest turns cores off and on, and somebody leaves it ---- */
+
+static void check_nobody_left(void)
+{
+    for (int i = 0; i < NR; i++) {
+        CHECK(!hv_started_cpus[i] && !cores[i].in_guest, "core %d is still in the guest", i);
+        /* It is where it can be called: nobody is to lose a call to it from here on */
+        CHECK(i == BOOT ? !smp_is_alive(i) : smp_is_idle(i), "core %d is not back", i);
+    }
+    CHECK(!hv_cpus_in_guest, "0x%lx", hv_cpus_in_guest);
+    CHECK(!hv_get_started_cpus(), "0x%lx", hv_get_started_cpus());
+    CHECK(bhl.lock == -1, "core %ld has the lock", (long)bhl.lock);
+}
+
+/* A guest, as after a reset of the machine: what check_state() wants to find */
+static void run_guest(void (*what)(int))
+{
+    u64 regs[4] = {0};
+
+    smp_init();
+    hv_init();
+    for (int i = 0; i < NR; i++) {
+        *reg_slot(&cores[i], R_SCTLR_EL12) = 0x30d50980;
+        cores[i].vgic_inits = cores[i].dbg_inits = cores[i].pmu_inits = cores[i].xtrack_inits = 0;
+        cores[i].entered = cores[i].ticks = cores[i].irqs = cores[i].vgic_offs = 0;
+        __atomic_store_n(&cores[i].irq, 0, __ATOMIC_SEQ_CST);
+    }
+    vgic_global_inits = 0;
+    host_calls = 0;
+    guest = what;
+    hv_start((void *)0x8000001000, regs);
+    check_nobody_left();
+    /* The state of the vGIC is the guest's for as long as it runs */
+    CHECK(!vgic_global_inits, "the vGIC was set up %d times more", vgic_global_inits);
+}
+
+static void turn_on(int cpu)
+{
+    int times = __atomic_load_n(&cores[cpu].entered, __ATOMIC_SEQ_CST) + 1;
+
+    exc_entry();
+    CHECK(cpu_on(cpu, (void *)(0x8000400000 + 0x1000 * cpu), 0xc0de0000 + cpu) == 0,
+          "CPU_ON of core %d by core %d", cpu, me);
+    exc_exit();
+    wait_entered(cpu, times);
+}
+
+static void wait_off(int cpu)
+{
+    while (__atomic_load_n(&hv_started_cpus[cpu], __ATOMIC_SEQ_CST))
+        run_a_bit();
+}
+
+static void run_for(int ms)
+{
+    u64 until = now() + ms * 1000000UL;
+
+    while (now() < until)
+        run_a_bit();
+}
+
+#define TICKS_MS 100 /* so long... */
+#define SOME     5   /* ...and at least so many ticks, of one each millisecond */
+
+static int ticks_of(int cpu)
+{
+    return __atomic_load_n(&cores[cpu].ticks, __ATOMIC_SEQ_CST);
+}
+
+/* This core goes on for a while: in that time `cpu`, this one or another, ticks, and no other */
+static void check_ticks(int cpu, const char *when)
+{
+    int before[NR];
+
+    for (int i = 0; i < NR; i++)
+        before[i] = ticks_of(i);
+    run_for(TICKS_MS);
+    for (int i = 0; i < NR; i++) {
+        int n = ticks_of(i) - before[i];
+
+        CHECK(i == cpu ? n >= SOME : n <= 1, "%s: core %d has ticked %d times in %d ms", when, i, n,
+              TICKS_MS);
+    }
+}
+
+/*
+ * Every core turns others on and itself off, the boot core too, while AIC tells the boot core of
+ * lines, in the guest or not. In the end several have something for the host at once, which
+ * leaves the guest on whichever comes first, and hears of nothing more.
+ */
+static u64 off_rounds, off_raised;
+static bool last_was_off;
+#define OFF_ROUNDS 2000 /* for each guest */
+#define OFF_GUESTS 10
+
+static void guest_off(int cpu)
+{
+    if (cpu != BOOT || __atomic_load_n(&cores[cpu].entered, __ATOMIC_SEQ_CST) > 1)
+        check_state(cpu);
+
+    while (__atomic_load_n(&off_rounds, __ATOMIC_SEQ_CST) < OFF_ROUNDS) {
+        switch (rnd(10)) {
+            case 0:
+            case 1:
+            case 2:
+            case 3: {
+                int target = rnd(NR);
+                int ret;
+
+                exc_entry();
+                ret = cpu_on(target, (void *)(0x8000400000 + target), next_x0++);
+                CHECK(ret == 0 || ret == -4, "CPU_ON of core %d by core %d: %d", target, cpu, ret);
+                exc_exit();
+                if (!ret)
+                    __atomic_add_fetch(&off_rounds, 1, __ATOMIC_SEQ_CST);
+                break;
+            }
+            case 4:
+                cpu_off();
+                __atomic_store_n(&last_was_off, true, __ATOMIC_SEQ_CST);
+                break;
+            case 5:
+                if (rnd(4))
+                    break;
+                exc_entry();
+                rendezvous();
+                exc_exit();
+                break;
+            case 6:
+                /* A line, for the boot core: it is heard of, wherever that core is */
+                if (__atomic_exchange_n(&cores[BOOT].irq, 1, __ATOMIC_SEQ_CST))
+                    break;
+                __atomic_add_fetch(&off_raised, 1, __ATOMIC_SEQ_CST);
+                if (cpu != BOOT)
+                    while (__atomic_load_n(&cores[BOOT].irq, __ATOMIC_SEQ_CST))
+                        run_a_bit();
+                break;
+            default:
+                run_a_bit();
+                break;
+        }
+    }
+
+    if (rnd(3))
+        run_for(1);
+    host_leaves();
+}
+
+static void test_cpu_off(void)
+{
+    int boot_was_off = 0, boot_irqs = 0;
+
+    for (int n = 0; n < OFF_GUESTS; n++) {
+        off_rounds = off_raised = 0;
+        run_guest(guest_off);
+        CHECK(host_calls == 1, "the host was told of %d things", host_calls);
+        for (int i = 0; i < NR; i++)
+            CHECK(i == BOOT || cores[i].vgic_offs <= cores[i].entered, "core %d: %d, %d", i,
+                  cores[i].vgic_offs, cores[i].entered);
+        boot_was_off += cores[BOOT].vgic_offs;
+        boot_irqs += cores[BOOT].irqs;
+        CHECK(!cores[0].irqs && !cores[9].irqs, "another core has taken an IRQ");
+    }
+    CHECK(boot_was_off > OFF_GUESTS, "the boot core was off %d times", boot_was_off);
+    CHECK(boot_irqs > OFF_GUESTS, "%d IRQs", boot_irqs);
+    /* Not a line for each time a core leaves: at most one for each power of two, and the end */
+    CHECK(lines_with("HV: Exiting from CPU 9\n") <= 13 * OFF_GUESTS, "%d lines",
+          lines_with("HV: Exiting from CPU 9\n"));
+}
+
+/* The host leaves the guest on a core that is not the boot core: all of them leave */
+static void guest_exit_secondary(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(0);
+        turn_on(9);
+        turn_on(3);
+    }
+    if (cpu == 3)
+        host_leaves();
+    spin_in_guest(cpu);
+}
+
+static void test_exit_secondary(void)
+{
+    slow_back = true;
+    run_guest(guest_exit_secondary);
+    CHECK(host_calls == 1, "%d", host_calls);
+    /* And again: nothing of it is left */
+    run_guest(guest_exit_secondary);
+}
+
+/* ...while the guest has the boot core turned off */
+static void guest_exit_boot_off(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(0);
+        turn_on(3);
+        cpu_off();
+        CHECK(0, "the boot core is in the guest");
+    }
+    if (cpu == 3) {
+        wait_off(BOOT);
+        host_leaves();
+    }
+    spin_in_guest(cpu);
+}
+
+static void test_exit_boot_off(void)
+{
+    run_guest(guest_exit_boot_off);
+    CHECK(host_calls == 1 && cores[BOOT].vgic_offs == 1, "%d %d", host_calls,
+          cores[BOOT].vgic_offs);
+    run_guest(guest_exit_boot_off);
+}
+
+/* ...which the host does with hv_exit_cpu() as well, of the boot core */
+static int host_exits_boot(int reason, u32 code)
+{
+    UNUSED(reason);
+    UNUSED(code);
+    hv_exit_cpu(BOOT);
+    return EXC_RET_HANDLED;
+}
+
+static void test_exit_cpu_boot(void)
+{
+    host = host_exits_boot;
+    run_guest(guest_exit_boot_off);
+    run_guest(guest_exit_secondary);
+}
+
+/* The host takes the last core out of the guest: there is nothing left to wait for */
+static void guest_exit_last(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(3);
+        cpu_off();
+        CHECK(0, "the boot core is in the guest");
+    }
+    wait_off(BOOT);
+    host_leaves();
+}
+
+static int host_exits_this(int reason, u32 code)
+{
+    UNUSED(reason);
+    UNUSED(code);
+    hv_exit_cpu(-1);
+    return EXC_RET_HANDLED;
+}
+
+static void test_exit_last(void)
+{
+    host = host_exits_this;
+    run_guest(guest_exit_last);
+}
+
+/* Core 0 waits out a WFI of the guest in EL2 (hv_wfi.c), and no core is in the guest */
+static void guest_exit_wfi(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(0);
+        while (!__atomic_load_n(&cores[0].in_el2, __ATOMIC_SEQ_CST))
+            run_a_bit();
+        run_for(5);
+        host_leaves();
+    }
+    wait_in_wfi();
+    CHECK(0, "core 0 is in the guest");
+}
+
+static void test_exit_wfi(void)
+{
+    u64 start = now();
+
+    run_guest(guest_exit_wfi);
+    /* The tick of core 0 would have it look a second after it came */
+    CHECK(now() - start < 500000000UL, "it took %ld ms", (now() - start) / 1000000);
+}
+
+/*
+ * Two cores have something for the host at once. It leaves the guest with the first; the second,
+ * which waits for the lock meanwhile, does not tell it anything.
+ */
+static void guest_two_stops(int cpu)
+{
+    static int there;
+
+    if (cpu == BOOT) {
+        turn_on(3);
+        turn_on(4);
+        spin_in_guest(cpu);
+    }
+    __atomic_add_fetch(&there, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&there, __ATOMIC_SEQ_CST) < 2)
+        run_a_bit();
+    stop_guest(HV_GUEST_RESET);
+    /* A stop for good: whatever the host says, the guest does not go on */
+    for (;;)
+        stop_guest(HV_GUEST_RESET);
+}
+
+static int host_leaves_late(int reason, u32 code)
+{
+    UNUSED(reason);
+    CHECK(code == HV_GUEST_RESET, "%d", code);
+    usleep(20000);
+    return EXC_EXIT_GUEST;
+}
+
+static void test_two_stops(void)
+{
+    host = host_leaves_late;
+    run_guest(guest_two_stops);
+    CHECK(host_calls == 1, "the host was told of %d things", host_calls);
+}
+
+/*
+ * Without a host nothing of this happens: a guest that is stopped is not left, wherever it is
+ * stopped, and the boot core takes its IRQs, as with a host, but is not heard of otherwise
+ */
+static void guest_no_host(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(0);
+        turn_on(3);
+        cpu_off();
+        CHECK(0, "the boot core is in the guest");
+    }
+    if (cpu == 3) {
+        wait_off(BOOT);
+        for (int n = 0; n < 100; n++) {
+            __atomic_store_n(&cores[BOOT].irq, 1, __ATOMIC_SEQ_CST);
+            while (__atomic_load_n(&cores[BOOT].irq, __ATOMIC_SEQ_CST))
+                run_a_bit();
+        }
+        CHECK(cores[BOOT].irqs == 100, "%d IRQs", cores[BOOT].irqs);
+        /* Something comes in where a host would be: core 0, which ticks, does not mind */
+        __atomic_store_n(&host_byte, true, __ATOMIC_SEQ_CST);
+        check_ticks(0, "without a host");
+        stop_guest(HV_GUEST_RESET);
+        CHECK(0, "the guest goes on");
+    }
+    spin_in_guest(cpu);
+}
+
+static void *watch_stopped(void *arg)
+{
+    UNUSED(arg);
+    while (__atomic_load_n(&stopped_on, __ATOMIC_SEQ_CST) < 0)
+        usleep(1000);
+    /* An IRQ that nobody can take any more: who has the lock keeps it */
+    __atomic_store_n(&cores[BOOT].irq, 1, __ATOMIC_SEQ_CST);
+    usleep(300000);
+    CHECK(stopped_on == 3, "it stopped on core %d", stopped_on);
+    CHECK(!host_calls, "the host was told of %d things", host_calls);
+    CHECK(!hv_is_leaving(), "the guest is being left");
+    CHECK(hv_get_started_cpus() == (BIT(0) | BIT(3)), "0x%lx", hv_get_started_cpus());
+    /* They are all in EL2, and stay there */
+    CHECK(!__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_SEQ_CST), "0x%lx", hv_cpus_in_guest);
+    CHECK(bhl.lock == 3, "core %ld has the lock", (long)bhl.lock);
+    CHECK(cores[BOOT].irqs == 100, "%d IRQs", cores[BOOT].irqs);
+    CHECK(!was_printed("HV: Exiting hypervisor"), "the hypervisor ends");
+    _exit(failures ? 1 : 0);
+}
+
+static void test_no_host(void)
+{
+    pthread_t thread;
+
+    no_host = true;
+    pthread_create(&thread, NULL, watch_stopped, NULL);
+    run_guest(guest_no_host);
+    CHECK(0, "the hypervisor has ended");
+}
+
+/* ---- who ticks ---- */
+
+static bool tick_boot_off, tick_boot_on, tick_boot_done;
+
+static void guest_tick(int cpu)
+{
+    switch (cpu) {
+        case BOOT:
+            if (__atomic_load_n(&cores[BOOT].entered, __ATOMIC_SEQ_CST) == 1) {
+                turn_on(3);
+                turn_on(0);
+                turn_on(9);
+                /* The boot core, though there are others with a lower index */
+                CHECK(hv_lead_cpu() == BOOT, "%d", hv_lead_cpu());
+                check_ticks(BOOT, "all on");
+                cpu_off();
+            }
+            /* Core 9 turned it on again */
+            check_ticks(BOOT, "the boot core on again");
+            __atomic_store_n(&tick_boot_on, true, __ATOMIC_SEQ_CST);
+            cpu_off();
+            break;
+        case 0:
+            wait_off(BOOT);
+            /* The one that is left with the lowest index */
+            CHECK(hv_lead_cpu() == 0, "%d", hv_lead_cpu());
+            run_for(5);
+            check_ticks(0, "the boot core off");
+            __atomic_store_n(&tick_boot_off, true, __ATOMIC_SEQ_CST);
+            while (!__atomic_load_n(&tick_boot_on, __ATOMIC_SEQ_CST))
+                run_a_bit();
+            wait_off(BOOT);
+            run_for(5);
+            check_ticks(0, "the boot core off once more");
+            /* The host calls: it is this core that hears it */
+            __atomic_store_n(&tick_boot_done, true, __ATOMIC_SEQ_CST);
+            cpu_off();
+            break;
+        case 9:
+            while (!__atomic_load_n(&tick_boot_off, __ATOMIC_SEQ_CST))
+                run_a_bit();
+            turn_on(BOOT);
+            while (!__atomic_load_n(&tick_boot_done, __ATOMIC_SEQ_CST))
+                run_a_bit();
+            wait_off(0);
+            CHECK(hv_lead_cpu() == 3, "%d", hv_lead_cpu());
+            run_for(5);
+            __atomic_store_n(&host_byte, true, __ATOMIC_SEQ_CST);
+            break;
+    }
+    spin_in_guest(cpu);
+}
+
+static int host_called_on = -1;
+
+static int host_hears(int reason, u32 code)
+{
+    CHECK(reason == START_HV && code == HV_USER_INTERRUPT, "%d %d", reason, code);
+    host_called_on = me;
+    return EXC_EXIT_GUEST;
+}
+
+static void test_tick(void)
+{
+    host = host_hears;
+    run_guest(guest_tick);
+    CHECK(host_calls == 1 && host_called_on == 3, "%d, on core %d", host_calls, host_called_on);
+}
+
+/*
+ * The boot core turns itself off while core 0, the next one to tick, is in hv_exc_fiq() already and
+ * waits for the lock: the IPI that would tell it is acknowledged there
+ */
+static bool tick_race_wait;
+
+static void guest_tick_race(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(0);
+        for (int i = 0; i < 3; i++)
+            run_for(1);
+        exc_entry();
+        smp_send_ipi(0);
+        __atomic_store_n(&tick_race_wait, true, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_SEQ_CST) & BIT(0))
+            sched_yield();
+        usleep(2000); /* it has looked by now who ticks */
+        model_cpu_off();
+        CHECK(0, "the boot core is in the guest");
+    }
+    while (!__atomic_load_n(&tick_race_wait, __ATOMIC_SEQ_CST))
+        sched_yield();
+    wait_off(BOOT);
+    check_ticks(0, "after the race");
+    host_leaves();
+}
+
+static void test_tick_race(void)
+{
+    run_guest(guest_tick_race);
+}
+
+/* ---- a core that the host is waiting for turns itself off ---- */
+
+static int switch_step;
+static bool switch_by_exit;
+
+/* The host, on core BOOT: go to core 3. On core 3, in its CPU_OFF: here it is, go on */
+static int host_switches(int reason, u32 code)
+{
+    UNUSED(reason);
+    switch (switch_step++) {
+        case 0:
+            CHECK(me == BOOT && code == HV_USER_INTERRUPT, "core %d, %d", me, code);
+            if (switch_by_exit)
+                hv_exit_cpu(3);
+            CHECK(hv_switch_cpu(3), "core 3 cannot be switched to");
+            return EXC_RET_HANDLED;
+        case 1:
+            CHECK(me == 3 && code == HV_CPU_SWITCH, "core %d, %d", me, code);
+            CHECK(hv_started_cpus[3], "core 3 is off");
+            return EXC_RET_HANDLED;
+        default:
+            return EXC_EXIT_GUEST;
+    }
+}
+
+static void guest_switch(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(3);
+        stop_guest(HV_USER_INTERRUPT);
+        /* The host is not kept waiting, nor is anybody else */
+        wait_off(3);
+        CHECK(hv_want_cpu == -1, "%d", hv_want_cpu);
+        host_leaves();
+    }
+    if (switch_by_exit) {
+        /* It leaves from here, and does not look who wants what */
+        wait_in_wfi();
+    } else {
+        /* The host has stopped the guest, and the next thing the guest does here is this */
+        while (!__atomic_load_n(&cores[me].ipi, __ATOMIC_SEQ_CST))
+            sched_yield();
+        cpu_off();
+    }
+    CHECK(0, "core 3 is in the guest");
+}
+
+static void test_switch(void)
+{
+    host = host_switches;
+    switch_step = 0;
+    run_guest(guest_switch);
+    CHECK(switch_step == 3, "%d", switch_step);
+}
+
+/* The same for one that the host has told to leave the guest: it does not show up any more */
+static void test_switch_exit(void)
+{
+    host = host_switches;
+    switch_by_exit = true;
+    switch_step = 0;
+    run_guest(guest_switch);
+    CHECK(switch_step == 2, "%d", switch_step);
+}
+
+/* The host has pinned core 3, as for a single step, and it turns itself off with that step */
+static int host_pins(int reason, u32 code)
+{
+    UNUSED(reason);
+    UNUSED(code);
+    if (me != 3)
+        return EXC_EXIT_GUEST;
+    hv_pin_cpu(3);
+    return EXC_RET_HANDLED;
+}
+
+static void guest_pinned(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(3);
+        wait_off(3);
+        CHECK(hv_pinned_cpu == -1, "%d", hv_pinned_cpu);
+        host_leaves();
+    }
+    stop_guest(HV_USER_INTERRUPT);
+    cpu_off();
+    CHECK(0, "core 3 is in the guest");
+}
+
+static void test_pinned(void)
+{
+    host = host_pins;
+    run_guest(guest_pinned);
+    CHECK(host_calls == 2, "%d", host_calls);
+}
+
 /* ---- */
 
 static const struct {
@@ -1271,6 +2040,19 @@ static const struct {
     {"on-off", test_on_off},
     {"rendezvous", test_rendezvous},
     {"leaving", test_leaving},
+    {"cpu-off", test_cpu_off},
+    {"exit-secondary", test_exit_secondary},
+    {"exit-boot-off", test_exit_boot_off},
+    {"exit-cpu-boot", test_exit_cpu_boot},
+    {"exit-last", test_exit_last},
+    {"exit-wfi", test_exit_wfi},
+    {"two-stops", test_two_stops},
+    {"no-host", test_no_host},
+    {"tick", test_tick},
+    {"tick-race", test_tick_race},
+    {"switch", test_switch},
+    {"switch-exit", test_switch_exit},
+    {"pinned", test_pinned},
 };
 
 int main(int argc, char **argv)

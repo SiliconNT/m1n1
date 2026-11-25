@@ -18,6 +18,7 @@
 #   make qemu-wfi-smp  ...and on QEMU_SMP_CPUS CPUs
 #   make qemu-psci     the same for pscitest.bin, which ends with SYSTEM_OFF
 #   make qemu-psci-reset   ...and with SYSTEM_RESET
+#   make qemu-psci-smp     ...on QEMU_SMP_CPUS CPUs, which it turns on and off, the boot CPU too
 #   make qemu-psci-strict  pscitest.bin expecting the hypervisor's answers, which QEMU's
 #                      PSCI does not give: shows that those checks can fail
 #   make qemu-pmu-el2  pmutest.bin under an EL2 of its own that links the real execution
@@ -68,7 +69,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
 	-fno-jump-tables -fno-stack-protector -fno-asynchronous-unwind-tables
 
-.PHONY: anstest qemu-ans qemu-ans-broken all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken qemu-nohost qemu-nohost-broken clean
+.PHONY: anstest qemu-ans qemu-ans-broken all qemu qemu-sgi qemu-sgi-smp qemu-gic qemu-gic-smp qemu-wfi qemu-wfi-smp qemu-psci qemu-psci-reset qemu-psci-smp qemu-psci-strict qemu-pmu qemu-pmu-strict qemu-pmu-el2 qemu-pmu-el2-nosyn qemu-xi qemu-xi-el2 qemu-xi-el2-nosyn qemu-xi-broken qemu-nohost qemu-nohost-broken clean
 .SECONDARY:
 
 all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin
@@ -256,6 +257,10 @@ qemu-psci: build/pscitest-qemu-0x0.elf
 qemu-psci-reset: build/pscitest-qemu-0x1.elf
 	-timeout 20 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
+# 0x14: 20 times each
+qemu-psci-smp: build/pscitest-qemu-0x140000.elf
+	-timeout 60 $(QEMU) $(QEMU_FLAGS) -smp $(QEMU_SMP_CPUS) -no-reboot -kernel $<
+
 qemu-psci-strict: build/pscitest-qemu-0x100.elf
 	-timeout 20 $(QEMU) $(QEMU_FLAGS) -smp 1 -no-reboot -kernel $<
 
@@ -351,7 +356,7 @@ build/nohost-qemu-%.elf: build/stoptest-el2-head.o build/nohost-qemu-%.o $(NOHOS
 
 # QEMU ends by itself where a host is told; without one the core stays in EL2, and QEMU is
 # stopped after a while. check_nohost_qemu.sh says what each run is to show.
-NOHOST_RUNS := host-0 host-1 host-2 host-3 nohost-0 nohost-1 nohost-2 nohost-3
+NOHOST_RUNS := host-0 host-1 host-2 host-3 host-4 nohost-0 nohost-1 nohost-2 nohost-3 nohost-4
 define NOHOST_RUN
 { timeout 10 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel $(2) > $(3) 2>&1; \
 bash check_nohost_qemu.sh $(1) $(3) $$?; }

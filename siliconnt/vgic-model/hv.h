@@ -58,6 +58,8 @@ bool hv_vgic_has_aicmap(void);
 #define HV_VGIC_REDIST_BASE  0x5100000000UL
 #define HV_VGIC_REDIST_SIZE  0x20000UL
 void hv_vgic_init(void);
+void hv_vgic_init_cpu(void);
+void hv_vgic_cpu_off(void);
 void hv_vgic_start(void);
 void hv_vgic_stop(void);
 void hv_vgic_ppi_level(u32 intid, bool high);
@@ -73,6 +75,8 @@ void hv_update_fiq(void);
 void hv_psci_init(void);
 bool hv_psci_hvc(struct exc_info *ctx, u16 imm);
 bool hv_start_secondary(int cpu, void *entry, u64 regs[4]);
+void hv_cpu_off(struct exc_info *ctx);
+int hv_lead_cpu(void);
 void hv_psci_report(void);
 void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type, void *extra);
 void hv_pmu_init(void);
