@@ -147,7 +147,13 @@ static u64 hv_pt_switching;
  * that is given back goes on a list of its size, and is taken from there first; the lists
  * outlive hv_pt_init(), as heapblock never takes anything back. The first level is taken
  * once for every hv_pt_init(), and not given back.
+ *
+ * What is taken from heapblock is whole pages of 16 KB, as dlmalloc takes it, cut up into
+ * tables: the host puts guest RAM at a fixed distance above where the heap ends (ProxyUtils),
+ * and guest RAM starts on a page of 16 KB (SELFBOOT_PAGE).
  */
+#define HV_PT_CHUNK 0x4000UL
+
 struct hv_pt_spare {
     struct hv_pt_spare *next;
 };
@@ -161,17 +167,6 @@ static struct hv_pt_spare **hv_pt_spares(size_t size)
     return size == PAGE_SIZE ? &hv_pt_spare_4k : &hv_pt_spare_8k;
 }
 
-static u64 *hv_pt_table_alloc(size_t size)
-{
-    struct hv_pt_spare **spares = hv_pt_spares(size);
-    struct hv_pt_spare *table = *spares;
-
-    if (!table)
-        return heapblock_alloc_aligned(size, PAGE_SIZE);
-    *spares = table->next;
-    return (u64 *)table;
-}
-
 static void hv_pt_table_free(u64 *table, size_t size)
 {
     struct hv_pt_spare **spares = hv_pt_spares(size);
@@ -179,6 +174,23 @@ static void hv_pt_table_free(u64 *table, size_t size)
 
     spare->next = *spares;
     *spares = spare;
+}
+
+static u64 *hv_pt_table_alloc(size_t size)
+{
+    struct hv_pt_spare **spares = hv_pt_spares(size);
+
+    if (!*spares) {
+        u8 *chunk = heapblock_alloc_aligned(HV_PT_CHUNK, HV_PT_CHUNK);
+
+        // The last one first, so that they are taken in the order they lie in
+        for (size_t end = HV_PT_CHUNK; end; end -= size)
+            hv_pt_table_free((u64 *)(chunk + end - size), size);
+    }
+
+    struct hv_pt_spare *table = *spares;
+    *spares = table->next;
+    return (u64 *)table;
 }
 
 void hv_pt_init(void)
@@ -195,7 +207,7 @@ void hv_pt_init(void)
 
     // The tables of the first level lie side by side, aligned to the size of them all
     u64 size = max(sizeof(u64) * ENTRIES_PER_L1_TABLE, PAGE_SIZE);
-    hv_Ltop = heapblock_alloc_aligned(size, size);
+    hv_Ltop = heapblock_alloc_aligned(ALIGN_UP(size, HV_PT_CHUNK), max(size, HV_PT_CHUNK));
     memset(hv_Ltop, 0, size);
 
     msr(VTCR_EL2, FIELD_PREP(VTCR_PS, pa_range) |              // Full PA size
@@ -781,7 +793,8 @@ int hv_pt_check_ctrr(void)
         printf("HV: no memory is read-only on the other cores (CTRR is 0)\n");
         return 0;
     }
-    if (upper < lower) {
+    // No physical address has more than 52 bits (pa_bits of hv_pt_init())
+    if (upper < lower || upper >= BIT(52)) {
         printf("HV: the range read-only on the other cores (CTRR) makes no sense: 0x%lx..0x%lx\n",
                lower, upper);
         return -1;

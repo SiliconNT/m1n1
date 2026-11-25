@@ -100,14 +100,23 @@ static void memset64(void *dst, u64 value, size_t size)
  * which never takes anything back; tables given back are on the lists of hv_vm.c
  * (spare_bytes() below). The memory comes from memalign(), which tools/m1n1_heap of the
  * SiliconNT repository links to a heapblock of its own.
+ *
+ * Where the heap would end is kept besides: ProxyUtils of the host puts guest RAM at a fixed
+ * distance above that, and guest RAM starts on a page of 16 KB (SELFBOOT_PAGE; HV.map_hw() of
+ * the proxy client maps by 16 KB too). So the end has to stay on one, as dlmalloc leaves it.
  */
+#define HEAP_PAGE 0x4000UL
 static size_t heap_bytes;
+static u64 heap_end;
+static unsigned long heap_off_page; /* how often it was not, after something was taken */
 
 static void *mock_heapblock_alloc_aligned(size_t size, size_t align)
 {
     void *p = memalign(align, size);
     assert(p && !((u64)p & (align - 1)));
     heap_bytes += size;
+    heap_end = ALIGN_UP(heap_end, (u64)align) + size;
+    heap_off_page += heap_end % HEAP_PAGE != 0;
     return p;
 }
 
@@ -127,7 +136,10 @@ static int hv_xtrack_start(void)
     return xtrack_start_ret;
 }
 
-#include "hv_vm_pt.inc"
+#ifndef PT_INC
+#define PT_INC "hv_vm_pt.inc"
+#endif
+#include PT_INC
 
 /* What the lists of hv_vm.c hold of the tables given back */
 static size_t spare_bytes(void)
@@ -368,10 +380,18 @@ static void verify_range(u64 start, u64 end)
         verify(start + ((rnd() % (end - start)) & ~3UL));
 }
 
+static void check_heap_end(const char *what)
+{
+    check(heap_off_page == 0 && heap_end % HEAP_PAGE == 0,
+          "%s: the heap ends at 0x%lx, not on a page of 16 KB (%lu times so far)", what, heap_end,
+          heap_off_page);
+}
+
 static void verify_all(void)
 {
     for (unsigned i = 0; i < nr_ops; i++)
         verify_range(ops[i].start, ops[i].end);
+    check_heap_end("mapped");
 }
 
 /* ---- the calls, each noted in the list -------------------------------------------------- */
@@ -484,6 +504,7 @@ static void init(u64 mmfr0, u64 ram, u64 m1n1, u64 top)
     nr_ops = 0;
     xtrack = false;
     hv_pt_init();
+    check_heap_end("hv_pt_init()");
 }
 
 static void start_xtrack(void)
@@ -756,6 +777,59 @@ static void test_ctrr(void)
     reg_ctrr_lwr = CTRR_UPR;
     reg_ctrr_upr = CTRR_LWR;
     check_ctrr(-1, "the upper register below the lower one");
+    /* ...nor one whose end is no address: what comes after it would be 0 */
+    reg_ctrr_lwr = CTRR_LWR;
+    reg_ctrr_upr = ~0UL;
+    check_ctrr(-1, "the upper register all ones");
+    reg_ctrr_lwr = ~0UL;
+    check_ctrr(-1, "both registers all ones");
+    reg_ctrr_lwr = CTRR_LWR;
+    reg_ctrr_upr = BIT(52);
+    check_ctrr(-1, "the upper register past the last address there can be");
+    /* Memory the guest cannot have: past the end of its address space, which ends at 42 bits */
+    reg_ctrr_lwr = BIT(42);
+    reg_ctrr_upr = BIT(52) - 0x1000;
+    check_ctrr(0, "all of it past the end of the address space of the guest");
+    t_map_hw(BIT(42) - 0x1000, BIT(42) - 0x1000, 0x1000);
+    reg_ctrr_lwr = BIT(42) - 0x1000;
+    check_ctrr(-1, "its first page the last one of the address space of the guest");
+}
+
+/*
+ * One firmware after another in the same boot: hv_init() each time, the second time a guest
+ * that is refused, for what it has of the range of CTRR. Where the heap ends is where the host
+ * puts the next one, so that has to stay on a page of 16 KB all the way.
+ */
+static void test_again(void)
+{
+    printf("one load after another\n");
+    the_cpu.apple_sysregs_unlocked = false;
+    reg_ctrr_lwr = CTRR_LWR;
+    reg_ctrr_upr = CTRR_UPR;
+
+    for (int i = 0; i < 4; i++) {
+        init(M4_MMFR0, M4_RAM, M4_M1N1, 1UL << 42);
+        t_hook(0x5000000000, 0x10000, HOOK(20));
+        t_hook(0x5100000000, 10 * 0x20000, HOOK(21));
+        check_heap_end("hv_init()");
+        py_map_hw(0x200000000, 0x200000000, 0x3a0000000);
+        py_map_hw(M4_RAM, M4_RAM, R50_IBOOT - M4_RAM);
+        py_map_hw(R50_GUEST, R50_GUEST, 0x10400000000UL - R50_GUEST);
+        t_hook(0x3ad200000, 0x1000, HOOK(22));
+        if (i == 1)
+            t_map_hw(CTRR_UPR, CTRR_UPR, 0x1000);
+        check_heap_end("the mappings");
+        start_xtrack();
+        check_heap_end("taking memory apart");
+        check_ctrr(i == 1 ? -1 : 0, "one load after another");
+        for (int cpu = 0; cpu < 10; cpu++)
+            t_hook(0x210050100 + cpu * 0x100000UL, 8, HOOK(24));
+        /* Tables come and go: a mapping over what has been taken apart, and apart again */
+        t_map_hw(0x210000000, 0x210000000, 0x1000000);
+        t_unmap(0x210001004, 8);
+        check_heap_end("the hooks of the cores");
+        verify_all();
+    }
 }
 
 /* Other sizes of physical address: PARange, bits, bits of guest physical address */
@@ -795,6 +869,7 @@ int main(void)
     test_m4();
     test_sizes();
     test_ctrr();
+    test_again();
 
     printf("pt-model: %lu checks, %lu failed\n", checks, failures);
     if (failures)

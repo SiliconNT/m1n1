@@ -9,6 +9,8 @@
 #
 #   make        build them and run them
 #   make pt     only the page table one
+#   make pt-broken  ...against hv_vm.c with one thing wrong at a time in where the tables come
+#               from or in the check of the range of CTRR: it must fail on each
 #   make xtrack only the execution tracking one
 #   make xtrack-broken  ...against hv_xtrack.c with one thing wrong in it at a time: it must
 #               fail on each
@@ -27,9 +29,9 @@ SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -pthread -I. -Ibuild
 ROUNDS ?= 200000
 
-.PHONY: all psci pmu pt xtrack xtrack-broken xinsn dbg aic tsan vgic-broken clean
+.PHONY: all psci pmu pt pt-broken xtrack xtrack-broken xinsn dbg aic tsan vgic-broken clean
 
-all: build/model psci pmu pt xinsn xtrack xtrack-broken dbg aic vgic-broken
+all: build/model psci pmu pt pt-broken xinsn xtrack xtrack-broken dbg aic vgic-broken
 	build/model $(ROUNDS)
 
 # The breakpoint and watchpoint registers of the guest, src/hv/hv_dbg.c
@@ -98,6 +100,40 @@ xtrack-broken: $(BROKEN:%=build/xtrack-broken-%)
 build/pt-model: pt_test.c $(wildcard *.h) build/hv_vm_pt.inc build/hv_xpage.h build/arm_cpu_regs.h \
 	build/hv_aicmap.h
 	$(CC) $(CFLAGS) -o $@ pt_test.c
+
+# Every change must change something (cmp), or the source has moved on
+PT_BROKEN := small-chunk first-level-not-rounded never-reused l3-not-given-back \
+	kboot-end page-step flag-ignored order-not-checked end-not-checked zero-not-special \
+	refusal-ignored
+BREAK_PT_small-chunk := s/HV_PT_CHUNK 0x4000UL/HV_PT_CHUNK 0x2000UL/
+BREAK_PT_first-level-not-rounded := s/hv_Ltop = heapblock_alloc_aligned(ALIGN_UP(size, HV_PT_CHUNK),/hv_Ltop = heapblock_alloc_aligned(size,/
+BREAK_PT_never-reused := s/^    if (!\*spares) {$$/    if (1) {/
+BREAK_PT_l3-not-given-back := /^    hv_pt_table_free(l3, ENTRIES_PER_L3_TABLE/d
+BREAK_PT_kboot-end := s/ALIGN_DOWN(upper, PAGE_SIZE) + PAGE_SIZE;/ALIGN_UP(upper, PAGE_SIZE);/
+BREAK_PT_page-step := s/addr += BIT(VADDR_L4_OFFSET_BITS)/addr += PAGE_SIZE/
+BREAK_PT_flag-ignored := s/if (cpu_features->apple_sysregs_unlocked)/if (0)/
+BREAK_PT_order-not-checked := s/if (upper < lower || /if (/
+BREAK_PT_end-not-checked := s/ || upper >= BIT(52)) {/) {/
+BREAK_PT_zero-not-special := s/if (!lower \&\& !upper) {/if (0) {/
+BREAK_PT_refusal-ignored := s/if (hv_pt_walk(addr)) {/if (0) {/
+
+build/hv_vm_pt-broken-%.inc: build/hv_vm_pt.inc Makefile
+	sed -e '$(BREAK_PT_$*)' $< > $@
+	! cmp -s $< $@
+
+build/pt-broken-%: build/pt-model build/hv_vm_pt-broken-%.inc
+	$(CC) $(CFLAGS) -Wno-error -DPT_INC='"hv_vm_pt-broken-$*.inc"' -o $@ pt_test.c
+
+pt-broken: $(PT_BROKEN:%=build/pt-broken-%)
+	@for n in $(PT_BROKEN); do \
+		if timeout 120 build/pt-broken-$$n > build/pt-broken-$$n.log 2>&1; then \
+			echo "pt-broken-$$n: the test passes and must not"; exit 1; \
+		fi; \
+		grep -q -m1 '^FAIL' build/pt-broken-$$n.log || \
+			{ echo "pt-broken-$$n: ended without a failed check"; exit 1; }; \
+	done
+	@$(foreach n,$(PT_BROKEN),echo "pt-broken: $(n): $$(grep -m1 '^FAIL' build/pt-broken-$(n).log)";)
+	@echo "pt-broken: all $(words $(PT_BROKEN)) failed, as they must"
 
 # The instruction decoder of execution tracking, src/hv/hv_xinsn.c: where an instruction reads
 # or writes (xinsn_test.c), and every word against the disassembler of binutils (test_xinsn.py)

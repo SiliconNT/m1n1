@@ -101,9 +101,11 @@
  */
 
 #include "hv.h"
+#include "assert.h"
 #include "cpu_regs.h"
 #include "malloc.h"
 #include "memory.h"
+#include "selfboot.h"
 #include "smp.h"
 #include "utils.h"
 
@@ -152,6 +154,8 @@
  */
 #ifndef XT_MAX_PAGES
 #define XT_MAX_PAGES 8192
+static_assert(XT_MAX_PAGES * XT_PAGE == SELFBOOT_SHADOW_PAGES,
+              "selfboot_m1n1_heap() keeps other than what the shadow pages take");
 #endif
 
 /* By IPA of the page; page == 0 is a free entry */
