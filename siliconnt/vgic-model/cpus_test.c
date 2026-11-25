@@ -726,8 +726,9 @@ void hv_enter_guest(u64 x0, u64 x1, u64 x2, u64 x3, void *entry, u64 spsr)
           "core %d is still waited for", me);
     CHECK(!*reg_slot(&cores[me], "CNTP_CTL_EL0"), "core %d has a tick", me);
     CHECK(!*reg_slot(&cores[me], R_VM_TMR_FIQ), "core %d: the timers of the guest", me);
-    if (slow_back)
-        usleep(30000);
+    /* The others: longer than hv_start() waits by itself before it looks for them (200 ms) */
+    if (slow_back && me != BOOT)
+        usleep(300000);
 }
 
 static u32 rnd(u32 n)
@@ -1819,6 +1820,44 @@ static void test_no_host(void)
     CHECK(0, "the hypervisor has ended");
 }
 
+/*
+ * CPU_ON while the guest is being left: core 3 has come into EL2 for it while the boot core had
+ * the lock, to tell the host something, and gets the lock once the host has left the guest. It is
+ * answered, and nobody goes in.
+ */
+static bool leaving_go;
+
+static void guest_leaving_cpu_on(int cpu)
+{
+    if (cpu == BOOT) {
+        turn_on(3);
+        exc_entry();
+        __atomic_store_n(&leaving_go, true, __ATOMIC_SEQ_CST);
+        /* It waits for the lock, out of the guest: the rendezvous does not wait for it */
+        while (__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_SEQ_CST) & BIT(3))
+            sched_yield();
+        model_exc_proxy(START_HV, HV_USER_INTERRUPT);
+        CHECK(0, "the boot core is in the guest, which the host has left");
+        abort();
+    }
+    while (!__atomic_load_n(&leaving_go, __ATOMIC_SEQ_CST))
+        sched_yield();
+    exc_entry();
+    CHECK(hv_is_leaving(), "core 3 has the lock before the host has left");
+    CHECK(cpu_on(5, (void *)0x8000400000, 0) == 0, "CPU_ON of core 5 while leaving");
+    CHECK(!hv_started_cpus[5], "core 5 is let into the guest that is being left");
+    exc_exit();
+    CHECK(0, "core 3 is in the guest");
+    abort();
+}
+
+static void test_leaving_cpu_on(void)
+{
+    run_guest(guest_leaving_cpu_on);
+    CHECK(!cores[5].entered, "core 5 was in the guest");
+    CHECK(host_calls == 1, "the host was told of %d things", host_calls);
+}
+
 /* ---- who ticks ---- */
 
 static bool tick_boot_off, tick_boot_on, tick_boot_done;
@@ -1926,7 +1965,10 @@ static void test_tick_race(void)
 static int switch_step;
 static bool switch_by_exit;
 
-/* The host, on core BOOT: go to core 3. On core 3, in its CPU_OFF: here it is, go on */
+/*
+ * The host, on core BOOT: go to core 3. On core 3, in its CPU_OFF: here it is, go on. Then, on
+ * core BOOT again: leave. Told to leave first, core 3 never shows up.
+ */
 static int host_switches(int reason, u32 code)
 {
     UNUSED(reason);
@@ -1938,6 +1980,10 @@ static int host_switches(int reason, u32 code)
             CHECK(hv_switch_cpu(3), "core 3 cannot be switched to");
             return EXC_RET_HANDLED;
         case 1:
+            if (switch_by_exit) {
+                CHECK(me == BOOT && code == HV_USER_INTERRUPT, "core %d, %d", me, code);
+                return EXC_EXIT_GUEST;
+            }
             CHECK(me == 3 && code == HV_CPU_SWITCH, "core %d, %d", me, code);
             CHECK(hv_started_cpus[3], "core 3 is off");
             return EXC_RET_HANDLED;
@@ -2047,6 +2093,7 @@ static const struct {
     {"exit-last", test_exit_last},
     {"exit-wfi", test_exit_wfi},
     {"two-stops", test_two_stops},
+    {"leaving-cpu-on", test_leaving_cpu_on},
     {"no-host", test_no_host},
     {"tick", test_tick},
     {"tick-race", test_tick_race},

@@ -2362,7 +2362,7 @@ static void off_tests(void)
     settle_all();
     cores[0].masked = true;
     cores[0].timer = true;
-    was = taken(0, 3);
+    was = total(0);
     cur = 6;
     guest_send(sgi_to(0, 3));
     settle(0);
@@ -2373,6 +2373,8 @@ static void off_tests(void)
     for (u32 i = 0; i < NR_SGIS; i++) /* more than there are list registers */
         guest_send(sgi_to(0, i));
     settle(0);
+    /* Some wait for a list register: the Redistributor of core 0 says so to another core */
+    CHECK(rd32(GICR(0, GICR_ISPENDR0)) & 0xffff);
     guest_cpu_off(0);
     cores[0].timer = false;
     cores[0].masked = false;
@@ -2387,11 +2389,12 @@ static void off_tests(void)
     CHECK(!atomic_load(&cores[0].ipi));
     guest_cpu_on(0);
     settle(0);
-    CHECK(taken(0, 3) == was && !taken(0, HV_VGIC_INTID_VTIMER) && nr_valid_lrs(0) == 0);
+    /* None of them, and not the timer: nothing at all */
+    CHECK(total(0) == was && nr_valid_lrs(0) == 0);
     cur = 6;
     guest_send(sgi_to(0, 3));
     settle(0);
-    CHECK(taken(0, 3) == was + 1);
+    CHECK(total(0) == was + 1);
     printf("ok   off: SGIs and the timer do not outlast it\n");
 
     /* An SPI that any core may take goes to the boot core, and without that to the first */
@@ -2573,6 +2576,11 @@ static void *toggled_thread(void *arg)
         atomic_store(&toggled[cpu].came, 1);
         while (!is_started(cpu))
             sched_yield();
+        /*
+         * Its first tick (hv_enter_secondary()), a millisecond away if it is the core that ticks,
+         * which the SPIs for any core go to: what has waited for it is delivered
+         */
+        hv_exit();
     }
     return NULL;
 }

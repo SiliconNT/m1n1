@@ -36,9 +36,10 @@ void model_window(void);
         model_window();                                                                            \
     } while (0)
 
-/* Timers, SGIs and SPIs: not here */
+/* Timers, SGIs and SPIs: not here. What it leaves of the guest's timers: their FIQs are on */
 void hv_update_fiq(void)
 {
+    msr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V | VM_TMR_FIQ_ENA_ENA_P);
 }
 
 u64 hv_translate(u64 addr, bool s1only, bool w, u64 *par_out)
