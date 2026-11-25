@@ -176,6 +176,18 @@ static void test_layout_refuses_what_does_not_fit(void)
     CHECK_EQ(selfboot_layout_init(&l, R21_MEM_TOP + 0x4000, &ba), -1);
 }
 
+/*
+ * What m1n1 keeps for itself above its heap: the 32 MB of shadow pages, a table of 4 KB for
+ * every 2 MB of memory, 16 MB more (SiliconNT docs/findings/0099, 8). 80, 112 and 304 MB on
+ * 16, 32 and 128 GB.
+ */
+static void test_m1n1_heap(void)
+{
+    CHECK_EQ(selfboot_m1n1_heap(16UL << 30), 80UL << 20);
+    CHECK_EQ(selfboot_m1n1_heap(32UL << 30), 112UL << 20);
+    CHECK_EQ(selfboot_m1n1_heap(128UL << 30), 304UL << 20);
+}
+
 static void test_layout_refuses_a_framebuffer_in_guest_ram(void)
 {
     struct selfboot_layout l;
@@ -531,6 +543,7 @@ int main(int argc, char **argv)
     test_layout_of_r21();
     test_layout_rounds();
     test_layout_refuses_what_does_not_fit();
+    test_m1n1_heap();
     test_layout_refuses_a_framebuffer_in_guest_ram();
     test_layout_refuses_memory_map_entries_in_the_way();
     test_layout_needs_the_memory_map();

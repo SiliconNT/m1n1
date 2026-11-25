@@ -42,8 +42,11 @@
 
 /* Where the heap of m1n1 ends when it is asked to start the firmware: not a whole page */
 #define HEAP_TOP 0x1000898f040UL
-/* 128 MB above that, up to the next 16 KB: where guest RAM starts when m1n1 loads by itself */
-#define SELF_PHYS_BASE 0x10010990000UL
+/*
+ * 80 MB above that, up to the next 16 KB: where guest RAM starts when m1n1 loads by itself.
+ * What m1n1 keeps for itself on 16 GB of memory: 32 MB, 16 GB / 512, 16 MB.
+ */
+#define SELF_PHYS_BASE 0x1000d990000UL
 #define WINDOW         (48UL << 20)
 #define FILL           0xee
 
@@ -247,6 +250,7 @@ enum ev {
     EV_UNMAP,      /* a: from, c: size */
     EV_MAP_VUART,  /* a: base, b: irq, c: iodev */
     EV_XTRACK,
+    EV_CTRR,
     EV_IODEV_USAGE, /* a: iodev, b: usage */
     EV_FB_SHUTDOWN, /* a: restore_logo */
     EV_DC_CVAU,     /* a: address, c: length */
@@ -308,6 +312,8 @@ static const char *missing_file;
 static int map_hw_fails_at; /* the how-manieth call of hv_map_hw() fails; -1: none */
 static u64 sctlr_el12;
 static bool xtrack_fails;
+/* The guest has some of the memory that is read-only on the other cores (CTRR) */
+static bool ctrr_fails;
 /*
  * What hv_start() does. With a host the guest runs until the host leaves it, and hv_start()
  * returns. Without one it runs for good, and hv_start() does not return: here it goes back to
@@ -324,12 +330,14 @@ static iodev_usage_t usages[IODEV_NUM], usages_before[IODEV_NUM];
 static bool nvme_up;
 static u64 hcr_el2, actlr_el12;
 static int map_hw_calls, stray;
+/* Where the heap of m1n1 ends: HEAP_TOP, unless a test says otherwise */
+static u64 heap_top;
 
 void *heapblock_alloc(size_t size)
 {
     /* Asking for nothing says where the heap ends; nothing may be taken from it here */
     stray += size != 0;
-    return (void *)HEAP_TOP;
+    return (void *)heap_top;
 }
 
 void heapblock_set_limit(void *limit)
@@ -441,6 +449,13 @@ int hv_pt_xtrack(void)
     return xtrack_fails ? -1 : 0;
 }
 
+/* src/hv/hv_vm.c, which has its own test in siliconnt/vgic-model/pt_test.c */
+int hv_pt_check_ctrr(void)
+{
+    note(EV_CTRR, 0, 0, 0);
+    return ctrr_fails ? -1 : 0;
+}
+
 void hv_start(void *entry, u64 regs[4])
 {
     note(EV_HV_START, (u64)entry, regs[0], regs[1] | regs[2] | regs[3]);
@@ -499,6 +514,8 @@ static void reset(void)
     map_hw_fails_at = -1;
     map_hw_calls = 0;
     xtrack_fails = false;
+    ctrr_fails = false;
+    heap_top = HEAP_TOP;
     hv_start_does = GUEST_STAYS;
     /* The proxy on the first USB port; a console on the UART, the screen, the second port */
     memset(usages, 0, sizeof(usages));
@@ -842,6 +859,13 @@ static void check_entry(const struct where *w, int host_iodev)
           first(EV_XTRACK) > last(EV_MAP_VUART));
     CHECK(first(EV_MAP_HW) > first(EV_HV_INIT));
 
+    /*
+     * The memory that is read-only on the other cores: once every mapping is there, and
+     * while the screen is still m1n1's, to say so on (hv_start() asks again)
+     */
+    CHECK_EQ(count(EV_CTRR), 1);
+    CHECK(first(EV_CTRR) > first(EV_XTRACK) && first(EV_CTRR) < first(EV_FB_SHUTDOWN));
+
     /* The image is in the instruction cache's view before anything executes it */
     CHECK_EQ(the(EV_DC_CVAU)->a, w->image);
     CHECK_EQ(the(EV_DC_CVAU)->c, IMAGE_SIZE);
@@ -885,6 +909,7 @@ static void check_not_started(int ret)
     CHECK_EQ(count(EV_HV_START), 0);
     CHECK_EQ(count(EV_WRITE_HCR) + count(EV_WRITE_HACR) + count(EV_MSR), 0);
     CHECK_EQ(count(EV_MAP_HW) + count(EV_UNMAP) + count(EV_MAP_VUART) + count(EV_XTRACK), 0);
+    CHECK_EQ(count(EV_CTRR), 0);
     CHECK_EQ(count(EV_IODEV_USAGE) + count(EV_FB_SHUTDOWN), 0);
     /* The SSD controller is not left running */
     CHECK_EQ(count(EV_NVME_SHUTDOWN), nvme_fails ? 0 : count(EV_NVME_INIT));
@@ -914,7 +939,7 @@ static void check_not_entered(int ret, int host_iodev)
     CHECK_EQ(ret, -1);
     CHECK_EQ(count(EV_HV_INIT), 1);
     CHECK_EQ(count(EV_HV_START), 0);
-    CHECK_EQ(count(EV_XTRACK), 0);
+    CHECK_EQ(count(EV_XTRACK) + count(EV_CTRR), 0);
     /* The screen as it was; the consoles that are not USB ports are not even touched */
     CHECK_EQ(count(EV_FB_SHUTDOWN), 0);
     if (host_iodev >= 0)
@@ -937,7 +962,7 @@ static void test_from_the_ssd(void)
     /* The guest ran and was left */
     CHECK_EQ(from_the_ssd(), ENTERED);
 
-    /* Guest RAM starts 128 MB above the heap, on a 16 KB page, and the heap ends there */
+    /* Guest RAM starts 80 MB above the heap, on a 16 KB page, and the heap ends there */
     limit = the(EV_HEAP_LIMIT);
     CHECK_EQ(limit->a, SELF_PHYS_BASE);
 
@@ -1121,25 +1146,29 @@ static void test_loaded_by_a_host(void)
 
 /*
  * Without a host, a step between taking the ports and entering the guest fails: a mapping,
- * execution tracking, or the hypervisor itself (hv_start() returns). m1n1 goes back to the
- * proxy, and every port is what it was: with P_SELFBOOT_RUN the one the command came over is
- * the proxy's again, so that a host can connect again. With a host nothing is given back: its
- * port was never taken, and the spare ones stay the guest's, as before.
+ * execution tracking, the check of the memory that is read-only on the other cores, or the
+ * hypervisor itself (hv_start() returns). m1n1 goes back to the proxy, and every port is what
+ * it was: with P_SELFBOOT_RUN the one the command came over is the proxy's again, so that a
+ * host can connect again. With a host nothing is given back: its port was never taken, and
+ * the spare ones stay the guest's, as before.
  */
 static void test_not_entered_without_a_host(void)
 {
     struct where w = where(R21_PHYS_BASE);
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         reset();
         put_files(&w);
         map_hw_fails_at = i == 0 ? 0 : -1;
         xtrack_fails = i == 1;
-        hv_start_does = i == 2 ? NOT_ENTERED : GUEST_STAYS;
+        ctrr_fails = i == 2;
+        hv_start_does = i == 3 ? NOT_ENTERED : GUEST_STAYS;
         CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, SELFBOOT_NO_HOST), -1);
         CHECK_EQ(count(EV_HV_INIT), 1);
         CHECK_EQ(count(EV_XTRACK), i >= 1);
-        CHECK_EQ(count(EV_HV_START), i == 2);
+        CHECK_EQ(count(EV_CTRR), i >= 2);
+        CHECK_EQ(count(EV_FB_SHUTDOWN), i == 3);
+        CHECK_EQ(count(EV_HV_START), i == 3);
         check_ports_given_back(-1);
         CHECK_EQ(usages[IODEV_USB0], 3);
         CHECK_EQ(stray, 0);
@@ -1152,12 +1181,16 @@ static void test_not_entered_without_a_host(void)
     check_ports_given_back(-1);
 
     /* With a host: a mapping that fails, and hv_start() returning, are as before */
-    reset();
-    put_files(&w);
-    xtrack_fails = true;
-    CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), -1);
-    check_ports_given_back(IODEV_USB0);
-    CHECK_EQ(usages[IODEV_USB0 + 1], 0);
+    for (int i = 0; i < 2; i++) {
+        reset();
+        put_files(&w);
+        xtrack_fails = i == 0;
+        ctrr_fails = i == 1;
+        CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), -1);
+        CHECK_EQ(count(EV_HV_START) + count(EV_FB_SHUTDOWN), 0);
+        check_ports_given_back(IODEV_USB0);
+        CHECK_EQ(usages[IODEV_USB0 + 1], 0);
+    }
 
     reset();
     put_files(&w);
@@ -1216,6 +1249,20 @@ static void test_loaded_refuses(void)
     check_not_started(loaded(R21_PHYS_BASE + 0x1000, IMAGE_SIZE, DISK_SIZE, 4));
     reset();
     check_not_started(loaded(HEAP_TOP & ~0x3fffUL, IMAGE_SIZE, DISK_SIZE, 4));
+    /*
+     * One that leaves m1n1 a byte less above its heap than it keeps when it loads by itself,
+     * and one that leaves it just as much
+     */
+    reset();
+    put_files(&w);
+    heap_top = R21_PHYS_BASE - selfboot_m1n1_heap(mem_size_actual) + 1;
+    check_not_started(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, 4));
+    reset();
+    put_files(&w);
+    heap_top = R21_PHYS_BASE - selfboot_m1n1_heap(mem_size_actual);
+    hv_start_does = GUEST_LEFT;
+    CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), 0);
+    CHECK_EQ(count(EV_HV_START), 1);
 
     /* The image is not there; the disk is not there; sizes that are not theirs */
     reset();

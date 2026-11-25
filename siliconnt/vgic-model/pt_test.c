@@ -40,13 +40,29 @@
 
 static u64 reg_mmfr0, reg_vtcr, reg_vttbr;
 static unsigned long tlb_flushes;
+/* The range of CTRR that iBoot leaves locked on the other cores, and how often it was read */
+static u64 reg_ctrr_lwr, reg_ctrr_upr;
+static unsigned long ctrr_reads;
 
 static u64 mock_mrs(const char *reg)
 {
     if (!strcmp(reg, "ID_AA64MMFR0_EL1"))
         return reg_mmfr0;
+    if (!strcmp(reg, "SYS_IMP_APL_CTRR_C_LWR_EL1")) {
+        ctrr_reads++;
+        return reg_ctrr_lwr;
+    }
+    if (!strcmp(reg, "SYS_IMP_APL_CTRR_C_UPR_EL1")) {
+        ctrr_reads++;
+        return reg_ctrr_upr;
+    }
     return 0;
 }
+
+/* src/utils.h: what the hypervisor asks of the CPU it runs on */
+static struct {
+    bool apple_sysregs_unlocked;
+} the_cpu, *cpu_features = &the_cpu;
 
 static void mock_msr(const char *reg, u64 val)
 {
@@ -79,46 +95,23 @@ static void memset64(void *dst, u64 value, size_t size)
         p[i] = value;
 }
 
-/* The heap of m1n1 is small: count what the tables take */
-#define NR_SLOTS  (1u << 18)
-#define TOMBSTONE ((void *)1)
-static struct {
-    void *p;
-    size_t size;
-} slots[NR_SLOTS];
-static size_t live_bytes;
+/*
+ * The heap of m1n1 is small: count what the tables take of it. They come from heapblock,
+ * which never takes anything back; tables given back are on the lists of hv_vm.c
+ * (spare_bytes() below). The memory comes from memalign(), which tools/m1n1_heap of the
+ * SiliconNT repository links to a heapblock of its own.
+ */
+static size_t heap_bytes;
 
-static void *mock_memalign(size_t align, size_t size)
+static void *mock_heapblock_alloc_aligned(size_t size, size_t align)
 {
     void *p = memalign(align, size);
     assert(p && !((u64)p & (align - 1)));
-
-    unsigned i = ((u64)p >> 12) % NR_SLOTS;
-    while (slots[i].p && slots[i].p != TOMBSTONE)
-        i = (i + 1) % NR_SLOTS;
-    slots[i].p = p;
-    slots[i].size = size;
-    live_bytes += size;
+    heap_bytes += size;
     return p;
 }
 
-static void mock_free(void *p)
-{
-    if (!p)
-        return;
-
-    unsigned i = ((u64)p >> 12) % NR_SLOTS;
-    while (slots[i].p != p) {
-        assert(slots[i].p); /* freed something that was never allocated */
-        i = (i + 1) % NR_SLOTS;
-    }
-    slots[i].p = TOMBSTONE;
-    live_bytes -= slots[i].size;
-    free(p);
-}
-
-#define memalign(a, s) mock_memalign(a, s)
-#define free(p)        mock_free(p)
+#define heapblock_alloc_aligned(s, a) mock_heapblock_alloc_aligned(s, a)
 
 uint64_t ram_base;
 static u64 m1n1_base;
@@ -135,6 +128,24 @@ static int hv_xtrack_start(void)
 }
 
 #include "hv_vm_pt.inc"
+
+/* What the lists of hv_vm.c hold of the tables given back */
+static size_t spare_bytes(void)
+{
+    size_t bytes = 0;
+
+    for (struct hv_pt_spare *t = hv_pt_spare_4k; t; t = t->next)
+        bytes += 0x1000;
+    for (struct hv_pt_spare *t = hv_pt_spare_8k; t; t = t->next)
+        bytes += 0x2000;
+    return bytes;
+}
+
+/* ...and what the tables in use take */
+static size_t table_bytes(void)
+{
+    return heap_bytes - spare_bytes();
+}
 
 /* ---- checks --------------------------------------------------------------------------- */
 
@@ -582,11 +593,11 @@ static void test_m4(void)
     /* Execution tracking: memory page by page, and the tables still fit the heap of m1n1 */
     start_xtrack();
     verify_all();
-    printf("  page tables while execution is tracked: %zu MiB\n", live_bytes >> 20);
-    check(live_bytes < (48UL << 20),
-          "the page tables take %zu MiB of a heap of 128 MiB: device registers taken apart "
-          "into pages?",
-          live_bytes >> 20);
+    printf("  page tables while execution is tracked: %zu MiB\n", table_bytes() >> 20);
+    /* A table of 4 KB for every 2 MB of the 15.25 GiB of memory, 30.5 MiB, and little else */
+    check(table_bytes() < (32UL << 20),
+          "the page tables take %zu MiB: device registers taken apart into pages?",
+          table_bytes() >> 20);
     check(s2_walk(0x1000000000).level == 2 && s2_walk(0x1000000000).xn == 2,
           "device registers are not left as a block that cannot be executed");
 
@@ -646,13 +657,105 @@ static void test_m4(void)
     t_unmap(0x1cb0001004, 8);
     verify_all();
 
-    /* One mapping over what has been taken apart: the tables underneath are given back */
-    size_t before = live_bytes;
+    /*
+     * One mapping over what has been taken apart: the tables underneath are given back, a
+     * table of level 3 and one of level 4 for the two words
+     */
+    size_t before = table_bytes(), heap = heap_bytes, spare = spare_bytes();
     t_map_hw(0x1c50000000, 0x1c50000000, 0x40000000);
     t_map_hw(0x1cb0000000, 0x1cb0000000, 0x10000000);
-    check(live_bytes < before, "tables under a new mapping are not freed (%zu, then %zu bytes)",
-          before, live_bytes);
+    check(table_bytes() == before - 0x3000 && spare_bytes() == spare + 0x3000 &&
+              heap_bytes == heap,
+          "tables under a new mapping are not given back: %zu, then %zu bytes in use, %zu "
+          "then %zu given back",
+          before, table_bytes(), spare, spare_bytes());
     verify_all();
+
+    /* ...and taken again, each by its size, before anything more is taken from the heap */
+    t_hook(0x1cb0002000, 8, HOOK(22));
+    check(spare_bytes() == spare && heap_bytes == heap,
+          "a table of level 3 and one of level 4: %zu bytes taken from the heap, %zu from "
+          "those given back",
+          heap_bytes - heap, spare + 0x3000 - spare_bytes());
+    verify_all();
+}
+
+/*
+ * The memory iBoot leaves read-only on the other cores (CTRR). The registers and the mappings
+ * are those of R50 (SiliconNT docs/lab/2026-11-24-all-cores-probe-plan.md, "那块只读内存在哪"):
+ * the lower register is 0x10005850000, the upper one 0x1000585b000, which kboot.c takes to be
+ * the end; the memory below iBoot's and guest RAM above m1n1's heap are mapped, and in between
+ * is that range, the boot arguments of iBoot, m1n1 and its heap.
+ */
+#define CTRR_LWR  0x10005850000UL
+#define CTRR_UPR  0x1000585b000UL
+#define R50_IBOOT 0x10002e70000UL
+#define R50_GUEST 0x1001802c000UL
+
+static void check_ctrr(int want, const char *what)
+{
+    unsigned long reads = ctrr_reads;
+    int got = hv_pt_check_ctrr();
+
+    check(got == want, "CTRR, %s: hv_pt_check_ctrr() returns %d, not %d", what, got, want);
+    check(ctrr_reads - reads == (the_cpu.apple_sysregs_unlocked ? 0 : 2),
+          "CTRR, %s: %lu reads of the registers", what, ctrr_reads - reads);
+}
+
+static void test_ctrr(void)
+{
+    printf("the range of CTRR\n");
+    init(M4_MMFR0, M4_RAM, M4_M1N1, 1UL << 42);
+    the_cpu.apple_sysregs_unlocked = false;
+    reg_ctrr_lwr = CTRR_LWR;
+    reg_ctrr_upr = CTRR_UPR;
+
+    py_map_hw(M4_RAM, M4_RAM, R50_IBOOT - M4_RAM);
+    py_map_hw(R50_GUEST, R50_GUEST, 0x10400000000UL - R50_GUEST);
+    check_ctrr(0, "as R50 has it");
+
+    /* The pages on either side are not in it */
+    t_map_hw(CTRR_LWR - 0x1000, CTRR_LWR - 0x1000, 0x1000);
+    t_map_hw(CTRR_UPR + 0x1000, CTRR_UPR + 0x1000, 0x1000);
+    check_ctrr(0, "the page before it and the page after it mapped");
+
+    /* Its first page; the last one, which kboot.c leaves out; a hook in the middle */
+    t_map_hw(CTRR_LWR, CTRR_LWR, 0x1000);
+    check_ctrr(-1, "its first page mapped");
+    t_unmap(CTRR_LWR, 0x1000);
+    t_map_hw(CTRR_UPR, CTRR_UPR, 0x1000);
+    check_ctrr(-1, "the page the upper register points to mapped");
+    t_unmap(CTRR_UPR, 0x1000);
+    t_hook(CTRR_LWR + 0x5000, 0x1000, HOOK(23));
+    check_ctrr(-1, "a hook in it");
+    t_unmap(CTRR_LWR + 0x5000, 0x1000);
+    /* Two words of a page, not the first ones; the last word there is */
+    t_hook(CTRR_LWR + 0x5008, 8, HOOK(23));
+    check_ctrr(-1, "two words of a page in it");
+    t_unmap(CTRR_LWR + 0x5000, 0x1000);
+    t_hook(CTRR_UPR + 0xffc, 4, HOOK(23));
+    check_ctrr(-1, "the last word of it");
+    t_unmap(CTRR_UPR, 0x1000);
+    check_ctrr(0, "all of it taken away again");
+
+    /* Guest RAM over all of it, as a block, and as pages once execution is tracked */
+    t_map_hw(0x10005800000, 0x10005800000, 0x200000);
+    check_ctrr(-1, "in a block of 2 MB");
+    start_xtrack();
+    check_ctrr(-1, "in a block of 2 MB, taken apart into pages");
+    verify_all();
+
+    /* A machine that has no such memory is not asked for it; nor is a range of nothing */
+    the_cpu.apple_sysregs_unlocked = true;
+    check_ctrr(0, "apple_sysregs_unlocked");
+    the_cpu.apple_sysregs_unlocked = false;
+    reg_ctrr_lwr = reg_ctrr_upr = 0;
+    t_map_hw(0, 0, 0x1000);
+    check_ctrr(0, "both registers 0, page 0 mapped");
+    /* ...but a range the wrong way round is no range that has been looked at */
+    reg_ctrr_lwr = CTRR_UPR;
+    reg_ctrr_upr = CTRR_LWR;
+    check_ctrr(-1, "the upper register below the lower one");
 }
 
 /* Other sizes of physical address: PARange, bits, bits of guest physical address */
@@ -691,6 +794,7 @@ int main(void)
 {
     test_m4();
     test_sizes();
+    test_ctrr();
 
     printf("pt-model: %lu checks, %lu failed\n", checks, failures);
     if (failures)

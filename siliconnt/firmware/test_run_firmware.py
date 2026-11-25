@@ -24,12 +24,15 @@ sys.path.append(str(PROXYCLIENT))
 
 from m1n1.utils import align, align_up
 from m1n1 import sysreg
+from m1n1.tgtypes import BootArgs_r3
 
 # What the M4 reported (R9a, hello-before-r9a.txt and wfitest-1cpu.txt)
 M4 = dict(
     m1n1_base=0x10002e70000,
     ba_phys_base=0x10002e70000,
     ba_mem_size=0x3d87a0000,
+    # all of the 16 GB, mem_size_act (R23: docs/lab/2026-11-15-selfboot-rehearsal-plan/)
+    ba_mem_size_actual=0x400000000,
     devtree_size=0x84000,
     heap_top=0x10018eb8000,
     fb_base=0x103e004c000, fb_stride=0x2f40, fb_width=3024, fb_height=1964,
@@ -51,9 +54,14 @@ assert len(AICMAP_M4_LINES) == 391
 # For --loader m1n1. Three of the ranges of /arm-io that R21 mapped (SiliconNT
 # docs/lab/2026-11-15-boot-disk-4k-plan/run.txt); the UART lies in the first.
 ARM_IO = [(0x200000000, 0x3a0000000), (0x800000000, 0x2e0000000), (0x1cb0000000, 0x10000000)]
-# ProxyUtils keeps 128 MB for m1n1's heap and 128 MB for its own below the start of guest RAM
+# What m1n1 keeps for itself above its heap on this M4: 32 MB + 16 GB / 512 + 16 MB
+# (selfboot_m1n1_heap() of src/selfboot.c)
+M1N1_KEPT = 80 << 20
+# ProxyUtils keeps that for m1n1's heap, and 128 MB for its own, below the start of guest RAM
 HOST_HEAP_BASE = M4["heap_top"] - (128 << 20)
-M1N1_HEAP_TOP = HOST_HEAP_BASE - (128 << 20)
+M1N1_HEAP_TOP = HOST_HEAP_BASE - M1N1_KEPT
+# Where the proxy says the boot arguments are (P_GET_BOOTARGS), and their revision
+BOOTARGS_ADDR, BOOTARGS_REV = 0x10005058000, 3
 RAM_BASE = M4["heap_top"] & ~0xffffffff
 
 class EXC(enum.IntEnum):
@@ -121,6 +129,9 @@ def make_fakes(case):
                                 entered=None, sigints=[], writes=[], writes_at_entry=None,
                                 readbacks=[], printed=b"", kd={}, xtrack=None,
                                 xtrack_state=None,
+                                # what ProxyUtils was told to keep for m1n1; whether tracking
+                                # was on at each HV.pt_update() of the script
+                                m1n1_heap=None, pt_updates=[],
                                 # --loader m1n1
                                 selfboot=None, selfboot_sent=0.0, selfboot_done=False, interrupts=[],
                                 timeout_at_entry="not entered", debugger_at_entry=None,
@@ -189,6 +200,10 @@ def make_fakes(case):
             sys.stdout.write("".join("TTY> " + line for line in
                                      bytes(data).decode().splitlines(keepends=True)))
         def readstruct(self, addr, stype):
+            if stype is BootArgs_r3:
+                assert addr == BOOTARGS_ADDR
+                return types.SimpleNamespace(mem_size_actual=case.get(
+                    "mem_size_actual", M4["ba_mem_size_actual"]))
             assert stype == "ExcInfo"
             return types.SimpleNamespace(elr=rec.image_base + 0x8600)
         def readmem(self, addr, size):
@@ -216,6 +231,8 @@ def make_fakes(case):
     class M1N1Proxy:
         def __init__(self, iface, debug=False):
             self.iface = iface
+        def get_bootargs_rev(self):
+            return BOOTARGS_ADDR, case.get("bootargs_rev", BOOTARGS_REV)
         def heapblock_alloc(self, size):
             assert size == 0
             rec.heap_reads.append(rec.selfboot_done)
@@ -308,6 +325,7 @@ def make_fakes(case):
 
     class ProxyUtils:
         def __init__(self, p, heap_size, m1n1_heap):
+            rec.m1n1_heap = m1n1_heap
             self.base = M4["m1n1_base"]
             self.heap_top = heap_top
             self.heap_base = heap_top - heap_size
@@ -384,6 +402,8 @@ def make_fakes(case):
             self.mem_size = self.mem_top - self.phys_base
         def _load_executable_raw(self, image, base, label):
             rec.loaded = (base, len(image), label)
+        def pt_update(self):
+            rec.pt_updates.append((rec.loaded is not None, rec.xtrack))
         def _write_boot_args(self, top_of_kernel_data):
             rec.bootargs_top = top_of_kernel_data
             rec.bootargs_at = self.guest_base + self.bootargs_off
@@ -524,6 +544,15 @@ check("check-only prints the EL1 state the firmware starts in",
 check("check-only prints where the table of AIC lines goes, and does not have it written",
       f"AIC to GIC table     0x{AICMAP:x} .. 0x{AICMAP + 0x4000:x}" in out and
       rec.aicmap_calls == [], out)
+
+# 1a. what ProxyUtils keeps for m1n1 above its heap: what m1n1 keeps when it loads by itself,
+# by the size of memory
+check("m1n1 is kept 80 MB on 16 GB of memory", rec.m1n1_heap == M1N1_KEPT, f"{rec.m1n1_heap}")
+rec, out, code = run({"mem_size_actual": 128 << 30}, "--check-only", *image_args)
+check("...and 304 MB on 128 GB", rec.m1n1_heap == 304 << 20, f"{rec.m1n1_heap}")
+rec, out, code = run({"bootargs_rev": 4}, "--check-only", *image_args)
+check("boot arguments of a revision ProxyUtils does not know end the run before it is made",
+      isinstance(code, str) and "revision 4" in code and rec.m1n1_heap is None, f"{code!r}")
 
 # 2. the whole run
 rec, out, code = run({}, "--seconds", "30", *image_args)
@@ -1045,15 +1074,17 @@ check("execution tracking is on by default",
       code == 0 and rec.xtrack is True and "Execution tracking: on" in out, f"{rec.xtrack} {out[-300:]}")
 check("it is turned on after the image is loaded and before the guest is entered",
       rec.xtrack_state == (True, 0, True) and rec.hv_start is not None, f"{rec.xtrack_state}")
+check("the memory is mapped once, after the image is loaded and before tracking is turned on",
+      rec.pt_updates == [(True, None)], f"{rec.pt_updates}")
 
 rec, out, code = run({}, "--seconds", "1", "--xtrack", "el1", *image_args)
 check("there is no tracking of EL1 alone to ask for", code != 0 and rec.hv_start is None,
       f"{code!r}")
 
 rec, out, code = run({}, "--seconds", "1", "--xtrack", "off", *image_args)
-check("--xtrack off leaves it off and says what that means",
+check("--xtrack off leaves it off and says what that means, and the mapping to HV.start()",
       code == 0 and rec.xtrack is None and rec.hv_start is not None and
-      "Execution tracking: off" in out, f"{rec.xtrack}")
+      "Execution tracking: off" in out and rec.pt_updates == [], f"{rec.xtrack} {rec.pt_updates}")
 
 rec, out, code = run({"xtrack_ret": 0xffffffffffffffff}, "--seconds", "1", *image_args)
 check("a hypervisor that refuses stops the run before the guest is entered",
@@ -1174,7 +1205,7 @@ check("m1n1 loader: how long m1n1 took to get to the guest is reported",
 check("m1n1 loader: m1n1's heap is read right before the command and after the guest was left",
       rec.heap_reads == [False, True] and
       f"m1n1's heap: its top went from 0x{M1N1_HEAP_TOP:x} to 0x{M1N1_HEAP_TOP + (31 << 20):x}, "
-      "31.0 MiB; 97.0 MiB are left below its limit" in out, f"{rec.heap_reads} {tty(out)[-1500:]}")
+      "31.0 MiB; 49.0 MiB are left below its limit" in out, f"{rec.heap_reads} {tty(out)[-1500:]}")
 looked_up = {addr for addr, after in rec.pt_walks}
 check("m1n1 loader: stage 2 is looked up after the guest has been left: both ends of every "
       "range of /arm-io, the UART, m1n1, the host's heap and both ends of guest RAM",

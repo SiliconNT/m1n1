@@ -95,7 +95,8 @@ xtrack-broken: $(BROKEN:%=build/xtrack-broken-%)
 	@$(foreach n,$(BROKEN),echo "xtrack-broken: $(n) $(BREAK_$(n)_IS): $$(grep -m1 '^FAIL' build/xtrack-broken-$(n).log)";)
 	@echo "xtrack-broken: all $(words $(BROKEN)) failed, as they must"
 
-build/pt-model: pt_test.c $(wildcard *.h) build/hv_vm_pt.inc build/hv_xpage.h build/arm_cpu_regs.h
+build/pt-model: pt_test.c $(wildcard *.h) build/hv_vm_pt.inc build/hv_xpage.h build/arm_cpu_regs.h \
+	build/hv_aicmap.h
 	$(CC) $(CFLAGS) -o $@ pt_test.c
 
 # The instruction decoder of execution tracking, src/hv/hv_xinsn.c: where an instruction reads

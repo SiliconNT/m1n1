@@ -10,7 +10,8 @@ from the boot disk, the PMUv3 registers (src/hv/hv_pmu.c), which the M4 does not
 Execution tracking (--xtrack, src/hv/hv_xtrack.c) is how Windows gets them: no memory of the
 guest is executable until the hypervisor has scanned it and replaced the accesses to those
 registers, whether the code runs at EL1 or at EL0. It is turned on after everything has been
-put into guest memory and before the guest is entered.
+put into guest memory and mapped, and before the guest is entered: memory is taken apart into
+4 KB pages then, all of it at once, as m1n1 does it when it loads by itself.
 
 What the firmware is handed, and where things go. Guest RAM starts at the top of the heap
 this script keeps for itself, above m1n1 and m1n1's own heap (HV._prepare_load()), so what
@@ -82,10 +83,9 @@ P_SELFBOOT_RUN. m1n1 then does the rest with the code it runs when it starts wit
 host (selfboot_run_loaded(), src/selfboot_run.c): it works out the same layout from the
 start of guest RAM and the two sizes, checks both files where they lie, writes the boot
 arguments and the device tree, sets up the hypervisor, maps the memory, turns execution
-tracking on and enters the firmware. Three things are not as with the host's loader
-(SiliconNT docs/findings/0044): the guest's debug exceptions go to the guest and not to
-EL2, the few registers the host answers for itself are the devices, and memory is taken
-apart into 4 KB pages before the guest runs.
+tracking on and enters the firmware. Two things are not as with the host's loader
+(SiliconNT docs/findings/0044, 0099): the guest's debug exceptions go to the guest and not to
+EL2, and the few registers the host answers for itself are the devices.
 
 Without a host nobody answers what the hypervisor cannot deal with by itself, so with
 --loader m1n1 this script does not answer either: the first event that reaches it ends the
@@ -269,6 +269,7 @@ from m1n1.utils import *
 from m1n1.sysreg import *
 from m1n1.hv import HV, HV_EVENT
 from m1n1.hw.pmu import PMU
+from m1n1.tgtypes import BootArgs_r1, BootArgs_r2, BootArgs_r3
 
 # Where the version string sits in the image, and what it says in this build. The raw image
 # is loaded as it is, so an offset into the file is an offset from the base in memory.
@@ -283,8 +284,22 @@ iface = UartInterface()
 p = M1N1Proxy(iface, debug=False)
 bootstrap_port(iface, p)
 
-u = ProxyUtils(p, heap_size=128 * 1024 * 1024,
-               m1n1_heap=128 * 1024 * 1024)
+def m1n1_heap(mem_size):
+    """What m1n1 keeps for itself above its heap: the shadow pages of execution tracking,
+    a stage 2 table of 4 KB for every 2 MB of memory, and room for the rest. The same as
+    selfboot_m1n1_heap() of src/selfboot.c, which m1n1 checks the start of guest RAM against
+    with --loader m1n1. mem_size is all the memory there is, mem_size_actual."""
+    return (32 << 20) + mem_size // 512 + (16 << 20)
+
+# ProxyUtils needs it when it is made, before it reads the boot arguments itself: read them
+# here as it does
+ba_addr, ba_rev = p.get_bootargs_rev()
+if ba_rev > 3:
+    sys.exit(f"The boot arguments are of revision {ba_rev}, which ProxyUtils does not know")
+ba_struct = {2: BootArgs_r2, 3: BootArgs_r3}.get(ba_rev, BootArgs_r1)
+mem_size_actual = iface.readstruct(ba_addr, ba_struct).mem_size_actual
+
+u = ProxyUtils(p, heap_size=128 * 1024 * 1024, m1n1_heap=m1n1_heap(mem_size_actual))
 
 # An m1n1 without the changes of this tree has no GIC to offer the firmware
 version_got = iface.readmem(u.base + version_off, len(version_want))
@@ -1017,14 +1032,16 @@ def load_firmware(hv, image, disk, layout):
 
 load_firmware(hv, image, disk, layout)
 
-# After the memory of the guest has been filled, and before it is mapped: HV.start() makes the
-# mappings (HV.pt_update()), and the hypervisor makes them not executable as it goes. A 2 MB
-# block of memory is taken apart into pages when one of its pages is first scanned, not here.
-# What the host writes from here on (the device tree, in HV.start()) is data.
+# After the memory of the guest has been filled and mapped. HV._prepare_load() has asked for
+# the memory, and HV.pt_update() maps it now, in 2 MB blocks; turning tracking on takes them
+# apart into pages, all of them, before any core runs the guest (SiliconNT docs/DESIGN.md,
+# "一页内存的三种状态"). HV.start() then only adds the registers it answers for itself. What
+# the host writes from here on (the device tree, in HV.start()) is data.
 if args.xtrack == "off":
     print("Execution tracking: off. A guest that reads the PMUv3 cycle counter takes an "
           "exception")
 else:
+    hv.pt_update()
     if p.hv_xtrack() != 0:
         sys.exit("The hypervisor refused to track execution. The guest has not run.")
     print("Execution tracking: on")

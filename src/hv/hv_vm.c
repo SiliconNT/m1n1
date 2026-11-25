@@ -6,9 +6,9 @@
 #include "assert.h"
 #include "cpu_regs.h"
 #include "exception.h"
+#include "heapblock.h"
 #include "hv_sprr.h"
 #include "iodev.h"
-#include "malloc.h"
 #include "smp.h"
 #include "string.h"
 #include "types.h"
@@ -140,6 +140,47 @@ static u64 hv_pt_xn;
 #define HV_PT_NO_PAGE (~0UL)
 static u64 hv_pt_switching;
 
+/*
+ * The tables come from heapblock, not from malloc: dlmalloc takes 8 KB off the heap for a
+ * table of 4 KB aligned to 4 KB, and how much m1n1 keeps for itself is worked out from the
+ * size of the tables (selfboot_m1n1_heap(), SiliconNT docs/findings/0099, 8 and 9). A table
+ * that is given back goes on a list of its size, and is taken from there first; the lists
+ * outlive hv_pt_init(), as heapblock never takes anything back. The first level is taken
+ * once for every hv_pt_init(), and not given back.
+ */
+struct hv_pt_spare {
+    struct hv_pt_spare *next;
+};
+
+/* Tables given back: of 4 KB (levels 2 and 3), and of 8 KB (level 4, the sub-page one) */
+static struct hv_pt_spare *hv_pt_spare_4k, *hv_pt_spare_8k;
+
+static struct hv_pt_spare **hv_pt_spares(size_t size)
+{
+    assert(size == PAGE_SIZE || size == 2 * PAGE_SIZE);
+    return size == PAGE_SIZE ? &hv_pt_spare_4k : &hv_pt_spare_8k;
+}
+
+static u64 *hv_pt_table_alloc(size_t size)
+{
+    struct hv_pt_spare **spares = hv_pt_spares(size);
+    struct hv_pt_spare *table = *spares;
+
+    if (!table)
+        return heapblock_alloc_aligned(size, PAGE_SIZE);
+    *spares = table->next;
+    return (u64 *)table;
+}
+
+static void hv_pt_table_free(u64 *table, size_t size)
+{
+    struct hv_pt_spare **spares = hv_pt_spares(size);
+    struct hv_pt_spare *spare = (struct hv_pt_spare *)table;
+
+    spare->next = *spares;
+    *spares = spare;
+}
+
 void hv_pt_init(void)
 {
     hv_pt_xn = 0;
@@ -154,7 +195,7 @@ void hv_pt_init(void)
 
     // The tables of the first level lie side by side, aligned to the size of them all
     u64 size = max(sizeof(u64) * ENTRIES_PER_L1_TABLE, PAGE_SIZE);
-    hv_Ltop = memalign(size, size);
+    hv_Ltop = heapblock_alloc_aligned(size, size);
     memset(hv_Ltop, 0, size);
 
     msr(VTCR_EL2, FIELD_PREP(VTCR_PS, pa_range) |              // Full PA size
@@ -179,7 +220,7 @@ static u64 *hv_pt_get_l2(u64 from)
     if (L1_IS_TABLE(l1d))
         return (u64 *)(l1d & PTE_TARGET_MASK);
 
-    u64 *l2 = (u64 *)memalign(PAGE_SIZE, ENTRIES_PER_L2_TABLE * sizeof(u64));
+    u64 *l2 = hv_pt_table_alloc(ENTRIES_PER_L2_TABLE * sizeof(u64));
     memset64(l2, 0, ENTRIES_PER_L2_TABLE * sizeof(u64));
 
     l1d = ((u64)l2) | FIELD_PREP(PTE_TYPE, PTE_TABLE) | PTE_VALID;
@@ -194,8 +235,9 @@ static void hv_pt_free_l3(u64 *l3)
 
     for (u64 idx = 0; idx < ENTRIES_PER_L3_TABLE; idx++)
         if (IS_SW(l3[idx]) && FIELD_GET(PTE_TYPE, l3[idx]) == PTE_TABLE)
-            free((void *)(l3[idx] & PTE_TARGET_MASK));
-    free(l3);
+            hv_pt_table_free((u64 *)(l3[idx] & PTE_TARGET_MASK),
+                             ENTRIES_PER_L4_TABLE * sizeof(u64));
+    hv_pt_table_free(l3, ENTRIES_PER_L3_TABLE * sizeof(u64));
 }
 
 static void hv_pt_map_l2(u64 from, u64 to, u64 size, u64 incr)
@@ -228,7 +270,7 @@ static u64 *hv_pt_get_l3(u64 from)
     if (L2_IS_TABLE(l2d))
         return (u64 *)(l2d & PTE_TARGET_MASK);
 
-    u64 *l3 = (u64 *)memalign(PAGE_SIZE, ENTRIES_PER_L3_TABLE * sizeof(u64));
+    u64 *l3 = hv_pt_table_alloc(ENTRIES_PER_L3_TABLE * sizeof(u64));
     if (l2d) {
         u64 incr = 0;
         u64 l3d = l2d;
@@ -266,7 +308,8 @@ static void hv_pt_map_l3(u64 from, u64 to, u64 size, u64 incr)
         u64 *l3 = hv_pt_get_l3(from);
 
         if (L3_IS_TABLE(l3[idx]))
-            free((void *)(l3[idx] & PTE_TARGET_MASK));
+            hv_pt_table_free((u64 *)(l3[idx] & PTE_TARGET_MASK),
+                             ENTRIES_PER_L4_TABLE * sizeof(u64));
 
         l3[idx] = to;
         from += BIT(VADDR_L3_OFFSET_BITS);
@@ -290,7 +333,7 @@ static u64 *hv_pt_get_l4(u64 from)
         l3d |= FIELD_PREP(PTE_TYPE, PTE_BLOCK) | FIELD_PREP(SPTE_TYPE, SPTE_MAP);
     }
 
-    u64 *l4 = (u64 *)memalign(PAGE_SIZE, ENTRIES_PER_L4_TABLE * sizeof(u64));
+    u64 *l4 = hv_pt_table_alloc(ENTRIES_PER_L4_TABLE * sizeof(u64));
     if (l3d) {
         u64 incr = 0;
         u64 l4d = l3d;
@@ -712,6 +755,51 @@ u64 hv_translate_insn(u64 addr)
     if (!IS_HW(pte))
         return 0;
     return (pte & PTE_TARGET_MASK_L4) | (ipa & MASK(VADDR_L4_OFFSET_BITS));
+}
+
+/*
+ * The memory that iBoot leaves read-only for the cores other than the boot core (CTRR): none
+ * of it may be the guest's (SiliconNT docs/DESIGN.md, 4). The machines that have it say so as
+ * they do for kboot.c, which keeps it from Linux: apple_sysregs_unlocked is false. Its range
+ * is read here, on the boot core, and looked up in the tables: wherever memory is mapped here,
+ * the guest's address is the physical one. Word by word, as a page can be taken apart into
+ * words (level 4), where the first one says nothing about the rest. The upper register is
+ * taken to be where the last page starts, one page more than kboot.c takes. That costs the
+ * guest nothing: on the M4 that page is m1n1's (SiliconNT docs/findings/0100, 15).
+ *
+ * Returns 0 if the guest has none of it, -1 if it has or if the range makes no sense, after
+ * saying so.
+ */
+int hv_pt_check_ctrr(void)
+{
+    if (cpu_features->apple_sysregs_unlocked)
+        return 0;
+
+    u64 lower = mrs(SYS_IMP_APL_CTRR_C_LWR_EL1), upper = mrs(SYS_IMP_APL_CTRR_C_UPR_EL1);
+    /* Nothing is set, so nothing is locked: not seen on a machine */
+    if (!lower && !upper) {
+        printf("HV: no memory is read-only on the other cores (CTRR is 0)\n");
+        return 0;
+    }
+    if (upper < lower) {
+        printf("HV: the range read-only on the other cores (CTRR) makes no sense: 0x%lx..0x%lx\n",
+               lower, upper);
+        return -1;
+    }
+
+    u64 start = ALIGN_DOWN(lower, PAGE_SIZE), end = ALIGN_DOWN(upper, PAGE_SIZE) + PAGE_SIZE;
+    for (u64 addr = start; addr < end && addr < BIT(vaddr_bits);
+         addr += BIT(VADDR_L4_OFFSET_BITS)) {
+        if (hv_pt_walk(addr)) {
+            printf("HV: 0x%lx is mapped for the guest, in 0x%lx..0x%lx, read-only on the "
+                   "other cores (CTRR)\n",
+                   addr, start, end);
+            return -1;
+        }
+    }
+    printf("HV: 0x%lx..0x%lx, read-only on the other cores (CTRR), is not the guest's\n", start,
+           end);
+    return 0;
 }
 
 #define CHECK_RN                                                                                   \

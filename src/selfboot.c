@@ -90,6 +90,13 @@ int selfboot_layout_init(struct selfboot_layout *l, u64 phys_base, const struct 
     return 0;
 }
 
+/* m1n1_heap() of run_firmware.py */
+u64 selfboot_m1n1_heap(u64 mem_size)
+{
+    /* A table of the third level is 512 entries of 4 KB each: 4 KB of table for 2 MB of memory */
+    return SELFBOOT_SHADOW_PAGES + mem_size / 512 + SELFBOOT_HEAP_SPARE;
+}
+
 u64 selfboot_image_room(const struct selfboot_layout *l)
 {
     return l->uefi_base - l->image_base - SELFBOOT_BOOTARGS_SIZE - SELFBOOT_AICMAP_SIZE;

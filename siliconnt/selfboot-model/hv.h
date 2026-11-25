@@ -21,5 +21,6 @@ int hv_map_hw(u64 from, u64 to, u64 size);
 int hv_unmap(u64 from, u64 size);
 void hv_map_vuart(u64 base, int irq, iodev_id_t iodev);
 int hv_pt_xtrack(void);
+int hv_pt_check_ctrr(void);
 void hv_start(void *entry, u64 regs[4]);
 #endif

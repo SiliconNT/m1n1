@@ -62,6 +62,17 @@ struct selfboot_layout {
  */
 int selfboot_layout_init(struct selfboot_layout *l, u64 phys_base, const struct boot_args *ba);
 
+/*
+ * How much m1n1 keeps for itself between where its heap ends and guest RAM, for the
+ * hypervisor (SiliconNT docs/DESIGN.md, "目标机自己开机" 1): the shadow pages of execution
+ * tracking (XT_MAX_PAGES pages of XT_PAGE, src/hv/hv_xtrack.c), a stage 2 table of 4 KB for
+ * every 2 MB of memory, and room for the rest. mem_size is all the memory there is,
+ * mem_size_actual of the boot arguments. run_firmware.py keeps the same for ProxyUtils.
+ */
+#define SELFBOOT_SHADOW_PAGES (32UL << 20)
+#define SELFBOOT_HEAP_SPARE   (16UL << 20)
+u64 selfboot_m1n1_heap(u64 mem_size);
+
 /* The most bytes the firmware image may have: the size of the buffer to read it into */
 u64 selfboot_image_room(const struct selfboot_layout *l);
 /* The image, read to image_base, has this size: sets bootargs, aicmap and disk_base */
@@ -104,9 +115,6 @@ int selfboot_adt_unname(void *dest, const char *path);
  * between run_firmware.py and HV.start() of proxyclient/m1n1/hv/__init__.py.
  */
 
-/* m1n1 keeps this much above where its heap ends now, for the stage 2 page tables above all */
-#define SELFBOOT_M1N1_HEAP (128UL << 20)
-
 /* The two files, on the FAT32 partition that the variable siliconnt=<its UUID> names */
 #define SELFBOOT_IMAGE_FILE "siliconnt/firmware.fd"
 #define SELFBOOT_DISK_FILE  "siliconnt/bootdisk.img"
@@ -121,8 +129,8 @@ int selfboot_read_files(struct selfboot_layout *l, const char *part_uuid,
 
 /*
  * For payload.c, in a build with CHAINLOADING. Reads the two files from the partition into
- * guest memory, which starts SELFBOOT_M1N1_HEAP above m1n1's heap, hands the firmware what it
- * needs and enters it as the guest of the hypervisor, on the boot CPU.
+ * guest memory, which starts selfboot_m1n1_heap() above m1n1's heap, hands the firmware what
+ * it needs and enters it as the guest of the hypervisor, on the boot CPU.
  *
  * Returns -1 if the guest was not entered: m1n1 goes on to the proxy then. Returns 0 once the
  * guest has been left, which takes a host.
@@ -131,7 +139,8 @@ int selfboot_run(const char *part_uuid);
 
 /*
  * The same, for the proxy, when a host has put the two files where the layout above
- * phys_base has them: nothing is read. host_iodev is the port m1n1 talks to the host over;
+ * phys_base has them: nothing is read. phys_base has to leave m1n1 as much above its heap as
+ * selfboot_run() does. host_iodev is the port m1n1 talks to the host over;
  * it stays a console, and what the guest writes to its UART goes there too. Or it is
  * SELFBOOT_NO_HOST: the host is not staying, and the guest runs as if m1n1 had read the files
  * itself (SiliconNT docs/findings/0068, how R37 tests a machine without a host).

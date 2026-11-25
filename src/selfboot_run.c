@@ -243,13 +243,20 @@ static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
 
     /*
      * Execution tracking, when all the memory is mapped: this is where it is taken apart
-     * into pages (hv_pt_xtrack() of src/hv/hv_vm.c). run_firmware.py turns it on before
-     * HV.start() makes the mappings.
+     * into pages (hv_pt_xtrack() of src/hv/hv_vm.c). run_firmware.py has HV.pt_update() make
+     * the mappings first too.
      */
     if (hv_pt_xtrack() < 0) {
         printf("selfboot: the hypervisor refused to track execution\n");
         return selfboot_give_back(usage, host);
     }
+
+    /*
+     * Not in run_firmware.py, as for the GIC above: hv_start() checks, for every guest, but
+     * this says so while the screen is still m1n1's
+     */
+    if (hv_pt_check_ctrr() < 0)
+        return selfboot_give_back(usage, host);
 
     /*
      * HV.start(): from here on m1n1 prints to the host only, if there is one, and the screen
@@ -274,7 +281,8 @@ static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
 int selfboot_run(const char *part_uuid)
 {
     /* Where ProxyUtils of the host puts its own heap: here guest RAM starts there */
-    u64 phys_base = ALIGN_UP((u64)heapblock_alloc(0) + SELFBOOT_M1N1_HEAP, SELFBOOT_PAGE);
+    u64 phys_base = ALIGN_UP((u64)heapblock_alloc(0) + selfboot_m1n1_heap(mem_size_actual),
+                             SELFBOOT_PAGE);
     struct selfboot_layout l;
     int ret;
 
@@ -299,11 +307,13 @@ int selfboot_run(const char *part_uuid)
 
 int selfboot_run_loaded(u64 phys_base, u64 image_size, u64 disk_size, int host_iodev)
 {
+    u64 lowest = (u64)heapblock_alloc(0) + selfboot_m1n1_heap(mem_size_actual);
     struct selfboot_layout l;
 
-    if (phys_base % SELFBOOT_PAGE || phys_base < (u64)heapblock_alloc(0)) {
-        printf("selfboot: guest RAM cannot start at 0x%lx: not a page above m1n1's heap\n",
-               phys_base);
+    if (phys_base % SELFBOOT_PAGE || phys_base < lowest) {
+        printf("selfboot: guest RAM cannot start at 0x%lx: not a page at 0x%lx or above, where "
+               "m1n1 has room for its heap\n",
+               phys_base, lowest);
         return -1;
     }
     if (selfboot_layout_init(&l, phys_base, &cur_boot_args) < 0 ||

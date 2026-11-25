@@ -6,6 +6,7 @@
 #include "cpu_regs.h"
 #include "display.h"
 #include "gxf.h"
+#include "heapblock.h"
 #include "hv_sprr.h"
 #include "memory.h"
 #include "pcie.h"
@@ -266,6 +267,23 @@ void hv_start(void *entry, u64 regs[4])
         printf("CPU state hook setup failed, can't start the hypervisor\n");
         return;
     }
+
+    /* Both loaders have made every mapping by now: one check for the two */
+    if (hv_pt_check_ctrr() < 0) {
+        printf("HV: the guest has memory the other cores cannot write; can't start the "
+               "hypervisor\n");
+        return;
+    }
+
+    /*
+     * What the tables, the shadow pages and the rest of m1n1 have left of what was kept for
+     * them (selfboot_m1n1_heap()). dlmalloc may have more, of what it has taken already.
+     */
+    size_t heap_left;
+    if (heapblock_left(&heap_left))
+        printf("HV: %zu KiB of m1n1's heap left below its limit\n", heap_left >> 10);
+    else
+        printf("HV: m1n1's heap has no limit\n");
 
     memset(hv_should_exit, 0, sizeof(hv_should_exit));
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
