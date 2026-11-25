@@ -366,6 +366,7 @@ static void vgic_init_global(void)
         p->injected = p->maintenance = p->unmapped = p->spurious = p->retracted = 0;
         p->forwarded = p->late = p->spurious_run = 0;
         p->sgi_writes = p->sgi_deferred = p->spi_deferred = 0;
+        p->swapped = p->handed_on = 0;
         p->inits = p->off_active = 0;
     }
 

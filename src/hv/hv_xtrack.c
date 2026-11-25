@@ -1247,8 +1247,9 @@ void hv_xtrack_report(void)
 
     printf("HV: execution tracking: %ld pages scanned before they ran (%ld of them for EL0, %ld "
            "had instructions to replace), %ld us in all, longest %ld us; %ld faults on pages "
-           "already done or on their way\n",
-           xt_stats.scans, xt_stats.scans_el0, xt_stats.hits, us, longest, xt_stats.done);
+           "already done or on their way; %ld times a page began to change state\n",
+           xt_stats.scans, xt_stats.scans_el0, xt_stats.hits, us, longest, xt_stats.done,
+           hv_pt_switch_count());
     printf("HV: execution tracking: %d shadow pages in use now, %ld at most, room for %d; %ld "
            "times a page of code became data again (%ld of them for DC IVAC, %ld for a read that "
            "EL2 does not know how to carry out, %ld because the shadow page was out of date)\n",
