@@ -228,8 +228,8 @@ static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
     /*
      * HV.init(). The USB ports nobody talks over stop being m1n1's first: hv_init() gives the
      * interrupts of their port controllers back, for the guest (usb_hpm_restore_irqs() of
-     * src/usb.c). The other cores are left alone: hv_init() does not start them. What the
-     * ports were is kept, for a guest that is not entered without a host (selfboot_give_back())
+     * src/usb.c). It also has every other core come into EL2. What the ports were is kept, for a
+     * guest that is not entered without a host (selfboot_give_back())
      */
     for (int i = 0; i < IODEV_MAX; i++)
         usage[i] = iodev_get_usage(i);
@@ -237,6 +237,14 @@ static int selfboot_enter(struct selfboot_layout *l, iodev_id_t host)
         if (i != (int)host)
             iodev_set_usage(i, 0);
     hv_init();
+
+    /*
+     * Not in run_firmware.py, as for the GIC above: hv_start() checks, for every guest, but
+     * this says which core is missing while the screen is still m1n1's
+     */
+    if (!hv_cpus_ready())
+        return selfboot_give_back(usage, host);
+
     selfboot_regs();
     if (selfboot_map(l, host) < 0)
         return selfboot_give_back(usage, host);

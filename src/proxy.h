@@ -154,6 +154,7 @@ typedef enum {
     P_HV_XTRACK,
     P_SELFBOOT_RUN,
     P_HV_AICMAP,
+    P_HV_STARTED_CPUS,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,

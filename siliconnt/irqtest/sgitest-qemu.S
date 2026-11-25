@@ -12,7 +12,7 @@
  * Windows starts: it wakes the Redistributor of each CPU, which Windows never does. The
  * Distributor and the rest of the Redistributors are the guest's business. Then it fills in
  * the header of the image, starts the other CPUs through QEMU's PSCI and jumps to the image.
- * The hypervisor's PSCI has no CPU_ON yet; the loader starts the other CPUs there
+ * Under the hypervisor it is the loader that has the other CPUs enter the guest
  * (run_sgitest.py).
  */
 

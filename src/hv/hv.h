@@ -232,6 +232,7 @@ void hv_power_off(void);
 void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type, void *extra);
 void hv_set_time_stealing(bool enabled, bool reset);
 void hv_add_time(s64 time);
+void hv_write_cntvoff(void);
 u64 hv_pmcr0_read(void);
 void hv_pmcr0_write(u64 val);
 
@@ -278,6 +279,7 @@ void hv_start(void *entry, u64 regs[4]);
 bool hv_start_secondary(int cpu, void *entry, u64 regs[4]);
 void hv_exit_cpu(int cpu);
 void hv_rendezvous(void);
+u64 hv_get_started_cpus(void);
 bool hv_switch_cpu(int cpu);
 void hv_pin_cpu(int cpu);
 void hv_arm_tick(bool secondary);

@@ -23,7 +23,9 @@
 #   make psci-broken  the PSCI one against hv_psci.c with one thing wrong in CPU_ON at a
 #               time: it must fail on each
 #   make cpus   only the one for how the cores get into EL2 and into the guest: src/hv/hv.c and
-#               src/smp.c, and two functions of src/memory.c (cpus_test.c, with what is in cpus/)
+#               src/smp.c, and a few functions of src/memory.c and src/hv/hv_exc.c (cpus_test.c,
+#               with what is in cpus/); and test_hv_cpus.py: what the host knows of them (needs
+#               the Python of the proxy client)
 #   make cpus-broken  ...against one of those with one thing wrong at a time: it must fail on
 #               each, with a failed check or by hanging
 #   make tsan   test.c under ThreadSanitizer, with fewer rounds
@@ -247,21 +249,36 @@ build/cpus/mmu.c: cpus/mmu_head.c $(SRC)/memory.c
 build/cpus/%.o: build/cpus/%.c build/cpus/utils.h cpus/hw.h $(wildcard $(SRC)/*.h $(SRC)/hv/*.h)
 	$(CC) -c $(CPUS_CFLAGS) -Werror -o $@ $<
 
-build/cpus-model: cpus_test.c build/cpus/hv.o build/cpus/smp.o build/cpus/mmu.o build/cpus/stubs.o
+# The way of a core into EL2 and out of it: a function to the end of which is the first line
+# that is nothing but a closing brace
+build/cpus/exc.c: cpus/exc_head.c cpus/exc_tail.c $(SRC)/hv/hv_exc.c
+	@mkdir -p build/cpus
+	cp $< $@
+	for f in 'void hv_write_cntvoff(void)' 'static void hv_exc_entry(void)' 'static void hv_exc_exit(struct exc_info \*ctx)'; do \
+		test $$(grep -c "^$$f$$" $(SRC)/hv/hv_exc.c) = 1 || exit 1; \
+		sed -n "/^$$f$$/,/^}$$/p" $(SRC)/hv/hv_exc.c >> $@; \
+	done
+	cat cpus/exc_tail.c >> $@
+
+CPUS_OBJS := hv smp mmu exc stubs
+
+build/cpus-model: cpus_test.c $(CPUS_OBJS:%=build/cpus/%.o)
 	$(CC) $(CFLAGS) -o $@ $^
 
 cpus: build/cpus-model
 	build/cpus-model
+	$(PYTHON) test_hv_cpus.py
 
 # Every change must change something (cmp), or the source has moved on
 CPUS_BROKEN_hv := not-started after-vgic before-wfe-mode ready-ignored line-ignored busy-ignored \
 	beyond-ignored no-idle-wait not-copied no-leaving exit-kept masks sctlr-kept vbar-kept \
 	dbg-kept pmu-kept aborts-kept bit-after-lock started-not-set twice-in not-in-guest-bit \
-	log-all no-reason
+	log-all no-reason boot-cntvoff cntvoff mask-shifted boot-bit-after-lock
 CPUS_BROKEN_smp := rvbar-ignored start-again no-wait-result beyond-not-counted idle-always \
 	invalid-started boot-rvbar-kept boot-rvbar-locked
 CPUS_BROKEN_mmu := mmu-again
-CPUS_BROKEN := $(CPUS_BROKEN_hv) $(CPUS_BROKEN_smp) $(CPUS_BROKEN_mmu)
+CPUS_BROKEN_exc := bit-after-unlock bit-not-set exit-cntvoff
+CPUS_BROKEN := $(foreach f,hv smp mmu exc,$(CPUS_BROKEN_$(f)))
 BREAK_CPUS_not-started := /^void hv_init(void)/,/^}/{/^    hv_start_cpus();$$/d}
 BREAK_CPUS_after-vgic := /^void hv_init(void)/,/^}/{/^    hv_start_cpus();$$/d;s/^    hv_vgic_init();$$/&\n    hv_start_cpus();/}
 BREAK_CPUS_before-wfe-mode := /^void hv_init(void)/,/^}/{s/^    smp_set_wfe_mode(true);$$/    hv_start_cpus();\n&/;/^    hv_start_cpus();$$/d}
@@ -293,6 +310,13 @@ BREAK_CPUS_idle-always := s/    return !spin_table\[cpu\].target;/    return tru
 BREAK_CPUS_invalid-started := /^const char \*smp_try_start(/,/^}/{/if (!cpu_info\[cpu\].valid)/,+1d}
 BREAK_CPUS_boot-rvbar-kept := /^        smp_set_boot_rvbar(&cpu_info\[cpu\]);$$/d
 BREAK_CPUS_boot-rvbar-locked := /if (FIELD_GET(RVBAR_LOCK, read64(cpu->impl_reg)))/,+1d
+BREAK_CPUS_boot-cntvoff := /^void hv_start(/,/^}/{/^    hv_write_cntvoff();$$/d}
+BREAK_CPUS_cntvoff := /^static void hv_init_secondary(/,/^}/{/^    hv_write_cntvoff();$$/d}
+BREAK_CPUS_boot-bit-after-lock := /^void hv_start(/,/^}/{/^    __atomic_and_fetch(/d;s/^    hv_leaving = true;$$/&\n    __atomic_and_fetch(\&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);/}
+BREAK_CPUS_mask-shifted := /^u64 hv_get_started_cpus(/,/^}/{s/BIT(i)/BIT(i + 1)/}
+BREAK_CPUS_bit-after-unlock := /^static void hv_exc_exit(/,/^}/{/^    __atomic_or_fetch(/d;s/^    hv_maybe_exit();$$/&\n    __atomic_or_fetch(\&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);/}
+BREAK_CPUS_bit-not-set := /^static void hv_exc_exit(/,/^}/{/^    __atomic_or_fetch(/d}
+BREAK_CPUS_exit-cntvoff := /^static void hv_exc_exit(/,/^}/{/^    hv_write_cntvoff();$$/d}
 BREAK_CPUS_mmu-again := s/    if (read_sctlr() \& SCTLR_M)/    if (0)/
 
 define CPUS_BROKEN_RULES
@@ -300,13 +324,14 @@ build/cpus/$(1)-broken-%.c: build/cpus/$(1).c Makefile
 	sed -e '$$(BREAK_CPUS_$$*)' $$< > $$@
 	! cmp -s $$< $$@
 $(foreach n,$(CPUS_BROKEN_$(1)),build/cpus-broken-$(n)): build/cpus-broken-%: cpus_test.c \
-		build/cpus/$(1)-broken-%.o $(foreach o,$(filter-out $(1),hv smp mmu stubs),build/cpus/$(o).o)
+		build/cpus/$(1)-broken-%.o $(foreach o,$(filter-out $(1),$(CPUS_OBJS)),build/cpus/$(o).o)
 	$$(CC) $$(CFLAGS) -o $$@ $$^
 endef
 $(eval $(call CPUS_BROKEN_RULES,hv))
 $(eval $(call CPUS_BROKEN_RULES,smp))
 $(eval $(call CPUS_BROKEN_RULES,mmu))
-$(foreach f,hv smp mmu,$(CPUS_BROKEN_$(f):%=build/cpus/$(f)-broken-%.o)): CPUS_CFLAGS += -Wno-error -Wno-unused
+$(eval $(call CPUS_BROKEN_RULES,exc))
+$(foreach f,hv smp mmu exc,$(CPUS_BROKEN_$(f):%=build/cpus/$(f)-broken-%.o)): CPUS_CFLAGS += -Wno-error -Wno-unused
 
 cpus-broken: $(CPUS_BROKEN:%=build/cpus-broken-%)
 	@for n in $(CPUS_BROKEN); do \

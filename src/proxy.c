@@ -571,6 +571,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_AICMAP:
             reply->retval = hv_aicmap((struct hv_aicmap *)request->args[0]);
             break;
+        case P_HV_STARTED_CPUS:
+            reply->retval = hv_get_started_cpus();
+            break;
 
         case P_FB_INIT:
             fb_init(request->args[0]);

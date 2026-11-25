@@ -677,6 +677,7 @@ class M1N1Proxy(Reloadable):
     P_HV_XTRACK = 0xc14
     P_SELFBOOT_RUN = 0xc15
     P_HV_AICMAP = 0xc16
+    P_HV_STARTED_CPUS = 0xc17
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -1194,6 +1195,10 @@ class M1N1Proxy(Reloadable):
         which needs room for 3960 bytes. Returns its size in bytes, or -1 if there is none
         (m1n1 has said why on its console)."""
         return self.request(self.P_HV_AICMAP, dest, signed=True)
+    def hv_started_cpus(self):
+        """hv_get_started_cpus() of src/hv/hv.c: the CPUs the guest runs on now, a bit for
+        each"""
+        return self.request(self.P_HV_STARTED_CPUS)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)

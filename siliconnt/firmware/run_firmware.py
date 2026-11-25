@@ -936,9 +936,9 @@ if args.loader == "m1n1":
 # ---- --loader host: the hypervisor ---------------------------------------------------
 
 hv = HV(iface, p, u)
-# Boot CPU only: with hv.smp False, HV.init() does not start the secondary CPUs. By the same
-# hv.smp, HV.setup_adt(), which it calls later, would take the nodes of the cores that do not
-# run out of /cpus of the guest's device tree. The firmware is to find every core of the
+# It is hv_init() of m1n1 that has every core come into EL2, whatever hv.smp says. With hv.smp
+# False, HV.setup_adt(), which HV.init() calls later, would take the nodes of the cores that do
+# not run out of /cpus of the guest's device tree. The firmware is to find every core of the
 # machine there, as it does when m1n1 does the loading (src/selfboot.c hands it m1n1's own
 # tree): /cpus is what it makes the MADT from. So for HV.setup_adt(), and for nothing else,
 # hv.smp says to leave the nodes.

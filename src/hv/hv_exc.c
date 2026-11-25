@@ -153,6 +153,16 @@ void hv_add_time(s64 time)
     stolen_time -= (u64)time;
 }
 
+/*
+ * The offset of the virtual counter, the same on every core the guest runs on. The register is
+ * UNKNOWN after a reset: a core gets it before it first enters the guest (hv.c), and from then on
+ * every time it goes back there.
+ */
+void hv_write_cntvoff(void)
+{
+    msr(CNTVOFF_EL2, stolen_time);
+}
+
 void hv_update_fiq(void)
 {
     u64 hcr = mrs(HCR_EL2);
@@ -526,10 +536,15 @@ static void hv_exc_exit(struct exc_info *ctx)
     hv_sprr_timer_arm();
     /* reenable PMU counters */
     reg_set(SYS_IMP_APL_PMCR0, PERCPU(exc_entry_pmcr0_cnt));
-    msr(CNTVOFF_EL2, stolen_time);
+    hv_write_cntvoff();
+    /*
+     * Before the lock is let go of: whoever takes it next may hv_rendezvous(), and this core would
+     * go on into the guest without being seen. If it leaves the guest instead, it takes itself out
+     * again before it waits for the lock (hv_start(), hv_enter_secondary()).
+     */
+    __atomic_or_fetch(&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);
     spin_unlock(&bhl);
     hv_maybe_exit();
-    __atomic_or_fetch(&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);
 
     hv_set_spsr(ctx->spsr);
     hv_set_elr(ctx->elr);

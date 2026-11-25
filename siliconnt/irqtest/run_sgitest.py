@@ -38,7 +38,7 @@ starts it, one at a time and only after putting m1n1's idle loop into WFE mode, 
 never waits in WFI (M4 loses CPU state there, src/kboot.c). The guest gets onto it the way
 upstream gets an Apple guest onto its secondary CPUs: it writes the CPU start register of the
 power manager, the hypervisor intercepts that, and this script answers with
-hv_start_secondary(). The hypervisor's PSCI has no CPU_ON yet.
+hv_start_secondary(). It does not use the CPU_ON of the hypervisor's PSCI.
 
 The guest sets up the GIC itself, the way the Windows kernel does: the script tells it where
 the hypervisor emulates the Distributor and the Redistributors.
@@ -191,7 +191,8 @@ if args.secondary:
             sys.exit("Not going on. Any CPU that did start stays in m1n1's idle loop.")
 
 hv = HV(iface, p, u)
-# The script has started the secondary CPUs it wants; HV.init() is to leave the rest alone
+# The script has started the secondary CPUs it wants; hv_init() has the others wait in EL2. The
+# guest's device tree is to have the boot CPU only.
 hv.smp = False
 hv.init()
 
@@ -348,7 +349,6 @@ def start_secondary(die, cluster, core):
     entry = hv.guest_base + secondary_entry_off
     hv.log(f"Entering the guest on CPU {index} (slot {slot}) at 0x{entry:x}")
     hv.sysreg[index] = {}
-    hv.started_cpus[index] = (die, cluster, core)
     p.hv_start_secondary(index, entry, slot)
 
 hv.start_secondary = start_secondary

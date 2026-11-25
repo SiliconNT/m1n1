@@ -73,8 +73,8 @@ bootstrap_port(iface, p)
 u = ProxyUtils(p, heap_size=128 * 1024 * 1024,
                m1n1_heap=128 * 1024 * 1024)
 
-# An m1n1 without the changes of this tree would start the secondary CPUs in hv_init() and
-# hand IRQs to the guest. Make sure it is this build before going anywhere near that.
+# An m1n1 without the changes of this tree would hand IRQs to the guest. Make sure it is this
+# build before going anywhere near that.
 version_got = iface.readmem(u.base + version_off, len(version_want))
 print(f"m1n1 expected: {version_want[len(VERSION_MARK):].decode()}")
 print(f"m1n1 running:  {version_got[len(VERSION_MARK):].decode(errors='replace')!r}")
@@ -85,7 +85,7 @@ if args.check_only:
     sys.exit(0)
 
 hv = HV(iface, p, u)
-# Boot CPU only: the secondary CPUs are neither started nor shown to the guest
+# Boot CPU only: the secondary CPUs wait in EL2 and are not shown to the guest
 hv.smp = False
 hv.init()
 

@@ -7,8 +7,9 @@
  *
  *  - the machine: the device tree as far as smp_init() reads it, the registers of the power
  *    manager that start a core, RVBAR, the system registers of each core, the IPIs;
- *  - the guest: hv_enter_guest() runs a function on that thread until hv_exit_guest(), and
- *    what hv_exc.c does on the way into EL2 and out of it is in guest_exc() and guest_fiq();
+ *  - the guest: hv_enter_guest() runs a function on that thread until hv_exit_guest(). Its
+ *    way into EL2 and out of it is hv_exc_entry() and hv_exc_exit() of src/hv/hv_exc.c, the real
+ *    ones;
  *  - the rest of the hypervisor, which hv_init() and hv_start() call: nothing, most of it.
  *
  * Every test runs in a process of its own, because a core never ends, and is taken to hang
@@ -70,6 +71,12 @@ bool hv_start_secondary(int cpu, void *entry, u64 regs[4]);
 void hv_maybe_exit(void);
 void hv_exit_cpu(int cpu);
 void hv_rendezvous(void);
+u64 hv_get_started_cpus(void);
+
+/* src/hv/hv_exc.c, by cpus/exc_head.c and cpus/exc_tail.c */
+void model_exc_entry(void);
+void model_exc_exit(void);
+void model_steal_time(u64 ticks);
 
 /* cpus/stubs.c */
 void set_sysregs_unlocked(bool unlocked);
@@ -181,6 +188,7 @@ static struct core {
 } cores[EXTRA];
 
 static void (*guest)(int cpu); /* what the guest does on each core */
+static u64 stolen;             /* what the host took of the time of the guest */
 static u64 alive_at_vgic_init;
 static bool wfi_used;
 static bool sysregs_unlocked;
@@ -580,32 +588,49 @@ void hv_enter_guest(u64 x0, u64 x1, u64 x2, u64 x3, void *entry, u64 spsr)
     __atomic_store_n(&cores[me].in_guest, false, __ATOMIC_SEQ_CST);
 }
 
-/* hv_exc_entry() and hv_exc_exit() of hv_exc.c, as far as they are about the cores */
+static u32 rnd(u32 n)
+{
+    static __thread u64 state;
+
+    if (!state)
+        state = 0x9e3779b97f4a7c15UL * (me + 1);
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return (state >> 20) % n;
+}
+
+/* On the way out of EL2, where the lock has just been let go of */
+void model_window(void)
+{
+    for (u32 n = rnd(4); n; n--)
+        sched_yield();
+}
+
+/* An exception of the guest, with the lock held between the two */
 static void exc_entry(void)
 {
     __atomic_store_n(&cores[me].in_el2, true, __ATOMIC_SEQ_CST);
-    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(me), __ATOMIC_ACQUIRE);
-    spin_lock(&bhl);
+    model_exc_entry();
 }
 
 static void exc_exit(void)
 {
-    spin_unlock(&bhl);
-    hv_maybe_exit();
-    __atomic_or_fetch(&hv_cpus_in_guest, BIT(me), __ATOMIC_ACQUIRE);
+    model_exc_exit();
     __atomic_store_n(&cores[me].in_el2, false, __ATOMIC_SEQ_CST);
 }
 
-/*
- * hv_rendezvous() by the one that has just let a core into the guest, with the lock still: that
- * core has been there and is in EL2 with everybody else
- */
-static void rendezvous_with(int cpu)
+/* By whoever has the lock: no core runs the guest afterwards, or gets to before it is let go of */
+static void rendezvous(void)
 {
     hv_rendezvous();
-    CHECK(__atomic_load_n(&cores[cpu].in_guest, __ATOMIC_SEQ_CST) &&
-              __atomic_load_n(&cores[cpu].in_el2, __ATOMIC_SEQ_CST),
-          "core %d is not in EL2 after a rendezvous", cpu);
+    for (int look = 0; look < 3; look++) {
+        for (int i = 0; i < NR; i++)
+            CHECK(i == me || !__atomic_load_n(&cores[i].in_guest, __ATOMIC_SEQ_CST) ||
+                      __atomic_load_n(&cores[i].in_el2, __ATOMIC_SEQ_CST),
+                  "core %d runs the guest after a rendezvous of core %d", i, me);
+        sched_yield();
+    }
 }
 
 /* hv_exc_fiq(), for an IPI */
@@ -670,6 +695,9 @@ static void reset(void)
     guest = spin_in_guest;
     /* What exception_initialize() leaves on the boot core: nothing masked */
     *reg_slot(&cores[BOOT], "DAIF") = 0;
+    /* UNKNOWN after a reset (Arm DDI 0487) */
+    for (int i = 0; i < NR; i++)
+        *reg_slot(&cores[i], "CNTVOFF_EL2") = 0xbad0000 + i;
 }
 
 /* ---- every core comes into EL2 ---- */
@@ -679,6 +707,8 @@ static void reset(void)
 static void boot_leaves(int cpu)
 {
     CHECK(cpu == BOOT, "core %d is in the guest", cpu);
+    CHECK(*reg_slot(&cores[cpu], "CNTVOFF_EL2") == 0, "CNTVOFF_EL2 is 0x%lx",
+          *reg_slot(&cores[cpu], "CNTVOFF_EL2"));
     hv_exit_guest();
 }
 
@@ -876,6 +906,8 @@ static void check_state(int cpu)
           c->mmu_inits, c->ivacs);
     CHECK(*reg_slot(c, "SCTLR_EL1") & SCTLR_M, "core %d: the MMU of EL2 is off", cpu);
     CHECK(__atomic_load_n(&hv_started_cpus[cpu], __ATOMIC_SEQ_CST), "core %d is not started", cpu);
+    CHECK(*reg_slot(c, "CNTVOFF_EL2") == stolen, "core %d: CNTVOFF_EL2 0x%lx, not 0x%lx", cpu,
+          *reg_slot(c, "CNTVOFF_EL2"), stolen);
     /* The guest turns things on, as Windows would have left them when the core stops */
     *reg_slot(c, R_SCTLR_EL12) |= SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_EE;
     *reg_slot(c, "VBAR_EL12") = 0xfffff80000000000;
@@ -883,12 +915,22 @@ static void check_state(int cpu)
 
 static void guest_cpu_on(int cpu)
 {
+    u64 started = BIT(BOOT);
+
     if (cpu != BOOT) {
         check_state(cpu);
         spin_in_guest(cpu);
     }
 
     for (int round = 1; round <= 3; round++) {
+        /* The host takes some time: the cores that come in have the same offset as this one */
+        exc_entry();
+        model_steal_time(1000);
+        stolen += 1000;
+        exc_exit();
+        CHECK(*reg_slot(&cores[BOOT], "CNTVOFF_EL2") == stolen, "CNTVOFF_EL2 is 0x%lx",
+              *reg_slot(&cores[BOOT], "CNTVOFF_EL2"));
+
         for (int n = 1; n < NR; n++) {
             int target = (BOOT + n) % NR;
 
@@ -899,15 +941,18 @@ static void guest_cpu_on(int cpu)
             /* It is in the guest for everybody by now: the answer to a second call */
             CHECK(hv_started_cpus[target], "core %d is not started", target);
             CHECK(cpu_on(target, NULL, 0) == -4, "a second CPU_ON of core %d", target);
+            started |= BIT(target);
+            CHECK(hv_get_started_cpus() == started, "the host is told 0x%lx, not 0x%lx",
+                  hv_get_started_cpus(), started);
             /* Had the host something to say now, it would be in EL2 with the others */
-            rendezvous_with(target);
+            rendezvous();
             CHECK(cores[target].entered == round, "core %d has not been in the guest", target);
             exc_exit();
             wait_entered(target, round);
         }
         /* Everybody into EL2, as the proxy has it, and on. They all stay in the guest. */
         exc_entry();
-        hv_rendezvous();
+        rendezvous();
         exc_exit();
         for (int i = 0; i < 100; i++) {
             usleep(20);
@@ -926,10 +971,13 @@ static void guest_cpu_on(int cpu)
                 continue;
             exc_entry();
             hv_exit_cpu(target);
-            hv_rendezvous();
+            rendezvous();
             exc_exit();
             while (__atomic_load_n(&hv_started_cpus[target], __ATOMIC_SEQ_CST))
                 run_a_bit();
+            started &= ~BIT(target);
+            CHECK(hv_get_started_cpus() == started, "the host is told 0x%lx, not 0x%lx",
+                  hv_get_started_cpus(), started);
         }
     }
 
@@ -1015,18 +1063,6 @@ static int rounds_done;
 static u64 next_x0 = 0x100;
 #define ROUNDS 20000
 
-static u32 rnd(u32 n)
-{
-    static __thread u64 state;
-
-    if (!state)
-        state = 0x9e3779b97f4a7c15UL * (me + 1);
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    return (state >> 20) % n;
-}
-
 static void guest_on_off(int cpu)
 {
     if (cpu != BOOT)
@@ -1062,7 +1098,7 @@ static void guest_on_off(int cpu)
                 if (rnd(4))
                     break;
                 exc_entry();
-                hv_rendezvous();
+                rendezvous();
                 exc_exit();
                 break;
             default:
@@ -1090,6 +1126,60 @@ static void test_on_off(void)
     for (int i = 0; i < NR; i++)
         CHECK(!hv_started_cpus[i] && !cores[i].in_guest, "core %d is still in the guest", i);
     CHECK(!hv_cpus_in_guest, "0x%lx", hv_cpus_in_guest);
+}
+
+/*
+ * ---- rendezvous: every core goes in and out of EL2 all the time, and any of them may want all
+ * of them there; then they leave the guest one by one, the boot core in the middle of it ----
+ */
+
+static int rendezvous_done;
+#define RENDEZVOUS 200 /* for each guest... */
+#define GUESTS     40  /* ...of which the boot core leaves each once */
+
+static void guest_rendezvous(int cpu)
+{
+    bool last = false;
+
+    if (cpu == BOOT) {
+        for (int i = 0; i < NR; i++) {
+            if (i == BOOT)
+                continue;
+            exc_entry();
+            CHECK(cpu_on(i, (void *)0x8000400000, 0) == 0, "CPU_ON of core %d", i);
+            exc_exit();
+        }
+    }
+
+    for (;;) {
+        exc_entry();
+        if (!rnd(4)) {
+            rendezvous();
+            last = __atomic_add_fetch(&rendezvous_done, 1, __ATOMIC_SEQ_CST) > RENDEZVOUS;
+        }
+        /* The way out of hv_exc_exit(), with everybody else in a rendezvous still */
+        if (cpu == BOOT && last)
+            hv_exit_cpu(-1);
+        exc_exit();
+        run_a_bit();
+    }
+}
+
+static void test_rendezvous(void)
+{
+    u64 regs[4] = {0};
+
+    smp_init();
+    guest = guest_rendezvous;
+    for (int n = 0; n < GUESTS; n++) {
+        hv_init();
+        rendezvous_done = 0;
+        hv_start((void *)0x8000001000, regs);
+        for (int i = 0; i < NR; i++)
+            CHECK(!hv_started_cpus[i] && !cores[i].in_guest, "core %d is still in the guest", i);
+        CHECK(!hv_cpus_in_guest, "0x%lx", hv_cpus_in_guest);
+        CHECK(!hv_get_started_cpus(), "0x%lx", hv_get_started_cpus());
+    }
 }
 
 /* ---- the host leaves the guest while the others go on with CPU_ON ---- */
@@ -1179,6 +1269,7 @@ static const struct {
     {"cpu-on", test_cpu_on},
     {"refused", test_refused},
     {"on-off", test_on_off},
+    {"rendezvous", test_rendezvous},
     {"leaving", test_leaving},
 };
 

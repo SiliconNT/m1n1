@@ -187,11 +187,14 @@ static void reload(void)
         after.x[i] = before.x[i];
 }
 
-/* x1 to x29 as a caller might have left them: no two alike, none that looks like an answer */
+/*
+ * x1 to x29 as a caller might have left them: no two alike, none that looks like an answer. All
+ * are multiples of 4: x2 of CPU_ON is where a CPU would start.
+ */
 static void call(u64 x0, u64 x1)
 {
     for (int i = 0; i < NR_REGS - 1; i++)
-        before.x[i] = 0xa5a5000000000000UL | ((u64)i << 32) | (0x2000 + i);
+        before.x[i] = 0xa5a5000000000000UL | ((u64)i << 32) | (0x2000 + 4 * i);
     before.x[0] = x0;
     before.x[1] = x1;
     before.x[30] = (u64)&after;

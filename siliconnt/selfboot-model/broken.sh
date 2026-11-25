@@ -92,6 +92,8 @@ unname-m1n1-tree@selfboot.c@s/memset(copy_of(dest, prop)->value, 0, prop->size);
 nohost-ports-not-given-back@selfboot_run.c@s/            iodev_set_usage(i, usage\[i\]);/            ;/@run
 ports-given-back-with-host@selfboot_run.c@s/^    if (host == NO_HOST)$/    if (1)/@run
 nohost-not-entered-is-left@selfboot_run.c@s/^    if (host != NO_HOST)$/    if (1)/@run
+cpus-not-asked@selfboot_run.c@s/    if (!hv_cpus_ready())/    if (0)/@run
+cpus-answer-ignored@selfboot_run.c@s/    if (!hv_cpus_ready())/    if (!hv_cpus_ready() \&\& 0)/@run
 ctrr-not-asked@selfboot_run.c@s/    if (hv_pt_check_ctrr() < 0)/    if (0)/@run
 ctrr-refusal-ignored@selfboot_run.c@s/    if (hv_pt_check_ctrr() < 0)/    if (hv_pt_check_ctrr() < -1)/@run
 m1n1-heap-fixed@selfboot_run.c@s/selfboot_m1n1_heap(mem_size_actual),$/(128UL << 20),/@run

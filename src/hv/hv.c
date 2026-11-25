@@ -426,6 +426,7 @@ void hv_start(void *entry, u64 regs[4])
     hv_want_cpu = -1;
     hv_cpus_in_guest = BIT(smp_id());
 
+    hv_write_cntvoff();
     hv_vgic_start();
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry, mrs(DAIF) | SPSR_M_EL1H);
 
@@ -535,6 +536,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     hv_xtrack_init_cpu(cpu);
     hv_dbg_init_cpu(cpu);
     hv_pmu_init_cpu(cpu);
+    hv_write_cntvoff();
 
     // For M3 and up, CNTHCTL_EL2 must be written after the counter redirection
     sysop("isb");
@@ -618,6 +620,17 @@ bool hv_start_secondary(int cpu, void *entry, u64 regs[4])
 
     smp_call0(cpu, hv_enter_secondary);
     return true;
+}
+
+/* The cores the guest runs on, a bit for each: the host asks, it is not told (P_HV_STARTED_CPUS) */
+u64 hv_get_started_cpus(void)
+{
+    u64 mask = 0;
+
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (hv_started_cpus[i])
+            mask |= BIT(i);
+    return mask;
 }
 
 void hv_exit_cpu(int cpu)

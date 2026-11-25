@@ -251,6 +251,7 @@ enum ev {
     EV_MAP_VUART,  /* a: base, b: irq, c: iodev */
     EV_XTRACK,
     EV_CTRR,
+    EV_CPUS,
     EV_IODEV_USAGE, /* a: iodev, b: usage */
     EV_FB_SHUTDOWN, /* a: restore_logo */
     EV_DC_CVAU,     /* a: address, c: length */
@@ -314,6 +315,7 @@ static u64 sctlr_el12;
 static bool xtrack_fails;
 /* The guest has some of the memory that is read-only on the other cores (CTRR) */
 static bool ctrr_fails;
+static bool cpu_missing;
 /*
  * What hv_start() does. With a host the guest runs until the host leaves it, and hv_start()
  * returns. Without one it runs for good, and hv_start() does not return: here it goes back to
@@ -410,6 +412,13 @@ void hv_init(void)
 {
     note(EV_HV_INIT, 0, 0, 0);
     hcr_el2 = HCR_AFTER_HV_INIT;
+}
+
+/* src/hv/hv.c, which has its own test in siliconnt/vgic-model/cpus_test.c */
+bool hv_cpus_ready(void)
+{
+    note(EV_CPUS, 0, 0, 0);
+    return !cpu_missing;
 }
 
 void hv_write_hcr(u64 val)
@@ -515,6 +524,7 @@ static void reset(void)
     map_hw_calls = 0;
     xtrack_fails = false;
     ctrr_fails = false;
+    cpu_missing = false;
     heap_top = HEAP_TOP;
     hv_start_does = GUEST_STAYS;
     /* The proxy on the first USB port; a console on the UART, the screen, the second port */
@@ -866,6 +876,14 @@ static void check_entry(const struct where *w, int host_iodev)
     CHECK_EQ(count(EV_CTRR), 1);
     CHECK(first(EV_CTRR) > first(EV_XTRACK) && first(EV_CTRR) < first(EV_FB_SHUTDOWN));
 
+    /*
+     * The cores that hv_init() has started: as soon as it is known which have come, while the
+     * screen is still m1n1's, to say so on (hv_start() asks again)
+     */
+    CHECK_EQ(count(EV_CPUS), 1);
+    CHECK(first(EV_CPUS) > first(EV_HV_INIT) && first(EV_CPUS) < first(EV_MAP_HW) &&
+          first(EV_CPUS) < first(EV_FB_SHUTDOWN));
+
     /* The image is in the instruction cache's view before anything executes it */
     CHECK_EQ(the(EV_DC_CVAU)->a, w->image);
     CHECK_EQ(the(EV_DC_CVAU)->c, IMAGE_SIZE);
@@ -909,7 +927,7 @@ static void check_not_started(int ret)
     CHECK_EQ(count(EV_HV_START), 0);
     CHECK_EQ(count(EV_WRITE_HCR) + count(EV_WRITE_HACR) + count(EV_MSR), 0);
     CHECK_EQ(count(EV_MAP_HW) + count(EV_UNMAP) + count(EV_MAP_VUART) + count(EV_XTRACK), 0);
-    CHECK_EQ(count(EV_CTRR), 0);
+    CHECK_EQ(count(EV_CTRR) + count(EV_CPUS), 0);
     CHECK_EQ(count(EV_IODEV_USAGE) + count(EV_FB_SHUTDOWN), 0);
     /* The SSD controller is not left running */
     CHECK_EQ(count(EV_NVME_SHUTDOWN), nvme_fails ? 0 : count(EV_NVME_INIT));
@@ -939,6 +957,7 @@ static void check_not_entered(int ret, int host_iodev)
     CHECK_EQ(ret, -1);
     CHECK_EQ(count(EV_HV_INIT), 1);
     CHECK_EQ(count(EV_HV_START), 0);
+    CHECK_EQ(count(EV_CPUS), 1);
     CHECK_EQ(count(EV_XTRACK) + count(EV_CTRR), 0);
     /* The screen as it was; the consoles that are not USB ports are not even touched */
     CHECK_EQ(count(EV_FB_SHUTDOWN), 0);
@@ -1145,30 +1164,33 @@ static void test_loaded_by_a_host(void)
 }
 
 /*
- * Without a host, a step between taking the ports and entering the guest fails: a mapping,
- * execution tracking, the check of the memory that is read-only on the other cores, or the
- * hypervisor itself (hv_start() returns). m1n1 goes back to the proxy, and every port is what
- * it was: with P_SELFBOOT_RUN the one the command came over is the proxy's again, so that a
- * host can connect again. With a host nothing is given back: its port was never taken, and
- * the spare ones stay the guest's, as before.
+ * Without a host, a step between taking the ports and entering the guest fails: a core that did
+ * not come into EL2, a mapping, execution tracking, the check of the memory that is read-only on
+ * the other cores, or the hypervisor itself (hv_start() returns). m1n1 goes back to the proxy,
+ * and every port is what it was: with P_SELFBOOT_RUN the one the command came over is the
+ * proxy's again, so that a host can connect again. With a host nothing is given back: its port
+ * was never taken, and the spare ones stay the guest's, as before.
  */
 static void test_not_entered_without_a_host(void)
 {
     struct where w = where(R21_PHYS_BASE);
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         reset();
         put_files(&w);
-        map_hw_fails_at = i == 0 ? 0 : -1;
-        xtrack_fails = i == 1;
-        ctrr_fails = i == 2;
-        hv_start_does = i == 3 ? NOT_ENTERED : GUEST_STAYS;
+        cpu_missing = i == 0;
+        map_hw_fails_at = i == 1 ? 0 : -1;
+        xtrack_fails = i == 2;
+        ctrr_fails = i == 3;
+        hv_start_does = i == 4 ? NOT_ENTERED : GUEST_STAYS;
         CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, SELFBOOT_NO_HOST), -1);
         CHECK_EQ(count(EV_HV_INIT), 1);
-        CHECK_EQ(count(EV_XTRACK), i >= 1);
-        CHECK_EQ(count(EV_CTRR), i >= 2);
-        CHECK_EQ(count(EV_FB_SHUTDOWN), i == 3);
-        CHECK_EQ(count(EV_HV_START), i == 3);
+        CHECK_EQ(count(EV_CPUS), 1);
+        CHECK_EQ(count(EV_MAP_HW) > 0, i >= 1);
+        CHECK_EQ(count(EV_XTRACK), i >= 2);
+        CHECK_EQ(count(EV_CTRR), i >= 3);
+        CHECK_EQ(count(EV_FB_SHUTDOWN), i == 4);
+        CHECK_EQ(count(EV_HV_START), i == 4);
         check_ports_given_back(-1);
         CHECK_EQ(usages[IODEV_USB0], 3);
         CHECK_EQ(stray, 0);
@@ -1181,11 +1203,12 @@ static void test_not_entered_without_a_host(void)
     check_ports_given_back(-1);
 
     /* With a host: a mapping that fails, and hv_start() returning, are as before */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         reset();
         put_files(&w);
         xtrack_fails = i == 0;
         ctrr_fails = i == 1;
+        cpu_missing = i == 2;
         CHECK_EQ(loaded(R21_PHYS_BASE, IMAGE_SIZE, DISK_SIZE, IODEV_USB0), -1);
         CHECK_EQ(count(EV_HV_START) + count(EV_FB_SHUTDOWN), 0);
         check_ports_given_back(IODEV_USB0);

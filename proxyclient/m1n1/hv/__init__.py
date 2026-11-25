@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 import io, sys, traceback, struct, array, bisect, os, plistlib, signal, runpy, secrets, asn1
+from collections import defaultdict
 from construct import *
 from dataclasses import dataclass
 
@@ -145,7 +146,8 @@ class HV(Reloadable):
         self.sym_offset = 0
         self.symbols = []
         self.symbol_dict = {}
-        self.sysreg = {}
+        # By CPU. The guest starts CPUs without the host (PSCI): one that is new here has none.
+        self.sysreg = defaultdict(dict)
         self.novm = False
         self._in_handler = False
         self._sigint_pending = False
@@ -164,7 +166,6 @@ class HV(Reloadable):
         self.hook_exceptions = False
         self.sptm_mode = SPTM_MODE.SPTM_NONE
         self.sprr_pool_size = 2048 * 1024 * 1024
-        self.started_cpus = {}
         self.started = False
         self.ctx = None
         self.hvcall_handlers = {}
@@ -187,6 +188,9 @@ class HV(Reloadable):
         })
 
         for attr in dir(self):
+            # started_cpus asks the hypervisor
+            if isinstance(getattr(type(self), attr, None), property):
+                continue
             a = getattr(self, attr)
             if callable(a):
                 self.shell_locals[attr] = getattr(self, attr)
@@ -735,7 +739,6 @@ class HV(Reloadable):
             if value & 1:
                 self.log("Guest is shutting down CPU")
                 self.p.hv_exit_cpu()
-                del self.started_cpus[self.ctx.cpu_id]
         elif enc in shadow:
             if iss.DIR == MSR_DIR.READ:
                 value = self.sysreg[self.ctx.cpu_id].setdefault(enc, 0)
@@ -1342,9 +1345,21 @@ class HV(Reloadable):
             lr = self.unpac(self.p.read64(lrp))
             frame = self.p.read64(fpp)
 
+    @property
+    def started_cpus(self):
+        """The CPUs the guest runs on now, by their index: (die, cluster, core). The hypervisor
+        is asked every time: the guest starts and stops CPUs without the host."""
+        started = self.p.hv_started_cpus()
+        return {node.cpu_id: (node.reg >> 11, (node.reg >> 8) & 7, node.reg & 0xff)
+                for node in self.u.adt["cpus"] if started & (1 << node.cpu_id)}
+
     def cpus(self):
         for i in sorted(self.started_cpus):
-            self.cpu(i)
+            try:
+                self.cpu(i)
+            except ValueError:
+                # It has left the guest since: going to another CPU lets the others go on
+                continue
             yield i
 
     def patch_exception_handling(self):
@@ -1433,11 +1448,6 @@ class HV(Reloadable):
             if iodev >= IODEV.USB0 and iodev != self.iodev:
                 print(f"Disable iodev {iodev!s}")
                 self.p.iodev_set_usage(iodev, 0)
-
-        # hv_init() no longer starts the secondary CPUs by itself, so that a guest
-        # which only needs the boot CPU (self.smp = False) leaves them alone.
-        if self.smp:
-            self.p.smp_start_secondaries()
 
         print("Initializing hypervisor over iodev %s" % self.iodev)
         self.p.hv_sptm_set_mode(self.sptm_mode)
@@ -1676,7 +1686,6 @@ class HV(Reloadable):
         self.log(f" CPU #{index}: RVBAR = {entry:#x}")
 
         self.sysreg[index] = {}
-        self.started_cpus[index] = (die, cluster, cpu)
         self.p.hv_start_secondary(index, entry)
 
     def setup_adt(self):
@@ -2367,11 +2376,6 @@ class HV(Reloadable):
         # Does not return
 
         self.started = True
-        for cpu_node in list(self.adt["cpus"]):
-            if cpu_node.state == "running":
-                break
-        self.started_cpus[cpu_node.cpu_id] = (getattr(cpu_node, "die_id", 0), cpu_node.cluster_id, cpu_node.cpu_id)
-        self.sysreg[cpu_node.cpu_id] = {}
         self.p.hv_start(self.entry, self.guest_base + self.bootargs_off)
 
 from .. import trace

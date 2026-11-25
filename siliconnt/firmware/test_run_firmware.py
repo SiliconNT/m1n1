@@ -124,7 +124,7 @@ def make_fakes(case):
     """Fresh stand-in modules for one run. case: dict of overrides."""
     m1n1_image = M1N1_BIN.read_bytes()
     rec = types.SimpleNamespace(loaded=None, bootargs_top=None, hv_start=None, stopped=None,
-                                secondaries_started=None, smp_at_start=None, guest_cpus=None,
+                                smp_at_start=None, guest_cpus=None,
                                 hv_inited=False, memory_map=None, context_printed=False,
                                 entered=None, sigints=[], writes=[], writes_at_entry=None,
                                 readbacks=[], printed=b"", kd={}, xtrack=None,
@@ -376,11 +376,10 @@ def make_fakes(case):
                                 "cpus": FakeCpus()})
             rec.memory_map = self.adt["chosen"]["memory-map"]
         def init(self):
-            # The two things the real one does by self.smp, in its order: whether it has the
-            # proxy start the secondary CPUs, and, in setup_adt(), which it calls as
-            # self.setup_adt() after that, what it leaves of /cpus. That the real one has no
-            # third use, and these two as they are here, is checked at the end of this file.
-            rec.secondaries_started = self.smp
+            # The one thing the real one does by self.smp: in setup_adt(), which it calls as
+            # self.setup_adt(), what it leaves of /cpus. That the real one has no other use, and
+            # this one as it is here, is checked at the end of this file. It is hv_init() of m1n1
+            # that starts the secondary CPUs: the proxy of this file has no command for that.
             self.mem_top = self.u.ba.phys_base + self.u.ba.mem_size
             rec.hv_inited = True
             self.setup_adt()
@@ -1511,9 +1510,8 @@ ALL_CPUS = [(f"cpu{i}", "running" if i == M4_BOOT_CPU else "waiting") for i in r
 rec, out, code = run({}, "--seconds", "1", *image_args)
 check("host loader: the firmware gets every node of /cpus, each as m1n1 has it",
       code == 0 and rec.guest_cpus == ALL_CPUS, f"{code!r} {rec.guest_cpus}")
-check("host loader: the secondary CPUs are not started",
-      rec.secondaries_started is False and rec.smp_at_start is False,
-      f"{rec.secondaries_started} {rec.smp_at_start}")
+check("host loader: hv.smp says to leave the nodes for HV.setup_adt() and for nothing else",
+      rec.smp_at_start is False, f"{rec.smp_at_start}")
 check("host loader: it says how many nodes the guest gets, and where the cores are",
       f"/cpus of the guest's device tree: all {M4_CPUS} nodes" in out and
       "the guest starts on the boot CPU, the others wait in EL2 for its CPU_ON" in out,
@@ -1526,7 +1524,8 @@ check("host loader: a device tree with a core missing from /cpus stops the run",
       "cpu2 cpu4" in code and rec.hv_inited and rec.hv_start is None and rec.loaded is None,
       f"{code!r} {rec.hv_start}")
 
-# 54. the real HV goes by self.smp where the stand-in above does, and nowhere else
+# 54. the real HV goes by self.smp where the stand-in above does, and nowhere else; it starts no
+# CPU on its own
 import ast
 
 def is_self(node, attr):
@@ -1539,19 +1538,18 @@ methods = {fn.name: fn for fn in real_hv.body if isinstance(fn, ast.FunctionDef)
 smp_reads = {name: [node for node in ast.walk(fn)
                     if is_self(node, "smp") and isinstance(node.ctx, ast.Load)]
              for name, fn in methods.items()}
-check("the real HV reads self.smp once in init(), once in setup_adt() and nowhere else",
-      {name: len(reads) for name, reads in smp_reads.items() if reads} ==
-      {"init": 1, "setup_adt": 1}, f"{ {n: len(r) for n, r in smp_reads.items() if r} }")
+check("the real HV reads self.smp once, in setup_adt(), and nowhere else",
+      {name: len(reads) for name, reads in smp_reads.items() if reads} == {"setup_adt": 1},
+      f"{ {n: len(r) for n, r in smp_reads.items() if r} }")
 
-starts = [node for node in ast.walk(methods["init"])
-          if isinstance(node, ast.If) and is_self(node.test, "smp")]
-calls = [node for node in ast.walk(methods["init"])
-         if isinstance(node, ast.Call) and is_self(node.func, "setup_adt")]
-check("in init() it is whether the secondary CPUs are started, before self.setup_adt() is called",
-      len(starts) == 1 and len(calls) == 1 and not starts[0].orelse and
-      [ast.unparse(stmt) for stmt in starts[0].body] == ["self.p.smp_start_secondaries()"] and
-      starts[0].end_lineno < calls[0].lineno,
-      f"{[ast.unparse(node) for node in starts]} {[node.lineno for node in calls]}")
+starts = [node.attr for node in ast.walk(real_hv)
+          if isinstance(node, ast.Attribute) and node.attr.startswith("smp_start")]
+calls = {name: [node.lineno for node in ast.walk(methods["init"]) if isinstance(node, ast.Call) and
+                isinstance(node.func, ast.Attribute) and node.func.attr == name]
+         for name in ("hv_init", "setup_adt")}
+check("the real HV starts no CPU: that is for hv_init(), which init() calls before setup_adt()",
+      not starts and [len(lines) for lines in calls.values()] == [1, 1] and
+      calls["hv_init"] < calls["setup_adt"], f"{starts} {calls}")
 
 drops = [node for node in ast.walk(methods["setup_adt"])
          if isinstance(node, ast.If) and isinstance(node.test, ast.UnaryOp) and

@@ -15,6 +15,7 @@ bool hv_io_ranges_next(struct hv_io_ranges *it, u64 *base, u64 *size);
 bool hv_vgic_ranges_free(void);
 int hv_aicmap(struct hv_aicmap *map);
 void hv_init(void);
+bool hv_cpus_ready(void);
 void hv_write_hcr(u64 val);
 void hv_write_hacr(u64 val);
 int hv_map_hw(u64 from, u64 to, u64 size);
