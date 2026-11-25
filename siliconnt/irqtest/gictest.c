@@ -18,6 +18,7 @@
 
 #include "sgitest.h"
 #include "gic.h"
+#include "cpuon.h"
 
 /* Interrupts that are counted one by one: all there are */
 #define NR_COUNTED 1020
@@ -32,8 +33,6 @@
 
 /* Written by the loader, see sgitest-head.S */
 extern u64 hdr_nr_cpus;
-extern u64 hdr_start_reg[MAX_CPUS];
-extern u64 hdr_start_val[MAX_CPUS];
 extern u64 hdr_arg;
 
 void uart_putc(int c);
@@ -645,25 +644,26 @@ void boot_main(void)
     describe(0);
 
     for (u64 slot = 1; slot < nr_cpus; slot++) {
-        u64 end;
+        /* PSCI CPU_ON; the CPU then enters secondary_start */
+        int ret = cpuon_start(slot, &cpus[slot].online);
 
-        /* Where the platform needs to be asked, ask; the CPU then enters secondary_start */
-        if (hdr_start_reg[slot])
-            mmio_write32(hdr_start_reg[slot], hdr_start_val[slot]);
-
-        end = now() + 20000 * ticks_per_ms;
-        while (!cpus[slot].online && now() < end)
-            ;
-        if (!cpus[slot].online) {
+        if (ret) {
             line("FAIL cpu ");
             put_dec(slot);
-            put(" did not come online\n");
+            put(ret == 1 ? " did not come online\n" : " was not turned on: CPU_ON answered ");
+            if (ret != 1) {
+                put_hex((u32)ret, 8);
+                put("\n");
+            }
             nr_fail++;
             nr_cpus = slot;
             break;
         }
         describe(slot);
     }
+    if (nr_cpus > 1)
+        result("every CPU_ON took at most 10 ms, and CPU_ON of a CPU that is on says ALREADY_ON",
+               0, cpuon_report(nr_cpus, cpus[0].mpidr));
 
     for (u64 cpu = 0; cpu < nr_cpus; cpu++) {
         if (!cpus[cpu].gicr) {

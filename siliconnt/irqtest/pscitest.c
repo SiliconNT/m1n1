@@ -13,12 +13,17 @@
  *      -1 for everything else, only x0 changed, the upper halves of x0 and x1 ignored, and
  *      only the affinity fields of CPU_ON's target_cpu looked at.
  *
- * Bits 3:0 of the argument choose the call it ends with, see enum last_call.
+ * Bits 3:0 of the argument choose the call it ends with, see enum last_call. With bit 4 every
+ * other CPU is turned on before that call and stays on, so that the call is made with all of
+ * them in the guest.
  *
  * Bits 31:16 are a number of times: so often each other CPU is turned on and turns itself off,
- * and then the boot CPU turns itself off and is turned on by another one. 0: the test stays on
- * the boot CPU. The other CPUs are those that have a Redistributor, and are off when this
- * starts; one of them is on at a time.
+ * and then the boot CPU turns itself off and is turned on by another one, bits 15:9 times if
+ * they are not 0. 0 in bits 31:16: the test stays on the boot CPU. The other CPUs are those that
+ * have a Redistributor, and are off when this starts; one of them is on at a time. The first
+ * time each other CPU is on, CPU_ON of it again has to answer ALREADY_ON. Before every CPU_ON
+ * the caller writes a page anew that the CPU reads when it comes, as the parking page of the
+ * Windows kernel (SiliconNT R51).
  *
  * It runs with interrupts masked, and of the GIC and the timer it only reads GICR_TYPER and the
  * counter. It prints on the hypervisor's virtual UART; lines start with "HVLOG: " so that the
@@ -32,10 +37,13 @@
 /* Written by the loader, see sgitest-head.S */
 extern u64 hdr_arg;
 
-#define ARG_LAST         0xf
-#define ARG_STRICT       0x100
-#define ARG_ROUNDS_SHIFT 16
-#define ARG_ROUNDS_MASK  0xffff
+#define ARG_LAST              0xf
+#define ARG_KEEP_ON           0x10
+#define ARG_STRICT            0x100
+#define ARG_BOOT_ROUNDS_SHIFT 9
+#define ARG_BOOT_ROUNDS_MASK  0x7f
+#define ARG_ROUNDS_SHIFT      16
+#define ARG_ROUNDS_MASK       0xffff
 
 enum last_call {
     LAST_SYSTEM_OFF,
@@ -461,24 +469,43 @@ static void test_strict(void)
  * The MMU is off: every CPU sees what another has written. A CPU that is turned on gets the
  * context of the call in x0, which sgitest-head.S takes for its slot, that is for which stack it
  * runs on.
+ *
+ * Before each CPU_ON the caller writes the parking page anew, as the Windows kernel writes the
+ * parking page of a processor before it starts it (HalpInterruptSetProcessorStartContext,
+ * docs/findings/0097, conclusion 11): through a mapping that is not cached, which with the MMU
+ * off is every access. The CPU that comes reads all of it, first thing, before it says it came.
  */
 
 #define SLOT_OTHER 1 /* the one other CPU that is on */
 #define SLOT_BOOT  2 /* the boot CPU, after it was off */
+#define SLOT_KEEP  3 /* ...and up: the other CPUs that stay on, for the last call (ARG_KEEP_ON) */
 
 #define SCTLR_M_C_I ((1 << 0) | (1 << 2) | (1 << 12))
 
-static u32 rounds;     /* how often */
-static u64 boot_mpidr; /* the CPU this started on */
+#define PARK_WORDS 512
+
+static u32 rounds;      /* how often each other CPU */
+static u32 boot_target; /* ...and the boot CPU */
+static u64 boot_mpidr;  /* the CPU this started on */
 static u64 other_mpidr, nr_others;
 static u32 boot_rounds;
 static int boot_bad;
+static u32 boot_parking_bad;
+static u32 parking_bad, already_bad;
 
 /* What the other CPU found when it came: written by it, and the count last */
 static volatile u32 came;
 static volatile u64 came_el, came_sctlr, came_mpidr;
+static volatile u32 came_parking_bad;
 /* What it is to do before it turns itself off again */
 static volatile u32 wake_boot;
+/* While this is 1, it does not turn itself off */
+static volatile u32 hold;
+/* Which of the CPUs that stay on are there, by slot */
+static volatile u32 kept[MAX_CPUS];
+
+static volatile u64 parking[PARK_WORDS] __attribute__((aligned(4096)));
+static volatile u64 parking_tag;
 
 static void barrier(void)
 {
@@ -503,16 +530,51 @@ static u64 ms_since(u64 start)
     return (read_sysreg(cntvct_el0) - start) / (read_sysreg(cntfrq_el0) / 1000);
 }
 
+static u64 parking_word(u64 tag, u32 i)
+{
+    return (tag << 20) ^ (0x9e3779b97f4a7c15UL * (i + 1));
+}
+
+/* The page anew, then the tag that says what it holds */
+static void parking_fill(void)
+{
+    u64 tag = parking_tag + 1;
+
+    for (u32 i = 0; i < PARK_WORDS; i++)
+        parking[i] = parking_word(tag, i);
+    barrier();
+    parking_tag = tag;
+    barrier();
+}
+
+/* How many words of the page are not what the tag says */
+static u32 parking_check(void)
+{
+    u64 tag;
+    u32 bad = 0;
+
+    barrier();
+    tag = parking_tag;
+    for (u32 i = 0; i < PARK_WORDS; i++)
+        if (parking[i] != parking_word(tag, i))
+            bad++;
+    return bad;
+}
+
+static u64 entry_point(void)
+{
+    return (u64)image_start + *(u64 *)(image_start + HDR_SECONDARY_OFF);
+}
+
 /* CPU_ON, over again while the CPU is still on its way out. The answer, as w0 has it */
 static int turn_on(u64 mpidr, u64 slot)
 {
-    u64 entry = (u64)image_start + *(u64 *)(image_start + HDR_SECONDARY_OFF);
     u64 start = read_sysreg(cntvct_el0);
     int ret;
 
-    barrier();
+    parking_fill();
     do {
-        ret = psci(FN_CPU_ON, mpidr, entry, slot);
+        ret = psci(FN_CPU_ON, mpidr, entry_point(), slot);
     } while ((ret == ALREADY_ON || ret == ON_PENDING) && ms_since(start) < 1000);
     return ret;
 }
@@ -536,20 +598,36 @@ static int state_ok(u64 el, u64 sctlr)
 
 static void on_off(u64 mpidr)
 {
-    u32 n, done = 0;
-    int ret = 0, bad = 0;
+    u32 n, done = 0, wrong_page = 0;
+    int ret = 0, bad = 0, again = 0;
 
     wake_boot = 0;
     for (n = 0; n < rounds; n++) {
         u32 before = came;
 
+        /* The first time it stays until it has been asked to turn on again */
+        hold = n == 0;
+        barrier();
         ret = turn_on(mpidr, SLOT_OTHER);
-        if (ret || !came_again(before))
+        if (ret || !came_again(before)) {
+            hold = 0;
             break;
+        }
+        if (n == 0) {
+            again = psci(FN_CPU_ON, mpidr, entry_point(), SLOT_OTHER);
+            if (again != ALREADY_ON)
+                already_bad++;
+            barrier();
+            hold = 0;
+            barrier();
+        }
         if (came != before + 1 || came_mpidr != mpidr || !state_ok(came_el, came_sctlr))
             bad++;
+        if (came_parking_bad)
+            wrong_page++;
         done++;
     }
+    parking_bad += wrong_page;
 
     result("a CPU was turned on, and turned itself off", done == rounds && !bad);
     line("     MPIDR ");
@@ -560,8 +638,12 @@ static void on_off(u64 mpidr)
     put_dec(rounds);
     put(" times, ");
     put_dec(bad);
-    put(" wrong; the last answer ");
+    put(" wrong, the parking page wrong ");
+    put_dec(wrong_page);
+    put(" times; the last answer ");
     put_hex((u32)ret, 8);
+    put(", CPU_ON while it was on ");
+    put_hex((u32)again, 8);
     put("\n");
 }
 
@@ -582,6 +664,12 @@ static void test_on_off(void)
         }
         gicr += GICR_STRIDE;
     } while (!(typer & (1 << 4))); /* Last */
+
+    if (nr_others) {
+        result("every CPU that was turned on read the parking page as it had been written",
+               !parking_bad);
+        result("CPU_ON of another CPU that is on answers ALREADY_ON", !already_bad);
+    }
 }
 
 static void finish(void);
@@ -592,10 +680,12 @@ static void boot_off_result(int ok)
     line("     ");
     put_dec(boot_rounds);
     put(" of ");
-    put_dec(rounds);
+    put_dec(boot_target);
     put(" times, ");
     put_dec(boot_bad);
-    put(" wrong\n");
+    put(" wrong, the parking page wrong ");
+    put_dec(boot_parking_bad);
+    put(" times\n");
     finish();
 }
 
@@ -608,6 +698,7 @@ static void boot_off(void)
     u32 before = came;
 
     wake_boot = 1;
+    hold = 0;
     if (turn_on(other_mpidr, SLOT_OTHER) || !came_again(before)) {
         boot_off_result(0);
         return;
@@ -620,11 +711,15 @@ static void boot_off(void)
 
 static void boot_back(void)
 {
+    u32 wrong = parking_check();
+
     boot_rounds++;
+    if (wrong)
+        boot_parking_bad++;
     if ((read_sysreg(mpidr_el1) & MPIDR_AFFINITY) != boot_mpidr ||
-        !state_ok(read_sysreg(CurrentEL), read_sysreg(sctlr_el1)))
+        !state_ok(read_sysreg(CurrentEL), read_sysreg(sctlr_el1)) || wrong)
         boot_bad++;
-    if (boot_rounds < rounds)
+    if (boot_rounds < boot_target)
         boot_off();
     else
         boot_off_result(!boot_bad);
@@ -633,18 +728,33 @@ static void boot_back(void)
 void secondary_main(int slot)
 {
     int ret;
+    u32 wrong;
 
     if (slot == SLOT_BOOT) {
         boot_back();
         return;
     }
 
+    wrong = parking_check();
+    if (slot >= SLOT_KEEP) {
+        /* It stays on until the guest is stopped */
+        barrier();
+        kept[slot] = 1;
+        barrier();
+        for (;;)
+            ;
+    }
+
     came_el = read_sysreg(CurrentEL);
     came_sctlr = read_sysreg(sctlr_el1);
     came_mpidr = read_sysreg(mpidr_el1) & MPIDR_AFFINITY;
+    came_parking_bad = wrong;
     barrier();
     came = came + 1;
     barrier();
+
+    while (hold)
+        barrier();
 
     if (wake_boot) {
         ret = turn_on(boot_mpidr, SLOT_BOOT);
@@ -658,6 +768,37 @@ void secondary_main(int slot)
 
     psci(FN_CPU_OFF, 0, 0, 0);
     line("FAIL CPU_OFF came back\n");
+}
+
+/* For the last call: every other CPU with a Redistributor on, and staying on (ARG_KEEP_ON) */
+static void keep_on(void)
+{
+    u64 gicr = hdr_gicr_base, typer, slot = SLOT_KEEP, start;
+    u32 asked = 0, there;
+
+    do {
+        u64 mpidr;
+
+        typer = rd64(gicr + GICR_TYPER);
+        mpidr = ((typer >> 56) << 32) | ((typer >> 32) & 0xffffff);
+        if (mpidr != (read_sysreg(mpidr_el1) & MPIDR_AFFINITY) && slot < MAX_CPUS) {
+            if (!turn_on(mpidr, slot++))
+                asked++;
+        }
+        gicr += GICR_STRIDE;
+    } while (!(typer & (1 << 4))); /* Last */
+
+    start = read_sysreg(cntvct_el0);
+    do {
+        there = 0;
+        for (u64 s = SLOT_KEEP; s < MAX_CPUS; s++)
+            there += kept[s];
+    } while (there != asked && ms_since(start) < 1000);
+    line("kept on for the last call: ");
+    put_dec(there);
+    put(" CPUs of ");
+    put_dec(asked);
+    put(" turned on\n");
 }
 
 /* A call that must not come back. If it does, say so */
@@ -728,6 +869,8 @@ static void finish(void)
     put_dec(nr_fail);
     put("\n");
 
+    if (hdr_arg & ARG_KEEP_ON)
+        keep_on();
     last_call();
 }
 
@@ -735,6 +878,9 @@ void boot_main(void)
 {
     strict = !!(hdr_arg & ARG_STRICT);
     rounds = (hdr_arg >> ARG_ROUNDS_SHIFT) & ARG_ROUNDS_MASK;
+    boot_target = (hdr_arg >> ARG_BOOT_ROUNDS_SHIFT) & ARG_BOOT_ROUNDS_MASK;
+    if (!boot_target)
+        boot_target = rounds;
     boot_mpidr = read_sysreg(mpidr_el1) & MPIDR_AFFINITY;
 
     line("start, arg=");
@@ -752,7 +898,7 @@ void boot_main(void)
     if (rounds)
         test_on_off();
 
-    if (nr_others)
+    if (nr_others && boot_target)
         boot_off(); /* goes on elsewhere */
     else
         finish();

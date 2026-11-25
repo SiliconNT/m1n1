@@ -12,17 +12,17 @@
  *     nothing depends on
  *   - the counters that a core reads before it has ever been in the hypervisor, next to those
  *     of the boot core: nobody has written CNTVOFF_EL2 by then (0098, conclusion 9)
- *   - how long a core takes to get here from the boot core's write to the CPU start register
+ *   - how long a core takes from the boot core's PSCI CPU_ON to its first instruction (cpuon.h)
  *   - last, the CTRR registers of every core: an access that may end in the hypervisor
  *
  * The guest never uses the GIC: IRQs stay masked. Only the boot CPU prints, on the virtual
  * UART of the hypervisor; lines start with "HVLOG: " so that the hypervisor copies them to its
  * own console. Nothing here waits with WFI. Entry points, vectors and the header are those of
- * sgitest (sgitest-head.S). On QEMU's virt machine (`make qemu-cpu-smp`) the CTRR registers do
- * not exist, which is what shows that the exceptions are skipped and reported.
+ * sgitest (sgitest-head.S).
  */
 
 #include "gic.h"
+#include "cpuon.h"
 #include "sgitest.h"
 
 /* As in cputest-regs.S */
@@ -35,8 +35,6 @@
 
 /* Written by the loader, see sgitest-head.S */
 extern u64 hdr_nr_cpus;
-extern u64 hdr_start_reg[MAX_CPUS];
-extern u64 hdr_start_val[MAX_CPUS];
 
 extern u32 reg_code[], reg_code_late[], reg_code_end[];
 extern const char reg_names[], reg_names_late[];
@@ -73,7 +71,6 @@ struct seen {
  */
 struct cpu {
     volatile u64 online;
-    volatile u64 go; // written by the boot CPU: the pages are, for a core that started by itself
     u64 mpidr;
     u64 vct, pct; // CNTVCT_EL0 and CNTPCT_EL0, the first two things it does
     struct seen dev, wb, wb_clean;
@@ -308,9 +305,6 @@ void secondary_main(int slot)
     isb();
     c->vct = read_sysreg(cntvct_el0);
     c->pct = read_sysreg(cntpct_el0);
-    if (!hdr_start_reg[slot])
-        while (!c->go)
-            ;
     look(page_dev[slot], PATTERN(slot), &c->dev);
     look(page_wb[slot], PATTERN(slot), &c->wb);
     c->mpidr = read_sysreg(mpidr_el1);
@@ -359,7 +353,7 @@ static void put_seen(const char *name, const struct seen *s)
 
 void boot_main(void)
 {
-    u64 tcr, t0, pct0[MAX_CPUS];
+    u64 tcr;
     int dev_ok = 1, clean_ok = 1;
 
     ticks_per_ms = read_sysreg(cntfrq_el0) / 1000;
@@ -407,27 +401,21 @@ void boot_main(void)
     clean(table_l1, sizeof(table_l1));
 
     for (u64 slot = 1; slot < nr_cpus; slot++) {
-        u64 end;
+        int ret;
 
         mailbox_write((u64)page_dev[slot] + ((u64)ALIAS_GB << 30), (u64)page_wb[slot],
                       PATTERN(slot), PAGE_WORDS, (u64)table_l0, tcr, 0x00ff);
 
-        isb();
-        t0 = read_sysreg(cntpct_el0);
-        pct0[slot] = t0;
-        /* Where the platform needs to be asked, ask; the CPU then enters secondary_start */
-        if (hdr_start_reg[slot])
-            mmio_write32(hdr_start_reg[slot], hdr_start_val[slot]);
-        else
-            cpus[slot].go = 1;
-
-        end = now() + 20000 * ticks_per_ms;
-        while (!cpus[slot].online && now() < end)
-            ;
-        if (!cpus[slot].online) {
+        /* PSCI CPU_ON; the CPU then enters secondary_start */
+        ret = cpuon_start(slot, &cpus[slot].online);
+        if (ret) {
             line("FAIL cpu ");
             put_dec(slot);
-            put(" did not come online\n");
+            put(ret == 1 ? " did not come online\n" : " was not turned on: CPU_ON answered ");
+            if (ret != 1) {
+                put_hex((u32)ret, 8);
+                put("\n");
+            }
             nr_fail++;
             nr_cpus = slot;
             break;
@@ -471,16 +459,14 @@ void boot_main(void)
         put_dec(slot);
         put(": at its entry CNTPCT - CNTVCT = ");
         put_hex(c->pct - c->vct, 16);
-        if (hdr_start_reg[slot]) {
-            put(", us from the start write to its entry = ");
-            put_dec((c->pct - pct0[slot]) * 1000 / ticks_per_ms);
-        }
         put("\n");
     }
     line("boot cpu: CNTPCT - CNTVCT = ");
     put_hex(cpus[0].pct - cpus[0].vct, 16);
     put("\n");
     if (nr_cpus > 1) {
+        result("every CPU_ON took at most 10 ms, and CPU_ON of a CPU that is on says ALREADY_ON",
+               cpuon_report(nr_cpus, cpus[0].mpidr & 0xff00ffffffUL));
         result("every core sees what was written through a Device-nGnRnE mapping before its start",
                dev_ok);
         result("...and what was written through write-back memory, once it has been cleaned",

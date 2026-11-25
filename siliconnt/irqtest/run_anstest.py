@@ -64,7 +64,7 @@ EXIT_OK, EXIT_NOT_UP, EXIT_WRONG, EXIT_COMMANDS, EXIT_UNFINISHED, EXIT_NOT_RUN, 
     0, 1, 2, 3, 4, 5, 6
 
 # The image header of sgitest-head.S, as run_sgitest.py has it
-HDR_MAGIC = b"SNTSGI03"
+HDR_MAGIC = b"SNTSGI04"
 MAGIC_OFF = 0x08
 UART_BASE_OFF = 0x10
 NR_CPUS_OFF = 0x18

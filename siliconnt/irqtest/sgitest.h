@@ -6,6 +6,9 @@
 /* Slots in the image header and per-CPU state; slot 0 is the boot CPU */
 #define MAX_CPUS 16
 
+/* AIC lines in the image header (aictest uses the first, aicroute up to all) */
+#define MAX_AIC_LINES 3
+
 /* 8K of stack per CPU */
 #define STACK_SHIFT 13
 

@@ -35,21 +35,27 @@ hypervisor stops the guest and says why, and this script leaves the guest right 
 build/cputest.bin (cputest.c) is an eighth: what a guest reads in the identification registers
 of every core, and what a core that has just started sees of what the boot core wrote before
 (SiliconNT R50). build/aicroute.bin (aicroute.c) is a ninth, about which core AIC reports a
-line to. It takes --aic-line as aictest does, and --guest-arg: bit 0 the cores spin while they
-wait, bit 1 they are in WFI, bits 31:8 the rounds for each pair of cores.
+line to. It takes --aic-line as aictest does, up to three times, and --guest-arg: bit 0 the
+cores spin while they wait, bit 1 they are in WFI, bits 2 and 3 the same with the line held over
+the first end, bit 4 the lines raised at once, bit 5 the boot core turned off; bits 31:8 the
+rounds for each pair of cores. build/xtstress.bin (xtstress.c) is a tenth, execution tracking on
+several cores at once (R51): it needs --xtrack and 3 CPUs or more; --guest-arg bits 15:0 the
+seconds it runs, bits 23:16 how often it prints.
 
-Without --secondary the guest runs on the boot CPU only and no other CPU is touched. Each
---secondary N adds the CPU with that m1n1 index (the cpu-id of its ADT node), --secondary all
-every CPU there is: the script
-starts it, one at a time and only after putting m1n1's idle loop into WFE mode, so that it
-never waits in WFI (M4 loses CPU state there, src/kboot.c). The guest gets onto it the way
-upstream gets an Apple guest onto its secondary CPUs: it writes the CPU start register of the
-power manager, the hypervisor intercepts that, and this script answers with
-hv_start_secondary(). It does not use the CPU_ON of the hypervisor's PSCI.
+Without --secondary the guest runs on the boot CPU only. Each --secondary N gives the guest the
+CPU with that m1n1 index (the cpu-id of its ADT node) as well, --secondary all every CPU there
+is. The hypervisor has every CPU of the device tree waiting in EL2 from hv_init() on, with m1n1's
+idle loop in WFE mode (src/hv/hv.c), and the guest turns its CPUs on itself with the CPU_ON of
+the hypervisor's PSCI (cpuon.h), as Windows does: this script only tells it which Redistributor
+frame is each one's. A CPU the guest is not given stays waiting in EL2.
 
---park N (or all) starts a CPU in the same way and leaves it in m1n1's idle loop, where it never
-enters the guest. With --aic-line, and --parked-trials, the script raises that line itself
-once the guest has been stopped, and looks at which core gets the IRQ (aic_parked.py).
+--park N (or all) names CPUs that the guest is not given. With --aic-line, and --parked-trials,
+the script raises that line itself once the guest has been stopped, and looks at which of the
+boot core and those gets the IRQ (aic_parked.py).
+
+--aic-target T writes T into the target field of IRQ_CFG of every line of --aic-line before the
+guest runs, and puts back what was there once it has been left (R51: which core AIC reports a
+line to when that field is not 0).
 
 The guest sets up the GIC itself, the way the Windows kernel does: the script tells it where
 the hypervisor emulates the Distributor and the Redistributors.
@@ -72,9 +78,8 @@ parser.add_argument("--secondary", action="append", default=[], metavar="N",
                     help="also run the guest on the CPU with this m1n1 index (repeatable), or "
                          "on all of them")
 parser.add_argument("--park", action="append", default=[], metavar="N",
-                    help="start the CPU with this m1n1 index, or all that are not given with "
-                         "--secondary, and leave it in m1n1's idle loop (repeatable). It must not "
-                         "have been in the hypervisor before in this boot")
+                    help="a CPU that the guest is not given, by its m1n1 index, or all that are "
+                         "not given with --secondary, for --parked-trials (repeatable)")
 parser.add_argument("--parked-trials", type=int, default=0, metavar="N",
                     help="with --park and --aic-line: raise the line this often after the guest "
                          "has been stopped, and look at which core gets the IRQ")
@@ -87,35 +92,41 @@ parser.add_argument("--m1n1", type=pathlib.Path, default=HERE.parents[1] / "buil
                     help="the raw m1n1.bin that is supposed to be running on the target")
 parser.add_argument("--guest-arg", type=lambda s: int(s, 0), default=0, metavar="N",
                     help="what goes into the argument field of the image header (default 0)")
-parser.add_argument("--aic-line", type=lambda s: int(s, 0), metavar="N",
-                    help="for aictest: the AIC line it raises and lowers, as die * max_irq + "
-                         "line; one of the table of AIC lines and SPIs")
+parser.add_argument("--aic-line", type=lambda s: int(s, 0), action="append", default=[],
+                    metavar="N",
+                    help="for aictest and aicroute: the AIC line it raises and lowers, as die * "
+                         "max_irq + line; one of the table of AIC lines and SPIs. aicroute takes "
+                         "up to three")
+parser.add_argument("--aic-target", type=lambda s: int(s, 0), metavar="T",
+                    help="write T (1 to 15) into the target field of IRQ_CFG of each --aic-line "
+                         "while the guest runs; what was there is put back afterwards")
 parser.add_argument("--xtrack", action="store_true",
                     help="track execution: scan the memory of the guest before it runs "
                          "(for pmutest)")
 parser.add_argument("--check-only", action="store_true",
-                    help="only check which m1n1 is running and, for each --secondary, where "
-                         "that CPU would start; then exit")
+                    help="only check which m1n1 is running and, for each CPU, where it would "
+                         "start; then exit")
 parser.add_argument("payload", type=pathlib.Path, nargs="?",
                     default=HERE / "build" / "sgitest.bin")
 args = parser.parse_args()
 
-# Layout of the image header, see sgitest-head.S
-MAGIC = b"SNTSGI03"
+# Layout of the image header, see sgitest-head.S and sgitest.h
+MAGIC = b"SNTSGI04"
 MAGIC_OFF = 0x08
 UART_BASE_OFF = 0x10
 NR_CPUS_OFF = 0x18
 SECONDARY_OFF = 0x20
-START_REG_OFF = 0x28
+CPU_FRAME_OFF = 0x28
 MAX_CPUS = 16
-START_VAL_OFF = START_REG_OFF + 8 * MAX_CPUS
-GICD_BASE_OFF = START_VAL_OFF + 8 * MAX_CPUS
+CPU_ENTRY_OFF = CPU_FRAME_OFF + 8 * MAX_CPUS
+GICD_BASE_OFF = CPU_ENTRY_OFF + 8 * MAX_CPUS
 GICR_BASE_OFF = GICD_BASE_OFF + 8
 ARG_OFF = GICR_BASE_OFF + 8
+MAX_AIC_LINES = 3
 AIC_SET_OFF = ARG_OFF + 8
-AIC_CLR_OFF = AIC_SET_OFF + 8
-AIC_BIT_OFF = AIC_CLR_OFF + 8
-AIC_SPI_OFF = AIC_BIT_OFF + 8
+AIC_CLR_OFF = AIC_SET_OFF + 8 * MAX_AIC_LINES
+AIC_BIT_OFF = AIC_CLR_OFF + 8 * MAX_AIC_LINES
+AIC_SPI_OFF = AIC_BIT_OFF + 8 * MAX_AIC_LINES
 
 # Where the hypervisor puts the Distributor and the Redistributors: HV_VGIC_DIST_BASE and
 # HV_VGIC_REDIST_BASE in src/hv/hv.h
@@ -125,13 +136,18 @@ GICR_BASE = 0x51_0000_0000
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
     sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest, pscitest, pmutest, xitest, "
-             "aictest, cputest or aicroute image of this tree")
+             "aictest, cputest, aicroute or xtstress image of this tree")
 if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
     sys.exit(f"{args.payload}: UART base already filled in")
-secondary_entry_off = struct.unpack_from("<Q", image, SECONDARY_OFF)[0]
 
-if args.parked_trials and (not args.park or args.aic_line is None):
+if args.parked_trials and (not args.park or not args.aic_line):
     sys.exit("--parked-trials needs --park and --aic-line")
+if len(args.aic_line) > MAX_AIC_LINES:
+    sys.exit(f"--aic-line: the guest has room for {MAX_AIC_LINES}")
+if len(set(args.aic_line)) != len(args.aic_line):
+    sys.exit("--aic-line: the same line twice")
+if args.aic_target is not None and not (args.aic_line and 1 <= args.aic_target <= 15):
+    sys.exit("--aic-target: 1 to 15, and only with --aic-line")
 
 def pick_cpus(option, names, candidates):
     """The CPUs an option names, out of the candidates (m1n1 indices, in their order)"""
@@ -152,6 +168,7 @@ from m1n1.proxy import *
 from m1n1.proxyutils import *
 from m1n1.utils import *
 from m1n1.sysreg import *
+from m1n1.tgtypes import BootArgs_r1, BootArgs_r2, BootArgs_r3
 from m1n1.hv import HV
 from m1n1.hw.pmu import PMU
 
@@ -170,11 +187,27 @@ iface = UartInterface()
 p = M1N1Proxy(iface, debug=False)
 bootstrap_port(iface, p)
 
-u = ProxyUtils(p, heap_size=128 * 1024 * 1024,
-               m1n1_heap=128 * 1024 * 1024)
+def m1n1_heap(mem_size):
+    """What m1n1 keeps for itself above its heap, as run_firmware.py and selfboot_m1n1_heap() of
+    src/selfboot.c have it: the shadow pages of execution tracking, a stage 2 table of 4 KB for
+    every 2 MB of memory, and room for the rest. mem_size is all the memory there is,
+    mem_size_actual."""
+    return (32 << 20) + mem_size // 512 + (16 << 20)
 
-# An m1n1 without the changes of this tree would start every secondary CPU in hv_init(), hand
-# IRQs to the guest and not know P_SMP_START_SECONDARY. Make sure it is this build first.
+# ProxyUtils needs it when it is made, before it reads the boot arguments itself: read them
+# here as it does
+ba_addr, ba_rev = p.get_bootargs_rev()
+if ba_rev > 3:
+    sys.exit(f"The boot arguments are of revision {ba_rev}, which ProxyUtils does not know")
+ba_struct = {2: BootArgs_r2, 3: BootArgs_r3}.get(ba_rev, BootArgs_r1)
+mem_size_actual = iface.readstruct(ba_addr, ba_struct).mem_size_actual
+
+u = ProxyUtils(p, heap_size=128 * 1024 * 1024, m1n1_heap=m1n1_heap(mem_size_actual))
+print(f"Memory: 0x{mem_size_actual:x} bytes; kept for m1n1 above its heap: "
+      f"0x{m1n1_heap(mem_size_actual):x}")
+
+# The hypervisor of another build would not have every CPU wait in EL2, or not answer CPU_ON as
+# this tree's guests need. Make sure it is this build first.
 version_got = iface.readmem(u.base + version_off, len(version_want))
 print(f"m1n1 expected: {version_want[len(VERSION_MARK):].decode()}")
 print(f"m1n1 running:  {version_got[len(VERSION_MARK):].decode(errors='replace')!r}")
@@ -202,10 +235,11 @@ if len(args.secondary) > MAX_CPUS - 1:
 
 # A secondary CPU starts executing at its RVBAR. Where that is locked (M4), it has to be the
 # start of the m1n1 that is running now, which is the case after chainloading the raw image
-# onto the base of the one iBoot loaded. Only the registers of the CPUs asked for are read;
-# reading one changes nothing, m1n1 does the same before it starts a CPU (src/smp.c).
+# onto the base of the one iBoot loaded. hv_init() starts every CPU and refuses to go on if one
+# does not come; this says why before it gets there. Reading the register changes nothing, m1n1
+# does the same before it starts a CPU (src/smp.c).
 RVBAR_ADDR = 0xfffffffff000
-for index in args.secondary + args.park:
+for index in others:
     rvbar = p.read64(cpu_nodes[index].cpu_impl_reg[0])
     print(f"CPU {index}: RVBAR register 0x{rvbar:x}, m1n1 base 0x{u.base:x}")
     if not u.cpu_features.apple_sysregs_unlocked and (rvbar & RVBAR_ADDR) != u.base:
@@ -224,21 +258,9 @@ def heap_top():
 
 print(f"heap top before the hypervisor: 0x{heap_top():x}")
 
-if args.secondary or args.park:
-    # Before any secondary CPU exists: its idle loop is to use WFE, never WFI. A CPU that is
-    # running m1n1 already (an earlier run in this boot) is left as it is
-    print("m1n1 idle loop: WFE mode")
-    p.smp_set_wfe_mode(True)
-    for index in args.secondary + args.park:
-        print(f"Starting CPU {index}...")
-        alive = p.smp_start_secondary(index)
-        print(f"CPU {index}: {'running m1n1' if alive else 'did NOT start'}")
-        if not alive:
-            sys.exit("Not going on. Any CPU that did start stays in m1n1's idle loop.")
-
 hv = HV(iface, p, u)
-# The script has started the secondary CPUs it wants; hv_init() has the others wait in EL2. The
-# guest's device tree is to have the boot CPU only.
+# hv_init() has every CPU wait in EL2, and the guest turns on those it is given with CPU_ON.
+# The guest's device tree is to have the boot CPU only.
 hv.smp = False
 hv.init()
 print(f"heap top after hv_init(): 0x{heap_top():x}")
@@ -273,17 +295,8 @@ if u.mrs(ICH_MISR_EL2):
 uart_base = hv.adt["/arm-io/uart0"].get_reg(0)[0]
 print(f"Virtual UART at 0x{uart_base:x}")
 
-def aic_line(line):
-    """For aictest: the SPI the table of m1n1 has for this AIC line, and where its software
-    trigger is set and cleared, and its bit there. AIC as aic_init() of src/aic.c reads it:
-    on AIC2 and AIC3 every die has the configuration of each line, from extint-baseaddress
-    of the device tree or else, on AIC2, from 0x2000; then the bitmaps of the software
-    trigger (set, clear), of the mask (set, clear) and the state of the lines. Set goes by the
-    die's stride for masking, clear by the one for unmasking, as aic_set_sw(), aic_mask() and
-    aic_unmask() have it. Where the line is masked and unmasked is printed too. Also
-    returns where AIC's global configuration is (aicglbcfg-offset of the device tree, else
-    0x14 on AIC2 and AIC3, as aic_init() has it; None on AIC1), which the hypervisor enables
-    while the guest runs (hv_vgic_start())."""
+def aic_table():
+    """The table of AIC lines and SPIs of m1n1 (P_HV_AICMAP)"""
     buf = u.malloc(0x4000)
     size = p.hv_aicmap(buf)
     if size < 8:
@@ -294,9 +307,24 @@ def aic_line(line):
     lines = struct.unpack_from(f"<{count}I", table, 8)
     print(f"AIC to GIC table: version {version}, {count} lines, AIC {lines[0] if lines else '-'} "
           f".. {lines[-1] if lines else '-'}")
+    return lines
+
+def aic_line(line, lines):
+    """For aictest and aicroute: the SPI the table of m1n1 has for this AIC line, and where its
+    software trigger is set and cleared, and its bit there. AIC as aic_init() of src/aic.c reads
+    it: on AIC2 and AIC3 every die has the configuration of each line, from extint-baseaddress
+    of the device tree or else, on AIC2, from 0x2000; then the bitmaps of the software
+    trigger (set, clear), of the mask (set, clear) and the state of the lines. Set goes by the
+    die's stride for masking, clear by the one for unmasking, as aic_set_sw(), aic_mask() and
+    aic_unmask() have it. Where the line is masked and unmasked is printed too. Returns a
+    dictionary of these, with where IRQ_CFG of the line is ("cfg", None on AIC1) and where
+    AIC's global configuration is ("config": aicglbcfg-offset of the device tree, else 0x14 on
+    AIC2 and AIC3, as aic_init() has it; None on AIC1), which the hypervisor enables while the
+    guest runs (hv_vgic_start())."""
     if line not in lines:
         sys.exit(f"--aic-line {line}: not a line of the table")
     spi = 32 + lines.index(line)
+    cfg_addr = None
 
     node = u.adt["/arm-io/aic"]
     base = node.get_reg(0)[0]
@@ -337,15 +365,18 @@ def aic_line(line):
           f"at 0x{set_addr:x} and cleared at 0x{clr_addr:x}, bit {num % 32}")
     print(f"  it is masked at 0x{base + mask_set + die * set_stride + word:x} and unmasked at "
           f"0x{base + mask_clr + die * clr_stride + word:x}, the same bit")
-    aic_regs.update(
-        sw_set=set_addr, sw_clr=clr_addr, bit=1 << (num % 32),
+    return dict(
+        line=line, spi=spi, sw_set=set_addr, sw_clr=clr_addr, bit=1 << (num % 32),
         mask_set=base + mask_set + die * set_stride + word,
         mask_clr=base + mask_clr + die * clr_stride + word,
-        event=None if config_addr is None else base + prop32("aic-iack-offset"))
-    return spi, set_addr, clr_addr, 1 << (num % 32), config_addr
+        event=None if config_addr is None else base + prop32("aic-iack-offset"),
+        cfg=cfg_addr, config=config_addr)
 
 aic_config_addr = None
+# The first line, for aic_parked.py
 aic_regs = {}
+# Each line: (address of its IRQ_CFG, the value that was there) where --aic-target changed it
+aic_target_was = []
 
 def print_aic_config(when):
     """AIC's global configuration, read only; bit 0 enables AIC"""
@@ -354,16 +385,21 @@ def print_aic_config(when):
         print(f"AIC global configuration {when}: 0x{value:08x} at 0x{aic_config_addr:x} "
               f"(enable bit {value & 1}, prefer-pcpu bit {(value >> 28) & 1})")
 
-if args.aic_line is not None:
-    spi, set_addr, clr_addr, bit, aic_config_addr = aic_line(args.aic_line)
-    struct.pack_into("<QQQQ", image, AIC_SET_OFF, set_addr, clr_addr, bit, spi)
-
-# The register a guest writes to start a CPU, as HV.map_essential() hooks it
-CPU_START_OFF = {0x8103: 0x54000, 0x6000: 0x54000, 0x6001: 0x54000, 0x6002: 0x54000,
-                 0x8112: 0x34000, 0x8122: 0x34000, 0x8132: 0x34000, 0x8140: 0x34000,
-                 0x8142: 0x34000, 0x6030: 0x34000}
-pmgr_base = u.adt["/arm-io/pmgr"].get_reg(0)[0]
-chip_id = u.adt["/chosen"].chip_id
+if args.aic_line:
+    table = aic_table()
+    for n, line in enumerate(args.aic_line):
+        regs = aic_line(line, table)
+        if n == 0:
+            aic_regs.update(regs)
+            aic_config_addr = regs["config"]
+        struct.pack_into("<Q", image, AIC_SET_OFF + 8 * n, regs["sw_set"])
+        struct.pack_into("<Q", image, AIC_CLR_OFF + 8 * n, regs["sw_clr"])
+        struct.pack_into("<Q", image, AIC_BIT_OFF + 8 * n, regs["bit"])
+        struct.pack_into("<Q", image, AIC_SPI_OFF + 8 * n, regs["spi"])
+        if args.aic_target is not None:
+            if regs["cfg"] is None:
+                sys.exit("--aic-target: this AIC has no IRQ_CFG")
+            aic_target_was.append((regs["cfg"], p.read32(regs["cfg"])))
 
 struct.pack_into("<Q", image, UART_BASE_OFF, uart_base)
 struct.pack_into("<Q", image, NR_CPUS_OFF, len(slots))
@@ -375,40 +411,25 @@ print(f"Guest argument: 0x{args.guest_arg:x}")
 for slot, index in enumerate(slots):
     if slot == 0:
         continue
-    if chip_id not in CPU_START_OFF:
-        sys.exit(f"CPU start register unknown for chip 0x{chip_id:x}")
+    # The hypervisor's Redistributor frame n is the CPU with m1n1 index n (HV_VGIC_REDIST_BASE
+    # in src/hv/hv.h); the guest takes the MPIDR for CPU_ON from that frame's GICR_TYPER
+    struct.pack_into("<Q", image, CPU_FRAME_OFF + 8 * slot, index)
     reg = cpu_nodes[index].reg
-    die, cluster, core = reg >> 11, (reg >> 8) & 7, reg & 0xff
-    start_reg = pmgr_base + CPU_START_OFF[chip_id] + die * 0x20_0000_0000 + 8 + 4 * cluster
-    struct.pack_into("<Q", image, START_REG_OFF + 8 * slot, start_reg)
-    struct.pack_into("<Q", image, START_VAL_OFF + 8 * slot, 1 << core)
-    print(f"Guest slot {slot} = CPU {index} ({die}:{cluster}:{core}), started by writing "
-          f"0x{1 << core:x} to 0x{start_reg:x}")
+    print(f"Guest slot {slot} = CPU {index} ({reg >> 11}:{(reg >> 8) & 7}:{reg & 0xff}), "
+          f"Redistributor frame {index}, turned on by the guest with CPU_ON")
+if args.park:
+    print(f"CPUs the guest is not given, looked at by --parked-trials: {args.park}")
 
 hv.load_raw(bytes(image), entryoffset=0)
 
 if args.xtrack:
-    # After the memory of the guest has been mapped and filled: this changes the mappings
-    # that are there
+    # After the memory of the guest has been filled: HV.pt_update() maps it now, and turning
+    # tracking on takes those mappings apart into pages before any core runs the guest, as
+    # run_firmware.py does (SiliconNT docs/findings/0099, conclusions 10 and 11)
+    hv.pt_update()
     if p.hv_xtrack() != 0:
         sys.exit("The hypervisor refused to track execution")
     print("Execution tracking: on")
-
-def start_secondary(die, cluster, core):
-    """The guest wrote the CPU start register. Stands in for HV.start_secondary(), which
-    looks the CPU up in the guest's ADT and enters the image where the boot CPU does."""
-    for slot, index in enumerate(slots):
-        if slot and cpu_nodes[index].reg == ((die << 11) | (cluster << 8) | core):
-            break
-    else:
-        hv.log(f"Guest asked for CPU {die}:{cluster}:{core}, which it was not given")
-        return
-    entry = hv.guest_base + secondary_entry_off
-    hv.log(f"Entering the guest on CPU {index} (slot {slot}) at 0x{entry:x}")
-    hv.sysreg[index] = {}
-    p.hv_start_secondary(index, entry, slot)
-
-hv.start_secondary = start_secondary
 
 # Does nothing unless M1N1_PMU_RESET=1 (proxyclient/m1n1/hw/pmu.py)
 PMU(u).reset_panic_counter()
@@ -477,9 +498,26 @@ def enter_guest_timed(*hv_start_args):
 
 p.hv_start = enter_guest_timed
 
+def print_irq_cfg(when):
+    for addr, _ in aic_target_was:
+        value = p.read32(addr)
+        print(f"IRQ_CFG {when}: 0x{value:08x} at 0x{addr:x} (target {value & 0xf})")
+
+# Only the target field; the rest of IRQ_CFG stays as it is. Put back once the guest has been
+# left, whatever became of it
+for addr, was in aic_target_was:
+    p.write32(addr, (was & ~0xf) | args.aic_target)
+print_irq_cfg("for the guest")
 print_aic_config("before the guest")
-hv.start()
-print_aic_config("after the guest")
+try:
+    hv.start()
+finally:
+    print_aic_config("after the guest")
+    if aic_target_was:
+        print_irq_cfg("after the guest")
+        for addr, was in aic_target_was:
+            p.write32(addr, was)
+        print_irq_cfg("put back")
 
 print("Hypervisor exited.")
 if args.secondary:

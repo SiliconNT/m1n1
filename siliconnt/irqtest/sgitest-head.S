@@ -6,7 +6,8 @@
  * pscitest.c and aictest.c use the entry points, the vectors and the header.
  *
  * Raw image, position independent, MMU off, EL1h. The boot CPU enters at offset 0. Every
- * other CPU enters at the offset stored at SECONDARY_OFF, with its slot number in x0.
+ * other CPU enters at the offset stored at SECONDARY_OFF, with its slot number in x0: the guest
+ * turns it on with PSCI CPU_ON (cpuon.h) and gives the slot as the context of the call.
  * Nothing in this file executes WFI, and of the tests only wfitest does: M4 loses CPU state
  * there (src/kboot.c) unless the hypervisor traps it (src/hv/hv_wfi.c).
  */
@@ -21,7 +22,7 @@
 image_start:
     b       _start
     .word   0
-    .ascii  "SNTSGI03"              /* 0x08: magic */
+    .ascii  "SNTSGI04"              /* 0x08: magic */
     .globl  hdr_uart_base
 hdr_uart_base:
     .quad   0                       /* 0x10: virtual UART base, from the loader */
@@ -29,12 +30,12 @@ hdr_uart_base:
 hdr_nr_cpus:
     .quad   0                       /* 0x18: CPUs the guest runs on, from the loader */
     .quad   secondary_start - image_start /* 0x20: where the other CPUs enter */
-    .globl  hdr_start_reg
-hdr_start_reg:
-    .fill   MAX_CPUS, 8, 0          /* 0x28: per slot, where to write to get that CPU started */
-    .globl  hdr_start_val
-hdr_start_val:
-    .fill   MAX_CPUS, 8, 0          /*       ...and what; register 0 = it starts by itself */
+    .globl  hdr_cpu_frame
+hdr_cpu_frame:
+    .fill   MAX_CPUS, 8, 0          /* 0x28: per slot, which Redistributor frame is that CPU's */
+    .globl  hdr_cpu_entry
+hdr_cpu_entry:
+    .fill   MAX_CPUS, 8, 0          /*       ...and where CPU_ON has it enter; 0 = secondary_start */
     .globl  hdr_gicd_base
 hdr_gicd_base:
     .quad   0                       /* GIC Distributor, from the loader */
@@ -46,16 +47,17 @@ hdr_arg:
     .quad   0                       /* what the test makes of it; 0 unless the loader says */
     .globl  hdr_aic_set
 hdr_aic_set:
-    .quad   0                       /* aictest: where the software trigger of its AIC line is set */
-    .globl  hdr_aic_clr
+    .fill   MAX_AIC_LINES, 8, 0     /* aictest, aicroute: where the software trigger of each of */
+    .globl  hdr_aic_clr             /*   their AIC lines is set */
 hdr_aic_clr:
-    .quad   0                       /*          ...and cleared */
+    .fill   MAX_AIC_LINES, 8, 0     /*          ...and cleared */
     .globl  hdr_aic_bit
 hdr_aic_bit:
-    .quad   0                       /*          ...the bit of the line in those two */
+    .fill   MAX_AIC_LINES, 8, 0     /*          ...the bit of the line in those two */
     .globl  hdr_aic_spi
 hdr_aic_spi:
-    .quad   0                       /*          ...and the SPI the line is for the guest */
+    .fill   MAX_AIC_LINES, 8, 0     /*          ...and the SPI the line is for the guest; 0 for
+                                       none, which is where the lines end */
 
     .macro  bad_vector num
     .balign 0x80
@@ -87,8 +89,16 @@ vectors:
 
 _start:
     mov     x0, #0
+    .globl  secondary_start
 secondary_start:
-    msr     daifset, #0xf
+    /* When this CPU got here, for how long CPU_ON took (cpuon.h) */
+    isb
+    mrs     x1, cntvct_el0
+    cmp     x0, #MAX_CPUS
+    b.hs    1f
+    adr     x2, cpu_first_insn
+    str     x1, [x2, x0, lsl #3]
+1:  msr     daifset, #0xf
     mov     x19, x0                 /* x19 = slot */
     /* Whatever ran here before may have left a timer armed */
     msr     cntv_ctl_el0, xzr
@@ -188,6 +198,10 @@ read_sgi1r:
     ret
 
     .bss
+    .balign 16
+    .globl  cpu_first_insn
+cpu_first_insn:
+    .fill   MAX_CPUS, 8, 0          /* per slot: CNTVCT_EL0 at its first instruction */
     .balign 16
     .fill   MAX_CPUS << STACK_SHIFT, 1, 0
 stack_top:

@@ -5,14 +5,16 @@
 #
 #   make               build/irqtest.bin, build/sgitest.bin, build/gictest.bin,
 #                      build/wfitest.bin, build/pscitest.bin, build/pmutest.bin,
-#                      build/xitest.bin, build/aictest.bin, build/cputest.bin and
-#                      build/aicroute.bin, the raw images that run_irqtest.py and
-#                      run_sgitest.py load under the hypervisor, and build/el2probe.bin,
-#                      which run_cpuregs.py puts into the memory of the target.
+#                      build/xitest.bin, build/aictest.bin, build/cputest.bin,
+#                      build/aicroute.bin and build/xtstress.bin, the raw images that
+#                      run_irqtest.py and run_sgitest.py load under the hypervisor;
+#                      build/el2probe.bin, which run_cpuregs.py puts into the memory of the
+#                      target; and build/stoptest.bin, which run_firmware.py loads.
 #                      aictest and aicroute need AIC: run_sgitest.py --aic-line
 #   make build/stoptest.bin  a guest that only does what the hypervisor stops it for, with
 #                      the header of a firmware image: for run_firmware.py --loader m1n1
 #                      [--no-host] (R37)
+#   make build/stoptest-arg-<STOP_ARG>.bin  stoptest.bin with STOP_ARG in the file (R51)
 #   make anstest       build/anstest.bin: the disk controller core of the SiliconNT drivers
 #                      repository (ANS_CORE) in a guest that run_anstest.py loads (R38). Not
 #                      part of "all": it needs that repository
@@ -32,7 +34,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 .PHONY: anstest all clean
 .SECONDARY:
 
-all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin build/cputest.bin build/aicroute.bin build/el2probe.bin
+all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin build/cputest.bin build/aicroute.bin build/xtstress.bin build/el2probe.bin build/stoptest.bin
 
 build/irqtest.o: irqtest.S
 	@mkdir -p build
@@ -48,7 +50,7 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o build/aictest.o build/aicroute.o build/cputest.o: build/%.o: %.c sgitest.h gic.h
+build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o build/aictest.o build/aicroute.o build/cputest.o build/xtstress.o: build/%.o: %.c sgitest.h gic.h cpuon.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
@@ -89,6 +91,18 @@ build/xitest.elf: build/sgitest-head.o build/xitest.o build/xitest-insns.o xites
 build/xitest.bin: build/xitest.elf
 	$(OBJCOPY) -O binary $< $@
 
+# xtstress: the page that several cores execute while another writes it is a page of its own
+# (xtstress.ld), and it has an LD1, which C with -mgeneral-regs-only does not write
+build/xtstress-hot.o: xtstress-hot.S
+	@mkdir -p build
+	$(CC) -c -Wall -Werror -o $@ $<
+
+build/xtstress.elf: build/sgitest-head.o build/xtstress.o build/xtstress-hot.o xtstress.ld
+	$(LD) -T xtstress.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/xtstress.o build/xtstress-hot.o
+
+build/xtstress.bin: build/xtstress.elf
+	$(OBJCOPY) -O binary $< $@
+
 # stoptest: a guest that the hypervisor stops
 
 build/stoptest.o: stoptest.S
@@ -99,6 +113,18 @@ build/stoptest.elf: build/stoptest.o
 	$(LD) -Ttext=0 -e 0 --build-id=none -o $@ $<
 
 build/stoptest.bin: build/stoptest.elf
+	$(OBJCOPY) -O binary $< $@
+
+# build/stoptest-arg-<STOP_ARG>.bin: the same with STOP_ARG in the file, for run_firmware.py
+# (R51: 0x100 to 0x104, the call made with every CPU in the guest)
+build/stoptest-arg-%.o: stoptest.S
+	@mkdir -p build
+	$(CC) -c -Wall -Werror -DSTOP_ARG_DEFAULT=$* -o $@ $<
+
+build/stoptest-arg-%.elf: build/stoptest-arg-%.o
+	$(LD) -Ttext=0 -e 0 --build-id=none -o $@ $<
+
+build/stoptest-arg-%.bin: build/stoptest-arg-%.elf
 	$(OBJCOPY) -O binary $< $@
 
 # anstest: the core of the drivers repository is compiled from there, as it is; nothing of it
