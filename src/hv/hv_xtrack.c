@@ -145,7 +145,10 @@
 
 #define DC_IVAC 0xd5087620 // dc ivac, x0
 
-/* How often a core may fault on the same page that is executable already before it is stopped */
+/*
+ * How often a core may fault on the same page that is executable already, with no page changing
+ * state in between, before it is stopped
+ */
 #define XTRACK_MAX_REPEATS 16
 
 /*
@@ -216,8 +219,10 @@ static struct {
     u64 stops;
 } xt_stats;
 
-static struct {
+/* The page each core last faulted on, and what hv_pt_switch_count() was then */
+static struct xt_last {
     u64 page;
+    u64 switches;
     u32 repeats;
 } xtrack_last[MAX_CPUS];
 
@@ -233,6 +238,7 @@ static void xt_free_all(void)
 void hv_xtrack_init_cpu(int cpu)
 {
     xtrack_last[cpu].page = 0;
+    xtrack_last[cpu].switches = 0;
     xtrack_last[cpu].repeats = 0;
 }
 
@@ -680,21 +686,31 @@ bool hv_xtrack_iabort(struct exc_info *ctx)
         return false;
     }
 
+    struct xt_last *last = &xtrack_last[ctx->cpu_id];
+
     if (trans || state != HV_XPAGE_UNSCANNED) {
         /*
          * Another core got there first, or this one faulted on what was left in its TLB, or
-         * on an entry that was invalid for the moment
+         * on an entry that was invalid for the moment.
+         *
+         * Any of these takes a page that has changed state since this core last came here for
+         * it: only if none has is it a repeat. A core that keeps losing the race to scan a page,
+         * which another keeps making data again, does get on all the same. A core that faults
+         * on and on while nothing changes is stuck (SiliconNT docs/findings/0100, conclusion 6).
          */
-        if (xtrack_last[ctx->cpu_id].page == page) {
-            if (++xtrack_last[ctx->cpu_id].repeats > XTRACK_MAX_REPEATS) {
+        u64 switches = hv_pt_switch_count();
+
+        if (last->page == page && last->switches == switches) {
+            if (++last->repeats > XTRACK_MAX_REPEATS) {
                 printf("HV: instruction abort at 0x%lx (IPA 0x%lx, ESR 0x%lx) again and again "
                        "although the page is executable\n",
                        far, ipa, esr);
                 return false;
             }
         } else {
-            xtrack_last[ctx->cpu_id].page = page;
-            xtrack_last[ctx->cpu_id].repeats = 1;
+            last->page = page;
+            last->switches = switches;
+            last->repeats = 1;
         }
         xt_stats.done++;
         return true;
@@ -721,8 +737,9 @@ bool hv_xtrack_iabort(struct exc_info *ctx)
     if (t > xt_stats.longest)
         xt_stats.longest = t;
 
-    xtrack_last[ctx->cpu_id].page = page;
-    xtrack_last[ctx->cpu_id].repeats = 0;
+    last->page = page;
+    last->switches = hv_pt_switch_count();
+    last->repeats = 0;
     return true;
 }
 

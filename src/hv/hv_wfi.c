@@ -38,9 +38,18 @@ struct hv_wfi_pcpu {
     u64 wfes;      // WFE instructions executed while waiting
     u64 ticks;     // time spent waiting, in ticks of the system counter
     u64 longest;   // the longest wait
+    u64 ipi_waits; // waits during which the vGIC sent this core an IPI
+    u64 ipi_ticks; // ...from the IPI to the end of the wait, in all
+    u64 ipi_late;  // ...the longest
 } ALIGNED(64);
 
 static struct hv_wfi_pcpu wfi_pcpu[MAX_CPUS];
+
+/*
+ * When the vGIC last sent each core an IPI, 0 if not since that core began to wait. The only
+ * thing here that other cores write: atomic.
+ */
+static u64 wfi_ipi_sent[MAX_CPUS];
 
 /*
  * The bit of the counter whose 0 to 1 transitions make the event stream: the highest of bits
@@ -63,8 +72,10 @@ void hv_wfi_init(void)
     u64 freq = mrs(CNTFRQ_EL0);
     u64 bit = hv_wfi_event_bit(freq);
 
-    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
         wfi_pcpu[cpu] = (struct hv_wfi_pcpu){0};
+        __atomic_store_n(&wfi_ipi_sent[cpu], 0, __ATOMIC_SEQ_CST);
+    }
 
     /* EVNTIS, where it exists, would move the choice to bits 8-23 (FEAT_ECV) */
     msr(CNTHCTL_EL2, (mrs(CNTHCTL_EL2) & ~(CNTHCTL_EVNTIS | CNTHCTL_EVNTI | CNTHCTL_EVNTDIR)) |
@@ -73,6 +84,19 @@ void hv_wfi_init(void)
 
     printf("HV: WFI: trapped, the event stream of bit %ld ends a WFE every %ld us\n", bit,
            (2000000UL << bit) / freq);
+}
+
+/*
+ * The vGIC is about to send an IPI to this core, which may be waiting here. The first since the
+ * wait began counts: how late the wait ends after it is what a masked IPI costs, the event
+ * stream being what ends the WFE at the latest (SiliconNT docs/findings/0098, conclusion 28).
+ */
+void hv_wfi_ipi_sent(int cpu)
+{
+    u64 none = 0;
+
+    __atomic_compare_exchange_n(&wfi_ipi_sent[cpu], &none, mrs(CNTPCT_EL0), false,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 }
 
 /*
@@ -86,9 +110,10 @@ void hv_wfi_init(void)
  */
 bool hv_handle_wfx(u64 iss)
 {
-    struct hv_wfi_pcpu *p = &wfi_pcpu[mrs(TPIDR_EL2)];
+    int cpu = mrs(TPIDR_EL2);
+    struct hv_wfi_pcpu *p = &wfi_pcpu[cpu];
     u64 ti = FIELD_GET(ESR_ISS_WFx_TI, iss);
-    u64 start, ticks;
+    u64 start, end, ticks, sent;
 
     /* HCR_EL2.TWE is 0: WFE and WFET of the guest do not trap */
     if (ti == ESR_ISS_WFx_TI_WFE || ti == ESR_ISS_WFx_TI_WFET)
@@ -136,20 +161,34 @@ bool hv_handle_wfx(u64 iss)
     sysop("msr daifset, 4");
 
     p->waits++;
+    __atomic_store_n(&wfi_ipi_sent[cpu], 0, __ATOMIC_SEQ_CST);
     start = mrs(CNTPCT_EL0);
     while (!(mrs(ISR_EL1) & (ISR_A | ISR_I | ISR_F))) {
         sysop("wfe");
         p->wfes++;
     }
-    ticks = mrs(CNTPCT_EL0) - start;
+    end = mrs(CNTPCT_EL0);
+    ticks = end - start;
     p->ticks += ticks;
     if (ticks > p->longest)
         p->longest = ticks;
 
-    /* As in hv_exc_entry(): SErrors back on in the hypervisor, unless one is pending */
+    sent = __atomic_exchange_n(&wfi_ipi_sent[cpu], 0, __ATOMIC_SEQ_CST);
+    if (sent) {
+        ticks = end > sent ? end - sent : 0;
+        p->ipi_waits++;
+        p->ipi_ticks += ticks;
+        if (ticks > p->ipi_late)
+            p->ipi_late = ticks;
+    }
+
+    /*
+     * As in hv_exc_entry(): SErrors back on in the hypervisor, unless one is pending, once the
+     * lock is held
+     */
+    hv_lock();
     if (!(mrs(ISR_EL1) & ISR_A))
         sysop("msr daifclr, 4");
-    spin_lock(&bhl);
     return true;
 }
 
@@ -165,8 +204,11 @@ void hv_wfi_report(void)
             continue;
 
         printf("HV: WFI: CPU %d: %ld trapped (%ld WFIT), %ld returned at once, %ld waited: %ld "
-               "WFEs, %ld ms in all, longest %ld us\n",
+               "WFEs, %ld ms in all, longest %ld us; %ld waits got an IPI of the vGIC and ended "
+               "%ld us after it on average, %ld us at most\n",
                cpu, p->traps, p->wfit, p->immediate, p->waits, p->wfes, p->ticks * 1000 / freq,
-               p->longest * 1000000 / freq);
+               p->longest * 1000000 / freq, p->ipi_waits,
+               p->ipi_waits ? p->ipi_ticks * 1000000 / freq / p->ipi_waits : 0,
+               p->ipi_late * 1000000 / freq);
     }
 }

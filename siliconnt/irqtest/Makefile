@@ -207,10 +207,11 @@ $(EL2_GUESTS:%=build/%-el2-qemu-nosyn.elf): build/%-el2-qemu-nosyn.elf: build/%-
 # them, told to end at its first failure. DC IVAC and a device that writes into code are in
 # pmutest alone, which runs 16 and 23.
 # Three cannot show on QEMU, which has no caches: 19 leaves lines of the guest's page not
-# clean, 20 a shadow page, and 21 leaves the instruction caches as they are. Those are for the
-# model (../vgic-model, make xtrack-broken).
+# clean, 20 a shadow page, and 21 leaves the instruction caches as they are. Nor can 25, which
+# takes another core to make a page executable. Those are for the model (../vgic-model, make
+# xtrack-broken).
 include ../xtrack-broken.mk
-QEMU_BROKEN := $(filter-out 19 20 21,$(BROKEN))
+QEMU_BROKEN := $(filter-out 19 20 21 25,$(BROKEN))
 QEMU_BROKEN_PMU := 16 23
 broken_guest = $(if $(filter $(1),$(QEMU_BROKEN_PMU)),pmutest,xitest)
 

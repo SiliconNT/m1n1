@@ -253,6 +253,14 @@ static bool is_code(int st)
     return st == HV_XPAGE_SCANNED || st == HV_XPAGE_XONLY;
 }
 
+/* How many times a page has been made invalid on its way to another state, as hv_vm.c counts */
+static u64 switches;
+
+static u64 hv_pt_switch_count(void)
+{
+    return switches;
+}
+
 static int hv_pt_set_scanned(u64 ipa, int st, u64 pa)
 {
     int n = page_of(ipa);
@@ -266,6 +274,7 @@ static int hv_pt_set_scanned(u64 ipa, int st, u64 pa)
         if (state[n] == HV_XPAGE_XONLY)
             ic_owed = true;
         state[n] = st;
+        switches++;
         return 0;
     }
 
@@ -1374,6 +1383,25 @@ static void test_directed(void)
     check(!hv_xtrack_iabort(&ctx), "core 4 faults again and again and goes on");
     hv_xtrack_init_cpu(3);
     hv_xtrack_init_cpu(4);
+
+    /*
+     * ...but not one that keeps losing the race for a page that changes state in between: a
+     * store from page 3 makes page 2 data, core 0 executes it first, then core 3 faults on it
+     * (SiliconNT docs/findings/0100, conclusion 6)
+     */
+    for (int i = 0; i < 2 * XTRACK_MAX_REPEATS; i++) {
+        ctx.cpu_id = 3;
+        test_esr = 0x8200000f;
+        test_far = ipa_of(2, 0);
+        check(hv_xtrack_iabort(&ctx), "core 3, which loses the race each time: fault %d", i);
+        c.x[1] = ipa_of(2, 64);
+        ret = data_abort(&c, I_STR, ipa_of(3, 0), c.x[1], 0x9200004f, false);
+        check(ret == HV_XTRACK_RETRY && state[2] == HV_XPAGE_UNSCANNED,
+              "a store from page 3 does not make page 2 data: answer %d, state %d", ret,
+              state[2]);
+        check(exec_page(2), "core 0 does not get to execute page 2");
+    }
+    hv_xtrack_init_cpu(3);
     ctx.cpu_id = 0;
 
     /* What hv_init() asks every core for */

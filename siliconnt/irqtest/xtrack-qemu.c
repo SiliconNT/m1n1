@@ -216,6 +216,8 @@ static u64 s2_l3[NR_L3][512] __attribute__((aligned(4096)));
 /* The page that hv_pt_set_scanned() has given an invalid entry, on its way to another state */
 #define NO_PAGE (~0UL)
 static u64 s2_switching = NO_PAGE;
+/* ...and how many times it has done that */
+static u64 s2_switches;
 
 static u64 *s2_pte(u64 ipa)
 {
@@ -268,6 +270,7 @@ static int hv_pt_set_scanned(u64 ipa, int state, u64 pa)
             return -1;
         *s2_pte(ipa) = 0;
         s2_switching = ipa;
+        s2_switches++;
         asm volatile("dsb ishst\ntlbi vmalls12e1is\ndsb ish\nisb");
         return 0;
     }
@@ -293,6 +296,12 @@ static int hv_pt_set_scanned(u64 ipa, int state, u64 pa)
     s2_switching = NO_PAGE;
     asm volatile("dsb ishst\ntlbi vmalls12e1is\ndsb ish\nisb");
     return 0;
+}
+
+/* As in hv_vm.c */
+static u64 hv_pt_switch_count(void)
+{
+    return s2_switches;
 }
 
 /*

@@ -138,11 +138,13 @@ struct hv_vgic_pcpu {
     u64 injected;
     u64 maintenance;
     u64 forwarded;    // AIC events whose SPI was made pending
+    u64 handed_on;    // ...and that another core was called into EL2 for: the SPI goes there
     u64 late;         // ...of a line of the table that the guest had just disabled
     u64 unmapped;     // ...that masking should have kept away (VGIC_UNMAPPED_LIMIT)
     u64 spurious;     // IRQs with neither an AIC event nor a maintenance interrupt
     u64 spurious_run; // ...since the last one that did something (VGIC_SPURIOUS_LIMIT)
     u64 retracted;    // interrupts taken back out of a list register
+    u64 swapped;      // ...to make room for one of a higher priority
     u64 sgi_writes;   // writes to ICC_SGI1R_EL1 by the guest on this core
     u64 sgi_deferred; // returns to the guest with SGIs left waiting for a list register
     u64 spi_deferred; // ...and with SPIs left waiting
@@ -500,11 +502,36 @@ void hv_vgic_init_cpu(void)
                smp_id(), nr_lr, vtr, sre);
 }
 
+static bool vgic_pend_spi(u32 intid, bool tell_self);
+
+/*
+ * An interrupt the guest had not acknowledged has been taken out of a list register of this
+ * core: it is pending here again, and goes into a list register when there is room
+ */
+static void vgic_put_back(u32 intid)
+{
+    if (intid < VGIC_NR_SGIS) {
+        __atomic_or_fetch(&VGIC_PERCPU(sgi_pending), BIT(intid), __ATOMIC_SEQ_CST);
+    } else if (intid >= VGIC_NR_LOCAL) {
+        vgic_pend_spi(intid, false);
+        /* ...for vgic_deliver_spis() to look for it, should it still go to this core */
+        VGIC_PERCPU(spi_left) = true;
+    }
+    /* A PPI is a level: its owner says so again in hv_vgic_ppi_level() */
+}
+
 /*
  * Make a Group 1 interrupt pending for the guest on this core. Returns true if the interrupt
  * is in a list register afterwards, including when it already was pending or active there
  * (two valid list registers with the same INTID are UNPREDICTABLE, IHI 0069H.b 12.4.6).
- * Returns false if there is no free list register; the caller has to try again later.
+ * Returns false if there is no room for it; the caller has to try again later.
+ *
+ * With no free list register, one that holds an interrupt of a lower priority, which the guest
+ * has not acknowledged yet, makes room: what the list registers hold are the pending interrupts
+ * of the highest priority. The one taken out is pending again (vgic_put_back()). Otherwise
+ * interrupts below the guest's priority mask could keep out one that it does take: an SGI, say,
+ * that it waits for with its priority raised (SiliconNT docs/findings/0098, conclusion 18;
+ * docs/findings/0100, conclusion 7).
  *
  * edge is for interrupts that are events rather than levels, such as SGIs: one that arrives
  * while the guest is still handling the previous one must be taken again after that has
@@ -514,7 +541,8 @@ void hv_vgic_init_cpu(void)
 static bool vgic_inject(u32 vintid, u8 priority, bool edge)
 {
     int nr_lr = vgic_nr_lr();
-    int free = -1;
+    int free = -1, lowest = -1;
+    u64 lowest_priority = priority; // a lower priority is a higher number
 
     /* 1020-1023 are special, and this virtual CPU interface has no extended INTID range */
     if (vintid >= VGIC_NR_INTIDS)
@@ -530,10 +558,25 @@ static bool vgic_inject(u32 vintid, u8 priority, bool edge)
                     vgic_write_lr(i, lr | FIELD_PREP(ICH_LR_STATE, ICH_LR_STATE_PENDING));
                 return true;
             }
+            if (state == ICH_LR_STATE_PENDING &&
+                FIELD_GET(ICH_LR_PRIORITY, lr) > lowest_priority) {
+                lowest = i;
+                lowest_priority = FIELD_GET(ICH_LR_PRIORITY, lr);
+            }
         } else if (!(lr & ICH_LR_EOI) && free < 0) {
             /* An invalid entry that still has EOI set is waiting for hv_vgic_handle_irq() */
             free = i;
         }
+    }
+
+    if (free < 0 && lowest >= 0) {
+        u32 out = FIELD_GET(ICH_LR_VINTID, vgic_read_lr(lowest));
+
+        vgic_write_lr(lowest, 0);
+        VGIC_PERCPU(retracted)++;
+        VGIC_PERCPU(swapped)++;
+        vgic_put_back(out);
+        free = lowest;
     }
 
     if (free < 0)
@@ -590,6 +633,7 @@ static void vgic_kick(int cpu)
      * and the target acknowledges the IPI before it looks at the flag, so nothing is missed.
      */
     if (cpu != smp_id() && vgic_started(cpu)) {
+        hv_wfi_ipi_sent(cpu);
         sysop("dsb ishst");
         smp_send_ipi(cpu);
     }
@@ -642,9 +686,10 @@ static bool vgic_deliverable_here(u32 intid)
 
 /*
  * Make an SPI pending. It reaches a list register of its target core in vgic_deliver_spis().
- * AIC lines that are forwarded to the guest will come in here as well.
+ * AIC lines that are forwarded to the guest will come in here as well. Returns true if another
+ * core was called into EL2 for it.
  */
-static void vgic_pend_spi(u32 intid, bool tell_self)
+static bool vgic_pend_spi(u32 intid, bool tell_self)
 {
     int cpu;
 
@@ -652,9 +697,10 @@ static void vgic_pend_spi(u32 intid, bool tell_self)
 
     cpu = vgic_spi_target(intid);
     if (cpu < 0)
-        return;
+        return false;
     if (cpu == smp_id() ? tell_self : vgic_started(cpu))
         vgic_kick(cpu);
+    return cpu != smp_id() && vgic_started(cpu);
 }
 
 /*
@@ -682,12 +728,7 @@ static void vgic_resync(void)
         else
             vgic_write_lr(i, lr & ~FIELD_PREP(ICH_LR_STATE, ICH_LR_STATE_PENDING));
         VGIC_PERCPU(retracted)++;
-
-        if (intid < VGIC_NR_SGIS)
-            __atomic_or_fetch(&VGIC_PERCPU(sgi_pending), BIT(intid), __ATOMIC_SEQ_CST);
-        else if (intid >= VGIC_NR_LOCAL)
-            vgic_pend_spi(intid, false);
-        /* A PPI is a level: its owner says so again in hv_vgic_ppi_level() */
+        vgic_put_back(intid);
     }
 }
 
@@ -768,6 +809,7 @@ void hv_vgic_send_sgi(u64 val)
          * bits, so none is missed.
          */
         if (cpu != self) {
+            hv_wfi_ipi_sent(cpu);
             sysop("dsb ishst");
             smp_send_ipi(cpu);
         }
@@ -813,6 +855,9 @@ static void vgic_deliver_spis(void)
     int self = smp_id();
     bool left = false;
 
+    /* Looked for now. vgic_put_back() says it again for one that makes room for another. */
+    VGIC_PERCPU(spi_left) = false;
+
     if (vgic_grp1_enabled()) {
         for (u32 word = 1; word < VGIC_NR_WORDS; word++) {
             u32 ready = __atomic_load_n(&vgic_dist.pending[word], __ATOMIC_SEQ_CST) &
@@ -842,9 +887,10 @@ static void vgic_deliver_spis(void)
         }
     }
 
-    VGIC_PERCPU(spi_left) = left;
-    if (left)
+    if (left) {
+        VGIC_PERCPU(spi_left) = true;
         VGIC_PERCPU(spi_deferred)++;
+    }
 }
 
 /*
@@ -977,7 +1023,11 @@ static enum vgic_event vgic_line_event(u32 event)
         return VGIC_EVENT_STRAY;
 
     vgic_lines[k] = VGIC_LINE_IN_FLIGHT;
-    vgic_pend_spi(HV_AICMAP_FIRST_SPI + k, true);
+    bool elsewhere = vgic_pend_spi(HV_AICMAP_FIRST_SPI + k, true);
+
+    /* How often a device interrupt costs an IPI as well (SiliconNT docs/findings/0100, 11) */
+    if (elsewhere)
+        VGIC_PERCPU(handed_on)++;
     return VGIC_EVENT_FORWARDED;
 }
 
@@ -1388,12 +1438,13 @@ void hv_vgic_report(void)
             continue;
 
         printf("HV: vGIC: CPU %d: %ld ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, "
-               "%ld taken back, %ld returns with SGIs waiting, %ld with SPIs waiting, SGIs still "
-               "pending 0x%x, AIC events: %ld forwarded, %ld late, %ld stray; %ld IRQs with "
-               "neither\n",
-               cpu, p->sgi_writes, p->injected, p->maintenance, p->retracted, p->sgi_deferred,
-               p->spi_deferred, __atomic_load_n(&p->sgi_pending, __ATOMIC_SEQ_CST), p->forwarded,
-               p->late, p->unmapped, p->spurious);
+               "%ld taken back (%ld for one of a higher priority), %ld returns with SGIs waiting, "
+               "%ld with SPIs waiting, SGIs still pending 0x%x, AIC events: %ld forwarded, %ld "
+               "late, %ld stray; %ld IRQs with neither; %ld forwarded to another core\n",
+               cpu, p->sgi_writes, p->injected, p->maintenance, p->retracted, p->swapped,
+               p->sgi_deferred, p->spi_deferred,
+               __atomic_load_n(&p->sgi_pending, __ATOMIC_SEQ_CST), p->forwarded, p->late,
+               p->unmapped, p->spurious, p->handed_on);
     }
 
     if (vgic_aic_config_saved) {

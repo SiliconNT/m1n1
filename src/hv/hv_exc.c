@@ -29,6 +29,15 @@ struct hv_pcpu_data {
 
 struct hv_pcpu_data pcpu[MAX_CPUS];
 
+/* How long each core waited for the big lock, since hv_init(). Only touched by its own core. */
+struct hv_lock_wait {
+    u64 takes;
+    u64 ticks;   // waiting, in ticks of the system counter
+    u64 longest; // the longest wait
+} ALIGNED(64);
+
+static struct hv_lock_wait lock_wait[MAX_CPUS];
+
 void hv_gexit(void);
 
 static u64 stolen_time = 0;
@@ -151,6 +160,49 @@ void hv_exc_init_cpu(int cpu)
 {
     pcpu[cpu] = (struct hv_pcpu_data){0};
     reg_clr(SYS_IMP_APL_PMCR0, PMCR0_IACT | PMCR0_IMODE_MASK);
+}
+
+/* On the boot core, from hv_init(), before any core is in the guest */
+void hv_exc_init(void)
+{
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        lock_wait[cpu] = (struct hv_lock_wait){0};
+}
+
+/*
+ * Take the big hypervisor lock, and count how long this core waited for it. Whether the cores
+ * keep each other waiting is measured before anything is done about it (SiliconNT
+ * docs/findings/0100, conclusion 11).
+ */
+void hv_lock(void)
+{
+    struct hv_lock_wait *w = &lock_wait[smp_id()];
+    u64 start = mrs(CNTPCT_EL0);
+
+    spin_lock(&bhl);
+
+    u64 ticks = mrs(CNTPCT_EL0) - start;
+
+    w->takes++;
+    w->ticks += ticks;
+    if (ticks > w->longest)
+        w->longest = ticks;
+}
+
+/* What each core waited for the lock, for the log. Called with the lock held. */
+void hv_exc_report(void)
+{
+    u64 freq = mrs(CNTFRQ_EL0);
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        struct hv_lock_wait *w = &lock_wait[cpu];
+
+        if (!w->takes)
+            continue;
+        printf("HV: lock: CPU %d took the hypervisor lock %ld times, %ld us waiting for it in "
+               "all, longest %ld us\n",
+               cpu, w->takes, w->ticks * 1000000 / freq, w->longest * 1000000 / freq);
+    }
 }
 
 void hv_set_time_stealing(bool enabled, bool reset)
@@ -527,12 +579,19 @@ static void hv_get_context(struct exc_info *ctx)
 
 static void hv_exc_entry(void)
 {
-    // Enable SErrors in the HV, but only if not already pending
+    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
+    hv_lock();
+
+    /*
+     * Enable SErrors in the HV, but only if not already pending, and only once the lock is held.
+     * A core may wait for it for good, behind one that has stopped the guest and shows why
+     * (hv_stop.c): an SError taken in EL2 restarts the machine (exc_serr()), and what is shown
+     * would be gone. Until the lock is held one stays pending (SiliconNT docs/findings/0100,
+     * conclusion 8).
+     */
     if (!(mrs(ISR_EL1) & 0x100))
         sysop("msr daifclr, 4");
 
-    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
-    spin_lock(&bhl);
     hv_wdt_breadcrumb('X');
     exc_entry_time = mrs(CNTPCT_EL0);
     /* disable PMU counters in the hypervisor */

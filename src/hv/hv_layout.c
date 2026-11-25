@@ -237,6 +237,12 @@ static u32 aicmap_add(int node, u32 aic_phandle)
     return left_out;
 }
 
+/*
+ * Not for two cores at once: aicmap_lines is the only copy, and nothing locks it. Nothing has
+ * to. It is called from hv_init() (vgic_init_global()), from selfboot_enter() and for the proxy's
+ * P_HV_AICMAP: on the core that runs m1n1's own work or its proxy, one call after another, never
+ * by a core for the guest (SiliconNT docs/findings/0098, conclusion 18).
+ */
 int hv_aicmap(struct hv_aicmap *map)
 {
     u32 phandle, len, count = 0, left_out = 0;

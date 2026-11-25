@@ -60,6 +60,71 @@ static struct hv_cpu_entry {
     u64 count; // how often it was let in since hv_init()
 } hv_cpu_entry[MAX_CPUS];
 
+/*
+ * How deep each core goes into its EL2 stack, the one the hypervisor runs on for it: the boot
+ * core's is m1n1's own, the others' are in secondary_stacks (src/smp.c). Each core marks what it
+ * has not used of it the first time it enters the guest after hv_init(), and hv_stack_report()
+ * finds the deepest word that is not the mark any more (SiliconNT docs/findings/0100, conclusion
+ * 11).
+ */
+extern u8 _stack_top[], _stack_bot[];
+extern u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE];
+
+#define HV_STACK_MARK 0x4b4354534b435453UL // "STCKSTCK"
+/* Left as it is below where hv_stack_mark() is: its own frame and what it may call */
+#define HV_STACK_SLACK 1024
+
+static bool hv_stack_marked[MAX_CPUS];
+
+static void hv_stack_range(int cpu, u64 *low, u64 *high)
+{
+    if (cpu == boot_cpu_idx) {
+        *low = (u64)_stack_top;
+        *high = (u64)_stack_bot;
+    } else {
+        *low = (u64)secondary_stacks[cpu];
+        *high = *low + SECONDARY_STACK_SIZE;
+    }
+}
+
+/* On the core itself, once per hv_init(). Not if it does not run on that stack. */
+static void hv_stack_mark(void)
+{
+    int cpu = smp_id();
+    u64 here = (u64)__builtin_frame_address(0);
+    u64 low, high;
+
+    if (hv_stack_marked[cpu])
+        return;
+    hv_stack_range(cpu, &low, &high);
+    if (here < low + HV_STACK_SLACK || here > high)
+        return;
+
+    for (volatile u64 *p = (u64 *)low; (u64)p < here - HV_STACK_SLACK; p++)
+        *p = HV_STACK_MARK;
+    hv_stack_marked[cpu] = true;
+}
+
+/*
+ * For the log, with every core out of the guest. What a core used before it marked its stack,
+ * down to HV_STACK_SLACK below where it was then, counts as used.
+ */
+static void hv_stack_report(void)
+{
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        u64 low, high;
+        const u64 *p;
+
+        if (!hv_stack_marked[cpu])
+            continue;
+        hv_stack_range(cpu, &low, &high);
+        for (p = (const u64 *)low; (u64)p < high && *p == HV_STACK_MARK; p++)
+            ;
+        printf("HV: CPU %d used at most %ld KiB of its %ld KiB EL2 stack\n", cpu,
+               (high - (u64)p) >> 10, (high - low) >> 10);
+    }
+}
+
 static u64 hv_cpu_state_regs[MAX_CPUS];
 
 static bool hv_cpu_state_access(struct exc_info *ctx, u64 ipa, u64 *val, bool write, int width)
@@ -87,11 +152,19 @@ static bool hv_cpu_state_access(struct exc_info *ctx, u64 ipa, u64 *val, bool wr
     return false;
 }
 
+/*
+ * For macOS under SPTM only, which upstream added this for: it reads the register of each core
+ * at cpu-impl-reg + 0x100 over and over. Any other guest reads it as the hardware has it, like
+ * every other register of the cores (SiliconNT docs/DESIGN.md, "设计核心" 1).
+ */
 static bool hv_cpu_state_setup_hook(void)
 {
     int node;
 
     memset(hv_cpu_state_regs, 0, sizeof(hv_cpu_state_regs));
+
+    if (hv_sptm_mode == SPTM_NONE)
+        return true;
 
     node = adt_path_offset(adt, "/cpus");
     if (node < 0)
@@ -307,6 +380,8 @@ void hv_init(void)
         hv_secondary_tick_interval = hv_tick_interval;
     }
 
+    hv_exc_init();
+    memset(hv_stack_marked, 0, sizeof(hv_stack_marked));
     // After CNTHCTL_EL2 has been set up above: this adds the event stream
     hv_wfi_init();
     hv_psci_init();
@@ -549,6 +624,7 @@ void hv_start(void *entry, u64 regs[4])
 
     hv_write_cntvoff();
     hv_vgic_start();
+    hv_stack_mark();
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry, mrs(DAIF) | SPSR_M_EL1H);
 
     /*
@@ -583,6 +659,8 @@ void hv_start(void *entry, u64 regs[4])
     hv_vgic_report();
     hv_vgic_stop();
     hv_wfi_report();
+    hv_exc_report();
+    hv_stack_report();
     hv_psci_report();
     hv_pmu_report();
     hv_dbg_report();
@@ -670,6 +748,7 @@ static void hv_enter_secondary(void)
     const struct hv_cpu_entry *e = &hv_cpu_entry[smp_id()];
 
     hv_arm_tick(smp_id() != hv_lead_cpu());
+    hv_stack_mark();
     hv_enter_guest(e->regs[0], e->regs[1], e->regs[2], e->regs[3], e->entry, HV_CPU_ON_SPSR);
 }
 

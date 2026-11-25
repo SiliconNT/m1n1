@@ -50,4 +50,6 @@ BREAK_23 := s/^        if (shadow\[i\] == xt_shadow_word(words\[i\]))$$/        
 BREAK_23_IS := a shadow page is never found out of date
 BREAK_24 := s/part\[parts\]\.orig = xt_orig(part\[parts\]\.page, part\[parts\]\.state, pa);/part[parts].orig = pa;/
 BREAK_24_IS := an access taken apart from the instruction goes to the page that stage 2 points to
-BROKEN := 2 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24
+BREAK_25 := s/if (last->page == page \&\& last->switches == switches) {/if (last->page == page) {/
+BREAK_25_IS := a core that faults on a page another core has just made executable counts it as a repeat, whatever changed in between
+BROKEN := 2 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25

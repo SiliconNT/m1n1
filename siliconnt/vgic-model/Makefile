@@ -3,18 +3,22 @@
 # Host-side model tests for src/hv/hv_vgic.c and src/hv/hv_wfi.c (test.c), for the masking
 # functions of src/aic.c (aic_test.c, with the stand-in headers of aic/) and for
 # src/hv/hv_psci.c (psci_test.c), src/hv/hv_pmu.c (pmu_test.c), the page tables of
-# src/hv/hv_vm.c (pt_test.c), src/hv/hv_xtrack.c (xtrack_test.c) and src/hv/hv_xinsn.c
-# (xinsn_test.c, test_xinsn.py), and src/hv/hv.c with src/smp.c (cpus_test.c). They compile
+# src/hv/hv_vm.c (pt_test.c), src/hv/hv_xtrack.c (xtrack_test.c; on several cores at once,
+# xtrack_smp_test.c) and src/hv/hv_xinsn.c (xinsn_test.c, test_xinsn.py), and src/hv/hv.c with
+# src/smp.c (cpus_test.c). They compile
 # the real files for the build machine against stand-in headers and play the hardware, the
 # guest and the host around them.
 #
 #   make        build them and run them
 #   make pt     only the page table one
 #   make pt-broken  ...against hv_vm.c with one thing wrong at a time in where the tables come
-#               from or in the check of the range of CTRR: it must fail on each
+#               from, in the check of the range of CTRR or in the count of changes of state: it
+#               must fail on each
 #   make xtrack only the execution tracking one
 #   make xtrack-broken  ...against hv_xtrack.c with one thing wrong in it at a time: it must
 #               fail on each
+#   make xtrack-smp  only the execution tracking one on several cores
+#   make xtrack-smp-broken  ...against hv_xtrack.c with the repeat count of before: it must fail
 #   make xinsn  only the one for the instruction decoder of execution tracking
 #   make dbg    only the one for the debug registers, src/hv/hv_dbg.c (dbg_test.c)
 #   make aic    only the one for aic_mask(), aic_unmask() and aic_mask_all() of src/aic.c
@@ -28,9 +32,11 @@
 #               host knows of them (needs the Python of the proxy client)
 #   make cpus-broken  ...against one of those with one thing wrong at a time: it must fail on
 #               each, with a failed check or by hanging
-#   make tsan   test.c under ThreadSanitizer, with fewer rounds
-#   make vgic-broken  test.c against hv_vgic.c with one thing wrong at a time, in how it forwards
-#               AIC lines or in what it does when the guest turns a core off: it must fail on each
+#   make tsan   test.c and xtrack_smp_test.c under ThreadSanitizer, with fewer rounds
+#   make vgic-broken  test.c against hv_vgic.c or hv_wfi.c with one thing wrong at a time, in how
+#               it forwards AIC lines, in what it does when the guest turns a core off, in which
+#               interrupts it keeps in the list registers or in when a waiting core takes SErrors
+#               again: it must fail on each
 
 CC := gcc
 PYTHON ?= $(HOME)/src/m1n1-venv/bin/python
@@ -38,9 +44,9 @@ SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -pthread -I. -Ibuild
 ROUNDS ?= 200000
 
-.PHONY: all psci psci-broken pmu pt pt-broken xtrack xtrack-broken xinsn dbg aic cpus cpus-broken tsan vgic-broken clean
+.PHONY: all psci psci-broken pmu pt pt-broken xtrack xtrack-broken xtrack-smp xtrack-smp-broken xinsn dbg aic cpus cpus-broken tsan vgic-broken clean
 
-all: build/model psci psci-broken cpus cpus-broken pmu pt pt-broken xinsn xtrack xtrack-broken dbg aic vgic-broken
+all: build/model psci psci-broken cpus cpus-broken pmu pt pt-broken xinsn xtrack xtrack-broken xtrack-smp xtrack-smp-broken dbg aic vgic-broken
 	build/model $(ROUNDS)
 
 # The breakpoint and watchpoint registers of the guest, src/hv/hv_dbg.c
@@ -106,6 +112,32 @@ xtrack-broken: $(BROKEN:%=build/xtrack-broken-%)
 	@$(foreach n,$(BROKEN),echo "xtrack-broken: $(n) $(BREAK_$(n)_IS): $$(grep -m1 '^FAIL' build/xtrack-broken-$(n).log)";)
 	@echo "xtrack-broken: all $(words $(BROKEN)) failed, as they must"
 
+# The same on several cores at once: threads for the cores, see xtrack_smp_test.c
+XTRACK_SMP_DEPS := xtrack_smp_test.c $(wildcard *.h) build/hv_xpage.h build/hv_pmu.c \
+	build/hv_xinsn.c build/hv_xinsn.h build/arm_cpu_regs.h build/hv_aicmap.h
+XTRACK_SMP_SRCS := xtrack_smp_test.c build/hv_pmu.c build/hv_xinsn.c
+
+xtrack-smp: build/xtrack-smp-model
+	build/xtrack-smp-model $(XTRACK_SMP_ROUNDS)
+
+build/xtrack-smp-model: $(XTRACK_SMP_DEPS) build/hv_xtrack.inc
+	$(CC) $(CFLAGS) -o $@ $(XTRACK_SMP_SRCS)
+
+build/xtrack-smp-tsan: $(XTRACK_SMP_DEPS) build/hv_xtrack.inc
+	$(CC) $(CFLAGS) -O1 -fsanitize=thread -o $@ $(XTRACK_SMP_SRCS)
+
+build/xtrack-smp-broken-%: $(XTRACK_SMP_DEPS) build/hv_xtrack-broken-%.inc
+	$(CC) $(CFLAGS) -Wno-error -DXTRACK_INC='"hv_xtrack-broken-$*.inc"' -o $@ $(XTRACK_SMP_SRCS)
+
+# ...against hv_xtrack.c with the repeat count of before, 25 of ../xtrack-broken.mk
+xtrack-smp-broken: build/xtrack-smp-broken-25
+	@if timeout 300 build/xtrack-smp-broken-25 > build/xtrack-smp-broken-25.log 2>&1; then \
+		echo "xtrack-smp-broken-25: the test passes and must not"; exit 1; \
+	fi
+	@grep -q -m1 '^FAIL' build/xtrack-smp-broken-25.log || \
+		{ echo "xtrack-smp-broken-25: ended without a failed check"; exit 1; }
+	@echo "xtrack-smp-broken: 25 $(BREAK_25_IS): $$(grep -m1 '^FAIL' build/xtrack-smp-broken-25.log)"
+
 build/pt-model: pt_test.c $(wildcard *.h) build/hv_vm_pt.inc build/hv_xpage.h build/arm_cpu_regs.h \
 	build/hv_aicmap.h
 	$(CC) $(CFLAGS) -o $@ pt_test.c
@@ -113,7 +145,8 @@ build/pt-model: pt_test.c $(wildcard *.h) build/hv_vm_pt.inc build/hv_xpage.h bu
 # Every change must change something (cmp), or the source has moved on
 PT_BROKEN := small-chunk first-level-not-rounded never-reused l3-not-given-back \
 	kboot-end page-step flag-ignored order-not-checked end-not-checked zero-not-special \
-	refusal-ignored
+	refusal-ignored switch-not-counted
+BREAK_PT_switch-not-counted := /^        hv_pt_switches++;$$/d
 BREAK_PT_small-chunk := s/HV_PT_CHUNK 0x4000UL/HV_PT_CHUNK 0x2000UL/
 BREAK_PT_first-level-not-rounded := s/hv_Ltop = heapblock_alloc_aligned(ALIGN_UP(size, HV_PT_CHUNK),/hv_Ltop = heapblock_alloc_aligned(size,/
 BREAK_PT_never-reused := s/^    if (!\*spares) {$$/    if (1) {/
@@ -265,6 +298,7 @@ build/cpus/exc.c: cpus/exc_head.c cpus/exc_tail.c $(SRC)/hv/hv_exc.c Makefile
 	for f in 'void hv_write_cntvoff(void)' 'static void _hv_exc_proxy$(EXC_ARGS)' \
 		'void hv_maybe_switch_cpu$(EXC_ARGS)' 'void hv_exc_proxy$(EXC_ARGS) void \*extra)' \
 		'void hv_exc_init_cpu(int cpu)' 'static void hv_get_context(struct exc_info \*ctx)' \
+		'void hv_exc_init(void)' 'void hv_lock(void)' 'void hv_exc_report(void)' \
 		'static void hv_exc_entry(void)' 'static void hv_exc_exit(struct exc_info \*ctx)' \
 		'static int hv_interruptible_cpu(void)' 'void hv_exc_fiq(struct exc_info \*ctx)'; do \
 		test $$(grep -c "^$$f$$" $(SRC)/hv/hv_exc.c) = 1 || exit 1; \
@@ -289,13 +323,15 @@ CPUS_BROKEN_hv := not-started after-vgic before-wfe-mode ready-ignored line-igno
 	last-leaves off-not-shown want-kept pin-kept exit-one exit-no-ipi started-kept tick-kept \
 	vtimer-kept vgic-not-off last-exit-ignored off-log-all boot-waits-for-lock boot-no-irq \
 	boot-not-parked lead-boot-only lead-not-boot tick-slow-on-entry no-exc-init back-not-awaited \
-	global-again boot-refused tick-no-host
+	global-again boot-refused tick-no-host state-hook-always
 CPUS_BROKEN_smp := rvbar-ignored start-again no-wait-result beyond-not-counted idle-always \
 	invalid-started boot-rvbar-kept boot-rvbar-locked boot-not-called boot-stays-alive
 CPUS_BROKEN_mmu := mmu-again
 CPUS_BROKEN_exc := bit-after-unlock bit-not-set exit-cntvoff take-over-forgotten stale-lead \
-	told-while-leaving exit-alone records-kept pmcr0-kept no-host-ignored
+	told-while-leaving exit-alone records-kept pmcr0-kept no-host-ignored serror-before-lock
 CPUS_BROKEN := $(foreach f,hv smp mmu exc,$(CPUS_BROKEN_$(f)))
+BREAK_CPUS_state-hook-always := /^static bool hv_cpu_state_setup_hook(/,/^}/{/^    if (hv_sptm_mode == SPTM_NONE)$$/,+1d}
+BREAK_CPUS_serror-before-lock := /^static void hv_exc_entry(/,/^}/{/^    hv_lock();$$/d;s/^        sysop("msr daifclr, 4");$$/&\n    hv_lock();/}
 BREAK_CPUS_not-started := /^void hv_init(void)/,/^}/{/^    hv_start_cpus();$$/d}
 BREAK_CPUS_after-vgic := /^void hv_init(void)/,/^}/{/^    hv_start_cpus();$$/d;s/^    hv_vgic_init();$$/&\n    hv_start_cpus();/}
 BREAK_CPUS_before-wfe-mode := /^void hv_init(void)/,/^}/{s/^    smp_set_wfe_mode(true);$$/    hv_start_cpus();\n&/;/^    hv_start_cpus();$$/d}
@@ -392,8 +428,9 @@ cpus-broken: $(CPUS_BROKEN:%=build/cpus-broken-%)
 	@$(foreach n,$(CPUS_BROKEN),echo "cpus-broken: $(n): $$(grep -m1 '^FAIL' build/cpus-broken-$(n).log)";)
 	@echo "cpus-broken: all $(words $(CPUS_BROKEN)) failed, as they must"
 
-tsan: build/model-tsan
+tsan: build/model-tsan build/xtrack-smp-tsan
 	build/model-tsan 3000
+	build/xtrack-smp-tsan 3000
 
 # Copies, so that their #include "..." lines find the stand-ins in this directory
 build/hv_vgic.c: $(SRC)/hv/hv_vgic.c
@@ -455,7 +492,7 @@ build/model-tsan: $(MODEL_DEPS) build/hv_vgic.c
 # hv_vgic.c with one thing wrong in how it forwards AIC lines, or in what it does when the guest
 # turns a core off, at a time. test.c must fail on each, in its tests of that (build/model aic and
 # build/model off run only those). Every change must change something (cmp), or the source has
-# moved on.
+# moved on. Likewise below for the list registers and for hv_wfi.c.
 VGIC_BROKEN_OFF := lr-kept spi-lost sgi-kept-pending active-not-ended ended-not-seen active-only \
 	hcr-kept events-kept lead-not-told irm-boot-only global-again off-sent-to
 BREAK_VGIC_lr-kept := /^void hv_vgic_cpu_off(void)/,/^}/{/vgic_write_lr(i, 0);/d}
@@ -493,6 +530,14 @@ BREAK_VGIC_end-not-seen := /vgic_line_ended(FIELD_GET(ICH_LR_VINTID, vgic_read_l
 BREAK_VGIC_last-line-missed := s/u32 lo = 0, hi = vgic_aicmap.count;/u32 lo = 0, hi = vgic_aicmap.count - 1;/
 BREAK_VGIC_unmask-in-flight := s/if (enable \&\& vgic_lines\[k\] == VGIC_LINE_MASKED) {/if (enable) {/
 BREAK_VGIC_no-table-check := s/    vgic_aicmap_ok = hv_aicmap(\&vgic_aicmap) >= 0;/    vgic_aicmap_ok = true; hv_aicmap(\&vgic_aicmap);/
+# ...in which interrupts are in the list registers (build/model lr)
+VGIC_BROKEN_LR := no-swap swap-lost swap-not-told
+BREAK_VGIC_no-swap := s/if (free < 0 \&\& lowest >= 0) {/if (0) {/
+BREAK_VGIC_swap-lost := /^        vgic_put_back(out);$$/d
+BREAK_VGIC_swap-not-told := /^static void vgic_put_back(/,/^}/{/VGIC_PERCPU(spi_left) = true;/d}
+# hv_wfi.c with one thing wrong, the same way (build/model wfi)
+WFI_BROKEN := serror-before-lock
+BREAK_WFI_serror-before-lock := /^bool hv_handle_wfx(/,/^}/{/^    hv_lock();$$/d;s/^        sysop("msr daifclr, 4");$$/&\n    hv_lock();/}
 
 build/hv_vgic-broken-%.c: build/hv_vgic.c Makefile
 	sed -e '$(BREAK_VGIC_$*)' $< > $@
@@ -501,8 +546,19 @@ build/hv_vgic-broken-%.c: build/hv_vgic.c Makefile
 build/model-broken-%: $(MODEL_DEPS) build/hv_vgic-broken-%.c
 	$(CC) $(CFLAGS) -Wno-error -o $@ test.c build/hv_vgic-broken-$*.c build/hv_wfi.c
 
-vgic-broken: $(VGIC_BROKEN:%=build/model-broken-%) $(VGIC_BROKEN_OFF:%=build/model-broken-%)
-	@for n in $(VGIC_BROKEN:%=aic-%) $(VGIC_BROKEN_OFF:%=off-%); do \
+build/hv_wfi-broken-%.c: build/hv_wfi.c Makefile
+	sed -e '$(BREAK_WFI_$*)' $< > $@
+	! cmp -s $< $@
+
+$(WFI_BROKEN:%=build/model-broken-%): build/model-broken-%: $(MODEL_DEPS) build/hv_vgic.c \
+		build/hv_wfi-broken-%.c
+	$(CC) $(CFLAGS) -Wno-error -o $@ test.c build/hv_vgic.c build/hv_wfi-broken-$*.c
+
+VGIC_BROKEN_NAMES := $(VGIC_BROKEN) $(VGIC_BROKEN_OFF) $(VGIC_BROKEN_LR) $(WFI_BROKEN)
+
+vgic-broken: $(VGIC_BROKEN_NAMES:%=build/model-broken-%)
+	@for n in $(VGIC_BROKEN:%=aic-%) $(VGIC_BROKEN_OFF:%=off-%) $(VGIC_BROKEN_LR:%=lr-%) \
+			$(WFI_BROKEN:%=wfi-%); do \
 		what=$${n%%-*}; n=$${n#*-}; \
 		if timeout 60 build/model-broken-$$n $$what > build/model-broken-$$n.log 2>&1; then \
 			echo "vgic-broken-$$n: the test passes and must not"; exit 1; \
@@ -510,8 +566,8 @@ vgic-broken: $(VGIC_BROKEN:%=build/model-broken-%) $(VGIC_BROKEN_OFF:%=build/mod
 		grep -q -m1 '^FAIL\|^CHECK FAILED' build/model-broken-$$n.log || \
 			{ echo "vgic-broken-$$n: ended without a failed check"; exit 1; }; \
 	done
-	@$(foreach n,$(VGIC_BROKEN) $(VGIC_BROKEN_OFF),echo "vgic-broken: $(n): $$(grep -m1 '^FAIL\|^CHECK FAILED' build/model-broken-$(n).log)";)
-	@echo "vgic-broken: all $(words $(VGIC_BROKEN) $(VGIC_BROKEN_OFF)) failed, as they must"
+	@$(foreach n,$(VGIC_BROKEN_NAMES),echo "vgic-broken: $(n): $$(grep -m1 '^FAIL\|^CHECK FAILED' build/model-broken-$(n).log)";)
+	@echo "vgic-broken: all $(words $(VGIC_BROKEN_NAMES)) failed, as they must"
 
 clean:
 	rm -rf build

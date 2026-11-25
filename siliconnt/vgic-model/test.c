@@ -3,7 +3,8 @@
 /*
  * Host-side model test for src/hv/hv_vgic.c and src/hv/hv_wfi.c. The files under test are the
  * real ones, compiled against stand-in headers; this file plays the hardware (list registers,
- * the Apple IPI, ISR_EL1, WFE), the rest of the hypervisor (the MMIO hooks, the exit paths) and
+ * the Apple IPI, ISR_EL1, WFE, the SError mask), the rest of the hypervisor (the MMIO hooks, the
+ * exit paths, the lock) and
  * the guest (the Distributor and Redistributor accesses of the Windows kernel, acknowledge,
  * EOI, WFI), with one thread per core.
  *
@@ -403,6 +404,30 @@ int hv_map_hook(u64 from, hv_hook_t *hook, u64 size)
  * holds it there, not on the other paths used here
  */
 spinlock_t bhl = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Whether the SErrors of each core are masked in EL2 (DAIF.A): what "msr daifset, 4" and "msr
+ * daifclr, 4" leave. A core takes the lock with them masked, or it might wait for good with them
+ * on (hv_exc_entry(), hv_handle_wfx()).
+ */
+static bool serror_masked[MAX_CPUS];
+
+void mock_sysop(const char *op)
+{
+    if (op[0] == 'w')
+        mock_wfe();
+    else if (!strcmp(op, "msr daifset, 4"))
+        serror_masked[cur] = true;
+    else if (!strcmp(op, "msr daifclr, 4"))
+        serror_masked[cur] = false;
+}
+
+/* src/hv/hv_exc.c, which also counts how long a core waits */
+void hv_lock(void)
+{
+    CHECK(serror_masked[cur]);
+    pthread_mutex_lock(&bhl);
+}
 
 /* hv_update_fiq(), on the current core. The timer's FIQ is off for as long as its output is high */
 static void hv_exit(void)
@@ -2711,13 +2736,13 @@ static void off_stress(int lrs, int n)
 /* ---- a timer handler that ends the interrupt before it lowers the line ---- */
 
 struct vgic_counts {
-    long injected, maintenance, taken_back;
+    long injected, maintenance, taken_back, swapped;
 };
 
 /* What hv_vgic_report() prints for one core; it leaves out a core that has done nothing */
 static struct vgic_counts report_counts(int cpu)
 {
-    struct vgic_counts n = {0, 0, 0};
+    struct vgic_counts n = {0, 0, 0, 0};
     char line[512], key[32];
     FILE *f = tmpfile();
     int saved;
@@ -2735,11 +2760,10 @@ static struct vgic_counts report_counts(int cpu)
     rewind(f);
     while (fgets(line, sizeof(line), f))
         if (!strncmp(line, key, strlen(key)))
-            CHECK(
-                sscanf(
-                    line + strlen(key),
-                    "%*d ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, %ld taken back",
-                    &n.injected, &n.maintenance, &n.taken_back) == 3);
+            CHECK(sscanf(line + strlen(key),
+                         "%*d ICC_SGI1R_EL1 writes, %ld injected, %ld maintenance IRQs, %ld taken "
+                         "back (%ld for one of a higher priority)",
+                         &n.injected, &n.maintenance, &n.taken_back, &n.swapped) == 4);
     fclose(f);
     return n;
 }
@@ -2872,6 +2896,8 @@ static u64 guest_wfi(void)
     u64 before = wfe_count;
 
     pthread_mutex_lock(&bhl);
+    /* As hv_exc_entry() leaves them: on, once the lock is held */
+    serror_masked[cur] = false;
     CHECK(hv_handle_wfx(ESR_ISS_WFx_TI_WFI));
     hv_exit();
     pthread_mutex_unlock(&bhl);
@@ -3247,6 +3273,162 @@ static void wfi_stress(int lrs, long hops)
     hv_wfi_report();
 }
 
+/*
+ * ---- the list registers hold the pending interrupts of the highest priority ----
+ *
+ * The guest on core 6 does not take SPIs of priority LR_LOW while its mask is LR_MASK, and they
+ * fill its list registers. An interrupt of a higher priority takes the place of one of them, and
+ * that one is delivered when there is room again (SiliconNT docs/findings/0100, conclusion 7).
+ */
+#define LR_LOW   0xa0
+#define LR_MASK  0x90
+#define LR_FIRST 64 /* the first of those SPIs */
+
+static void lr_fill(int lrs, u32 spis)
+{
+    reset(lrs);
+    cores[6].pmr = LR_MASK;
+    cur = 0;
+    for (u32 i = 0; i < spis; i++) {
+        windows_enable_spi(LR_FIRST + i, LR_LOW, 6, true);
+        windows_request_spi(LR_FIRST + i);
+    }
+    settle_all();
+    CHECK(nr_valid_lrs(6) == (spis < (u32)lrs ? (int)spis : lrs) && total(6) == 0);
+}
+
+static void lr_tests(void)
+{
+    struct vgic_counts before;
+
+    /* An SGI from core 0, of a higher priority: one of the SPIs makes room for it */
+    lr_fill(4, 4);
+    before = report_counts(6);
+    cur = 0;
+    guest_send(sgi_to(6, 1));
+    settle(6);
+    CHECK(taken(6, 1) == 1 && report_counts(6).swapped == before.swapped + 1);
+    /* ...and is back in a list register once the SGI has ended */
+    CHECK(nr_valid_lrs(6) == 4);
+    for (u32 i = 0; i < 4; i++)
+        CHECK(lr_of(6, LR_FIRST + i));
+    printf("ok   list registers full of SPIs the guest does not take: an SGI of a higher priority "
+           "gets in, the SPI it took the place of gets back\n");
+
+    /* An SGI of the same priority waits */
+    cur = 6;
+    wr8(GICR(6, GICR_IPRIORITYR + 2), LR_LOW);
+    cur = 0;
+    guest_send(sgi_to(6, 2));
+    settle(6);
+    CHECK(taken(6, 2) == 0 && !lr_of(6, 2) && nr_valid_lrs(6) == 4);
+    printf("ok   ...one of the same priority waits\n");
+
+    /* Everything arrives once, when the guest takes them */
+    cores[6].pmr = 0x100;
+    settle_all();
+    for (u32 i = 0; i < 4; i++)
+        CHECK(taken(6, LR_FIRST + i) == 1);
+    CHECK(taken(6, 2) == 1 && nr_valid_lrs(6) == 0);
+    printf("ok   ...and everything arrives once the guest takes it\n");
+
+    /* The timer, a PPI, takes the place of an SPI too */
+    lr_fill(2, 3);
+    cur = 6;
+    cores[6].timer = true;
+    hv_exit();
+    CHECK(lr_of(6, HV_VGIC_INTID_VTIMER) && nr_valid_lrs(6) == 2);
+    CHECK(guest_irq() == HV_VGIC_INTID_VTIMER);
+    cores[6].timer = false;
+    settle(6);
+    CHECK(nr_valid_lrs(6) == 2);
+    cores[6].pmr = 0x100;
+    settle_all();
+    for (u32 i = 0; i < 3; i++)
+        CHECK(taken(6, LR_FIRST + i) == 1);
+    CHECK(taken(6, HV_VGIC_INTID_VTIMER) == 1 && nr_valid_lrs(6) == 0);
+    printf("ok   the timer takes the place of an SPI of a lower priority\n");
+}
+
+/*
+ * The same with threads: cores 0, 7 and 1 keep sending SGIs to core 6, and now and then request
+ * the SPIs again, which fill the list registers of core 6 and which its guest does not take
+ * until the end
+ */
+static u64 lr_sent[NR_STARTED][NR_SGIS];
+static atomic_int lr_senders;
+
+static void *lr_sender(void *arg)
+{
+    int slot = (long)arg;
+    unsigned seed = 4321 + slot;
+
+    cur = started[slot];
+    for (int round = 0; round < rounds && !atomic_load(&failed); round++) {
+        u32 intid = 4 * slot + rand_r(&seed) % 4;
+        u32 before = taken(6, intid);
+
+        guest_send(sgi_to(6, intid));
+        lr_sent[slot][intid]++;
+        if (!wait_taken(6, intid, before, seconds()))
+            break;
+        if (rand_r(&seed) % 8 == 0)
+            windows_request_spi(LR_FIRST + rand_r(&seed) % 4);
+    }
+    atomic_fetch_sub(&lr_senders, 1);
+    while (atomic_load(&lr_senders) && !atomic_load(&failed))
+        serve();
+    return NULL;
+}
+
+static void *lr_receiver(void *arg)
+{
+    UNUSED(arg);
+    cur = 6;
+    while (atomic_load(&lr_senders) && !atomic_load(&failed))
+        serve();
+    return NULL;
+}
+
+static void lr_stress(int lrs, int n)
+{
+    pthread_t threads[NR_STARTED];
+    struct vgic_counts before;
+    long swapped;
+
+    lr_fill(lrs, lrs + 2);
+    cur = 6;
+    before = report_counts(6);
+    rounds = n;
+    memset(lr_sent, 0, sizeof(lr_sent));
+    atomic_store(&lr_senders, NR_STARTED - 1);
+    pthread_create(&threads[0], NULL, lr_receiver, NULL);
+    for (long i = 1; i < NR_STARTED; i++)
+        pthread_create(&threads[i], NULL, lr_sender, (void *)i);
+    for (int i = 0; i < NR_STARTED; i++)
+        pthread_join(threads[i], NULL);
+    if (atomic_load(&failed))
+        exit(1);
+
+    cur = 6;
+    swapped = report_counts(6).swapped - before.swapped;
+    cores[6].pmr = 0x100;
+    settle_all();
+    for (int s = 1; s < NR_STARTED; s++)
+        for (u32 i = 4 * s; i < 4 * s + 4; i++)
+            if (taken(6, i) != lr_sent[s][i]) {
+                printf("FAIL list register stress: core 6 took SGI %u %u times, %lu were sent\n",
+                       i, taken(6, i), lr_sent[s][i]);
+                exit(1);
+            }
+    for (int i = 0; i < lrs + 2; i++)
+        CHECK(taken(6, LR_FIRST + i) == 1);
+    CHECK(nr_valid_lrs(6) == 0 && swapped > 0);
+    printf("ok   list register stress, %d list registers, %d SGIs per core: %ld SPIs taken out for "
+           "an SGI\n",
+           lrs, n, swapped);
+}
+
 int main(int argc, char **argv)
 {
     int n = argc > 1 ? atoi(argv[1]) : 200000;
@@ -3269,7 +3451,22 @@ int main(int argc, char **argv)
         printf("ALL OK\n");
         return 0;
     }
+    /* "lr": only those of which interrupts are in the list registers (make vgic-broken) */
+    if (argc > 1 && !strcmp(argv[1], "lr")) {
+        lr_tests();
+        lr_stress(4, 2000);
+        lr_stress(1, 1000);
+        printf("ALL OK\n");
+        return 0;
+    }
+    /* "wfi": only those of WFI (make vgic-broken, against hv_wfi.c) */
+    if (argc > 1 && !strcmp(argv[1], "wfi")) {
+        wfi_tests();
+        printf("ALL OK\n");
+        return 0;
+    }
     sgi_tests();
+    lr_tests();
     dist_tests();
     aic_tests();
     aic_config_tests();
@@ -3287,6 +3484,8 @@ int main(int argc, char **argv)
     off_stress(8, n / 4);
     off_stress(2, n / 8);
     off_stress(1, n / 8);
+    lr_stress(4, n / 8);
+    lr_stress(1, n / 16);
     wfi_stress(8, n / 4);
     wfi_stress(1, n / 8);
     printf("ALL OK\n");

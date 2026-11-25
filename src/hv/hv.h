@@ -159,6 +159,7 @@ void hv_vgic_report(void);
 /* WFI of the guest: trapped, the core waits in EL2 */
 void hv_wfi_init(void);
 bool hv_handle_wfx(u64 iss);
+void hv_wfi_ipi_sent(int cpu);
 void hv_wfi_report(void);
 
 /* PSCI for the guest, over hvc #0 */
@@ -195,6 +196,7 @@ bool hv_pt_xtrack_on(void);
 #define HV_XPAGE_XONLY     3 // code with replaced instructions: executed only; a shadow page
 int hv_pt_scanned(u64 ipa, u64 *pa);
 int hv_pt_set_scanned(u64 ipa, int state, u64 pa);
+u64 hv_pt_switch_count(void);
 #define HV_XTRACK_NONE  0
 #define HV_XTRACK_RETRY 1
 #define HV_XTRACK_STOP  2
@@ -231,7 +233,10 @@ void hv_power_reset(void);
 void hv_power_off(void);
 
 /* Exceptions */
+void hv_exc_init(void);
 void hv_exc_init_cpu(int cpu);
+void hv_lock(void);
+void hv_exc_report(void);
 void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type, void *extra);
 void hv_maybe_switch_cpu(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type,
                          void *extra);

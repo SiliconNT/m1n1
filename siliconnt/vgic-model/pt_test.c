@@ -454,6 +454,8 @@ static void t_set_scanned(u64 ipa, int state, u64 pa)
     u64 page = ipa & ~0xfffUL, other = page - 0x1000, got = 0;
     unsigned long flushes = tlb_flushes;
     int was = hv_pt_scanned(page, &got);
+    /* Each change of state counts once, as it starts; one that is refused does not */
+    u64 switches = hv_pt_switch_count();
 
     /* Not from one valid entry to another */
     check(hv_pt_set_scanned(ipa, state, pa) < 0,
@@ -462,9 +464,11 @@ static void t_set_scanned(u64 ipa, int state, u64 pa)
           ipa, was, state);
     check(hv_pt_scanned(page, &got) == was, "0x%lx: a change that was refused changed the state",
           ipa);
+    check(hv_pt_switch_count() == switches, "0x%lx: a change that was refused is counted", ipa);
 
     check(hv_pt_set_scanned(ipa, HV_XPAGE_INVALID, 0) == 0,
           "hv_pt_set_scanned(0x%lx, invalid) failed", ipa);
+    check(hv_pt_switch_count() == switches + 1, "0x%lx: the change is not counted", ipa);
     op_add(page, 0x1000, K_NONE, 0, 0);
     check(tlb_flushes > flushes, "0x%lx: an invalid entry without a TLB invalidation", ipa);
     check(!s2_walk(page + 0x800).valid && hv_pt_scanned(page, &got) < 0,
@@ -483,6 +487,8 @@ static void t_set_scanned(u64 ipa, int state, u64 pa)
           state, pa);
     op_add(page, 0x1000, K_HW, pa, state);
     check(tlb_flushes > flushes, "0x%lx: page state %d without the barriers", ipa, state);
+    check(hv_pt_switch_count() == switches + 1, "0x%lx: one change counted %lu times", ipa,
+          hv_pt_switch_count() - switches);
     check(hv_pt_scanned(page + 0xff8, &got) == state && got == pa,
           "0x%lx: hv_pt_scanned() does not say state %d at 0x%lx, to 0x%lx (it says 0x%lx)", ipa,
           state, page, pa, got);

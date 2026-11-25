@@ -139,6 +139,8 @@ static u64 hv_pt_xn;
 /* The page that hv_pt_set_scanned() has given an invalid entry, on its way to another state */
 #define HV_PT_NO_PAGE (~0UL)
 static u64 hv_pt_switching;
+/* How many times hv_pt_set_scanned() has given a page an invalid entry since hv_pt_init() */
+static u64 hv_pt_switches;
 
 /*
  * The tables come from heapblock, not from malloc: dlmalloc takes 8 KB off the heap for a
@@ -197,6 +199,7 @@ void hv_pt_init(void)
 {
     hv_pt_xn = 0;
     hv_pt_switching = HV_PT_NO_PAGE;
+    hv_pt_switches = 0;
 
     const uint64_t pa_bits[] = {32, 36, 40, 42, 44, 48, 52};
     uint64_t pa_range = FIELD_GET(ID_AA64MMFR0_PARange, mrs(ID_AA64MMFR0_EL1));
@@ -617,6 +620,7 @@ int hv_pt_set_scanned(u64 ipa, int state, u64 pa)
         if (hv_map(ipa, 0, PAGE_SIZE, 0) < 0)
             return -1;
         hv_pt_switching = ipa;
+        hv_pt_switches++;
         hv_pt_flush_tlb();
         return 0;
     }
@@ -645,6 +649,16 @@ int hv_pt_set_scanned(u64 ipa, int state, u64 pa)
     hv_pt_switching = HV_PT_NO_PAGE;
     hv_pt_flush_tlb();
     return 0;
+}
+
+/*
+ * How many times a page has started to go from one state to another since hv_pt_init(). With the
+ * big hypervisor lock held, as everything that changes it is: a core that finds this the same as
+ * it was before knows that no page has changed state in between (hv_xtrack_iabort()).
+ */
+u64 hv_pt_switch_count(void)
+{
+    return hv_pt_switches;
 }
 
 u64 hv_translate(u64 addr, bool s1, bool w, u64 *par_out)

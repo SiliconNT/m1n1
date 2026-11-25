@@ -80,6 +80,10 @@ void hv_pin_cpu(int cpu);
 int hv_lead_cpu(void);
 bool hv_is_leaving(void);
 extern int hv_want_cpu, hv_pinned_cpu;
+/* An enum hv_sptm_mode of src/hv/hv.h, which the host sets (P_HV_SPTM_SET_MODE) */
+extern int hv_sptm_mode;
+#define SPTM_NONE        0
+#define SPTM_NESTED_VIRT 2
 
 /* src/hv/hv_exc.c, by cpus/exc_head.c and cpus/exc_tail.c */
 void model_exc_entry(void);
@@ -203,6 +207,7 @@ static struct core {
     int nr_regs;
     /* Its interrupts: the IPI, the tick, and one that AIC tells it of */
     int ipi, irq;
+    bool serror_on; // DAIF.A is clear: an SError would be taken in EL2
     u64 cval; // when the tick comes
     /* What it did about them */
     int ticks, irqs;
@@ -330,6 +335,10 @@ void mock_sysop(const char *op)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (!strcmp(op, "wfe") || !strcmp(op, "dmb sy"))
         sched_yield();
+    else if (me >= 0 && !strcmp(op, "msr daifclr, 4"))
+        cores[me].serror_on = true;
+    else if (me >= 0 && (!strcmp(op, "msr daifset, 4") || !strcmp(op, "msr daifset, #0xf")))
+        cores[me].serror_on = false;
 }
 
 u64 mock_read64(u64 addr)
@@ -499,15 +508,26 @@ const void *adt_getprop(const void *adt, int node, const char *name, u32 *len)
 void *adt;
 u32 chip_id = 0x8132;
 u8 _vectors_start[0x1000] __attribute__((aligned(0x1000)));
-u8 _stack_bot[16];
+u8 _stack_top[16], _stack_bot[16];
 char _hv_vectors_start[16];
 bool display_is_external;
 int uartproxy_iodev;
+
+/*
+ * The core has taken an exception from the guest, which masked SErrors, and has not taken a lock
+ * since. The first lock it waits for, it waits for with them masked: it may wait for good, behind
+ * a core that has stopped the guest (hv_exc_entry()).
+ */
+static __thread bool exception_taken;
 
 void spin_lock(spinlock_t *lock)
 {
     s64 free;
 
+    if (exception_taken) {
+        CHECK(!cores[me].serror_on, "core %d waits for the lock with SErrors on", me);
+        exception_taken = false;
+    }
     if (__atomic_load_n(&lock->lock, __ATOMIC_ACQUIRE) == me) {
         lock->count++;
         return;
@@ -657,7 +677,22 @@ bool in_gl12(void) { return false; }
 void gxf_init(void) {}
 u64 gl2_call(void *f, u64 a, u64 b, u64 c, u64 d) { UNUSED(f); UNUSED(a); UNUSED(b); UNUSED(c); UNUSED(d); abort(); }
 bool heapblock_left(size_t *left) { *left = 1 << 20; return true; }
-int hv_map_hook(u64 from, void *hook, u64 size) { UNUSED(from); UNUSED(hook); UNUSED(size); return 0; }
+/* clang-format on */
+
+/* What has been hooked: the state register of a core, hv_cpu_state_setup_hook() of hv.c */
+static u64 hooked[2 * EXTRA];
+static int nr_hooked;
+
+int hv_map_hook(u64 from, void *hook, u64 size)
+{
+    UNUSED(hook);
+    CHECK(size == 8 && nr_hooked < 2 * EXTRA, "a hook at 0x%lx, 0x%lx bytes", from, size);
+    if (nr_hooked < 2 * EXTRA)
+        hooked[nr_hooked++] = from;
+    return 0;
+}
+
+/* clang-format off */
 bool hv_pa_rw(void *ctx, u64 addr, u64 *val, bool write, int width) { UNUSED(ctx); UNUSED(addr); UNUSED(val); UNUSED(write); UNUSED(width); return false; }
 void hv_pt_init(void) {}
 int hv_pt_check_ctrr(void) { return 0; }
@@ -751,9 +786,17 @@ void model_window(void)
 }
 
 /* An exception of the guest, with the lock held between the two */
-static void exc_entry(void)
+/* Taking an exception masks SErrors, as the others (DAIF) */
+static void take_exception(void)
 {
     __atomic_store_n(&cores[me].in_el2, true, __ATOMIC_SEQ_CST);
+    cores[me].serror_on = false;
+    exception_taken = true;
+}
+
+static void exc_entry(void)
+{
+    take_exception();
     model_exc_entry();
 }
 
@@ -783,7 +826,7 @@ static void run_a_bit(void)
 
     if (pending & ISR_F) {
         /* The IPI or the tick: hv_exc_fiq() */
-        __atomic_store_n(&cores[me].in_el2, true, __ATOMIC_SEQ_CST);
+        take_exception();
         model_exc_fiq();
         __atomic_store_n(&cores[me].in_el2, false, __ATOMIC_SEQ_CST);
     } else if (pending & ISR_I) {
@@ -883,6 +926,7 @@ static void reset(void)
     stopped_on = -1;
     slow_back = false;
     vgic_global_inits = 0;
+    nr_hooked = 0;
     /* UNKNOWN after a reset (Arm DDI 0487) */
     for (int i = 0; i < NR; i++)
         *reg_slot(&cores[i], "CNTVOFF_EL2") = 0xbad0000 + i;
@@ -936,6 +980,35 @@ static void test_all_up(void)
     cores[BOOT].entered = 0;
     hv_init();
     check_all_up();
+}
+
+/*
+ * The register of each core at cpu-impl-reg + 0x100 is hooked for macOS under SPTM, and for no
+ * other guest: Windows reads it as it is (SiliconNT docs/DESIGN.md, "设计核心" 1)
+ */
+static void test_state_hook(void)
+{
+    u64 regs[4] = {0};
+
+    smp_init();
+    hv_init();
+    guest = boot_leaves;
+    hv_start((void *)0x8000001000, regs);
+    CHECK(cores[BOOT].entered == 1 && !nr_hooked, "%d hooks, without SPTM", nr_hooked);
+
+    hv_sptm_mode = SPTM_NESTED_VIRT;
+    cores[BOOT].entered = 0;
+    hv_init();
+    hv_start((void *)0x8000001000, regs);
+    CHECK(cores[BOOT].entered == 1 && nr_hooked == NR, "%d hooks, with SPTM", nr_hooked);
+    for (int i = 0; i < NR; i++) {
+        bool found = false;
+
+        for (int k = 0; k < nr_hooked; k++)
+            found |= hooked[k] == IMPL(i) + 0x100;
+        CHECK(found, "no hook for core %d", i);
+    }
+    hv_sptm_mode = SPTM_NONE;
 }
 
 /* RVBAR is not locked: m1n1 writes it, whatever is there */
@@ -2070,6 +2143,7 @@ static const struct {
     void (*run)(void);
 } tests[] = {
     {"all-up", test_all_up},
+    {"state-hook", test_state_hook},
     {"all-up-unlocked", test_all_up_unlocked},
     {"started-before", test_started_before},
     {"locked-elsewhere", test_locked_elsewhere},

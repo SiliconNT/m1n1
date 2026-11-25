@@ -8,11 +8,11 @@
 #include "types.h"
 u64 mock_mrs(int reg);
 void mock_msr(int reg, u64 val);
-void mock_wfe(void);
+void mock_sysop(const char *op);
 #define mrs(reg)      mock_mrs(reg)
 #define msr(reg, val) mock_msr(reg, val)
-/* Barriers do nothing here; "wfe" is the only instruction that starts with a w */
-#define sysop(op) ((op)[0] == 'w' ? mock_wfe() : (void)0)
+/* "wfe" and what masks or unmasks SErrors are played (test.c); barriers do nothing here */
+#define sysop(op) mock_sysop(op)
 typedef pthread_mutex_t spinlock_t;
 #define spin_lock(l)   pthread_mutex_lock(l)
 #define spin_unlock(l) pthread_mutex_unlock(l)
