@@ -50,6 +50,7 @@ static bool wfe_mode SMP_SHARED = false;
 
 static int target_cpu SMP_SHARED;
 static int cpu_nodes[MAX_CPUS];
+static int cpus_beyond; // cores of the device tree that cpu_nodes has no room for
 static struct spin_table spin_table[MAX_CPUS] SMP_SHARED;
 
 struct cpu_info {
@@ -290,6 +291,7 @@ int smp_init(void)
 
     memset(cpu_nodes, 0, sizeof(cpu_nodes));
     memset(cpu_info, 0, sizeof(cpu_info));
+    cpus_beyond = 0;
 
     switch (chip_id) {
         case S5L8960X:
@@ -352,6 +354,7 @@ int smp_init(void)
 
         if (cpu_id >= MAX_CPUS) {
             printf("cpu-id %d exceeds max CPU count %d: increase MAX_CPUS\n", cpu_id, MAX_CPUS);
+            cpus_beyond++;
             continue;
         }
 
@@ -427,6 +430,18 @@ int smp_init(void)
     return 0;
 }
 
+/* The boot CPU is to come back to this image when it loses its state, where that can be said */
+static void smp_set_boot_rvbar(const struct cpu_info *cpu)
+{
+    // Check if already locked
+    if (FIELD_GET(RVBAR_LOCK, read64(cpu->impl_reg)))
+        return;
+
+    // Unlocked, write _vectors_start into boot CPU's rvbar
+    write64(cpu->impl_reg, (u64)_vectors_start);
+    sysop("dmb sy");
+}
+
 void smp_start_secondaries(void)
 {
     printf("Starting secondary CPUs...\n");
@@ -441,14 +456,7 @@ void smp_start_secondaries(void)
             continue;
 
         if (i == boot_cpu_idx) {
-            // Check if already locked
-            if (FIELD_GET(RVBAR_LOCK, read64(cpu->impl_reg)))
-                continue;
-
-            // Unlocked, write _vectors_start into boot CPU's rvbar
-            write64(cpu->impl_reg, (u64)_vectors_start);
-            sysop("dmb sy");
-
+            smp_set_boot_rvbar(cpu);
             continue;
         }
 
@@ -457,17 +465,23 @@ void smp_start_secondaries(void)
 }
 
 /*
- * Start a single secondary CPU. Unlike smp_start_secondaries() this refuses when the core
- * would not come up in this image, which is the case after chainloading an image with a
- * different layout on a machine whose RVBARs are locked.
+ * Start a single CPU, if it does not run m1n1 yet. Returns NULL if it does then, and why not
+ * otherwise. Unlike smp_start_secondaries() this refuses when the core would not come up in
+ * this image, which is the case after chainloading an image with a different layout on a
+ * machine whose RVBARs are locked.
  */
-bool smp_start_secondary(int cpu)
+const char *smp_try_start(int cpu)
 {
-    if (!smp_initialized || cpu < 0 || cpu >= MAX_CPUS || cpu == boot_cpu_idx ||
-        !cpu_info[cpu].valid) {
-        printf("CPU %d cannot be started\n", cpu);
-        return false;
+    if (!smp_initialized || !smp_has_cpu(cpu))
+        return "there is no such CPU";
+    if (!cpu_info[cpu].valid)
+        return "the device tree does not say how to start it";
+    if (cpu == boot_cpu_idx) {
+        smp_set_boot_rvbar(&cpu_info[cpu]);
+        return NULL;
     }
+    if (smp_is_alive(cpu))
+        return NULL;
 
     u64 rvbar = read64(cpu_info[cpu].impl_reg);
 
@@ -475,12 +489,21 @@ bool smp_start_secondary(int cpu)
         printf("Not starting CPU %d: RVBAR (=0x%lx) is locked and differs from entry point "
                "(=0x%lx)\n",
                cpu, rvbar & RVBAR_ADDR, (u64)_vectors_start);
-        return false;
+        return "its reset vector is locked to another image of m1n1";
     }
 
     smp_start_cpu(cpu, &cpu_info[cpu]);
 
-    return smp_is_alive(cpu);
+    return smp_is_alive(cpu) ? NULL : "it did not come up after it was started";
+}
+
+bool smp_start_secondary(int cpu)
+{
+    const char *why = cpu == boot_cpu_idx ? "it is the boot CPU" : smp_try_start(cpu);
+
+    if (why)
+        printf("CPU %d cannot be started: %s\n", cpu, why);
+    return !why;
 }
 
 void smp_stop_secondaries(bool deep_sleep)
@@ -574,6 +597,28 @@ bool smp_is_alive(int cpu)
         return false;
 
     return spin_table[cpu].flag;
+}
+
+/* Whether a secondary CPU that runs m1n1 waits for something to do */
+bool smp_is_idle(int cpu)
+{
+    if (!smp_is_alive(cpu))
+        return false;
+
+    sysop("dmb sy");
+    return !spin_table[cpu].target;
+}
+
+/* Whether the device tree has this CPU, running or not */
+bool smp_has_cpu(int cpu)
+{
+    return cpu >= 0 && cpu < MAX_CPUS && cpu_nodes[cpu];
+}
+
+/* How many CPUs the device tree has whose index m1n1 has no room for */
+int smp_cpus_beyond(void)
+{
+    return cpus_beyond;
 }
 
 uint64_t smp_get_mpidr(int cpu)

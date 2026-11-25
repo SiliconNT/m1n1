@@ -208,6 +208,35 @@ static void per_core_tests(void)
             }
 }
 
+/* A core that starts the guest again has them as after a reset; the others keep theirs */
+static void init_cpu_tests(void)
+{
+    static const int cores[] = {0, 5, 6, MAX_CPUS - 1};
+    const unsigned nr = sizeof(cores) / sizeof(cores[0]);
+
+    for (unsigned again = 0; again < nr; again++) {
+        hv_dbg_init();
+        for (unsigned c = 0; c < nr; c++) {
+            cur_cpu = cores[c];
+            for (unsigned k = 0; k < 4; k++)
+                for (int n = 0; n < 16; n++)
+                    guest_write(DBG(kinds[k], n, 1, 0), 1, pattern(kinds[k], n, cores[c]));
+        }
+        hv_dbg_init_cpu(cores[again]);
+        for (unsigned c = 0; c < nr; c++) {
+            cur_cpu = cores[c];
+            for (unsigned k = 0; k < 4; k++)
+                for (int n = 0; n < 16; n++) {
+                    u64 want = c == again ? 0 : pattern(kinds[k], n, cores[c]);
+
+                    guest_read(DBG(kinds[k], n, 2, 1));
+                    CHECK(ctx.regs[2] == want, "%s%d on core %d reads 0x%lx, not 0x%lx",
+                          kind_names[kinds[k]], n, cur_cpu, ctx.regs[2], want);
+                }
+        }
+    }
+}
+
 /* Rt = 31 is the zero register (D24.2.45, Rt): it reads as 0 and a read into it is dropped */
 static void zero_register_tests(void)
 {
@@ -310,6 +339,7 @@ int main(void)
     fresh_tests();
     keep_tests();
     per_core_tests();
+    init_cpu_tests();
     zero_register_tests();
     oslsr_tests();
     not_ours_tests();

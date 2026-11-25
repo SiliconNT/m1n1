@@ -3,21 +3,26 @@
 /*
  * Host-side model test for src/hv/hv_psci.c. The file under test is the real one, compiled
  * against the stand-in headers of this directory; this file plays the guest (the registers of
- * an hvc) and the host of the hypervisor (hv_exc_proxy(), which is where a guest that is not
- * to run again ends up).
+ * an hvc), the host of the hypervisor (hv_exc_proxy(), which is where a guest that is not to
+ * run again ends up) and the cores of the machine (src/smp.c, and hv_start_secondary() of
+ * src/hv/hv.c).
  *
  * What the answers have to be comes from what the Windows kernel does with them
  * (10.0.26300.9457): it reads PSCI_VERSION and takes six functions for granted on 1.1, asks
  * PSCI_FEATURES about the others and goes without those that answer with a negative number,
- * and stops with a bug check if SYSTEM_RESET, SYSTEM_OFF or CPU_OFF return.
+ * and stops with a bug check if SYSTEM_RESET, SYSTEM_OFF or CPU_OFF return, or if CPU_ON
+ * returns anything but 0, ALREADY_ON or ON_PENDING.
  */
 #include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "hv.h"
+#include "smp.h"
 
 #define NOT_SUPPORTED ((u64)-1)
+#define ALREADY_ON    ((u64)-4)
 
 /* ---- the host of the hypervisor ---- */
 
@@ -38,6 +43,54 @@ void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type
     proxy_ctx = *ctx;
     if (proxy_calls > proxy_handled)
         longjmp(left_guest, 1);
+}
+
+/* ---- the cores: an M4, as src/smp.c has it once hv_init() has started them all ---- */
+
+#define M4_BOOT 6
+static const u64 m4_mpidr[] = {0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x10100, 0x10101, 0x10102, 0x10103};
+#define M4_CPUS ((int)(sizeof(m4_mpidr) / sizeof(m4_mpidr[0])))
+
+int boot_cpu_idx = M4_BOOT;
+bool hv_started_cpus[MAX_CPUS];
+static bool absent_cpu[MAX_CPUS]; /* a core of the M4 that does not run m1n1 */
+
+static int starts; /* hv_start_secondary() calls, and the last of them */
+static bool start_works;
+static int start_cpu;
+static void *start_entry;
+static u64 start_regs[4];
+
+/* The boot core is not one that smp.c has started, so that says nothing of itself */
+bool smp_is_alive(int cpu)
+{
+    return cpu < M4_CPUS && cpu != boot_cpu_idx && !absent_cpu[cpu];
+}
+
+/* A core that is not there reads as 0, which is the MPIDR of one that is */
+uint64_t smp_get_mpidr(int cpu)
+{
+    return cpu < M4_CPUS && !absent_cpu[cpu] ? m4_mpidr[cpu] : 0;
+}
+
+bool hv_start_secondary(int cpu, void *entry, u64 regs[4])
+{
+    starts++;
+    start_cpu = cpu;
+    start_entry = entry;
+    memcpy(start_regs, regs, sizeof(start_regs));
+    if (start_works)
+        hv_started_cpus[cpu] = true;
+    return start_works;
+}
+
+static void reset_cpus(void)
+{
+    memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
+    memset(absent_cpu, 0, sizeof(absent_cpu));
+    hv_started_cpus[boot_cpu_idx] = true;
+    starts = 0;
+    start_works = true;
 }
 
 /* ---- the guest ---- */
@@ -186,6 +239,140 @@ static void absent_tests(void)
         CHECK_ANSWER(psci(absent[i], 0x1234), NOT_SUPPORTED);
 }
 
+/* CPU_ON as a guest calls it: the answer, and what the core it is about starts with */
+#define ENTRY   0x8123456780UL
+#define CONTEXT 0xc0ffee00c0ffee00UL
+
+static enum outcome cpu_on(u64 target)
+{
+    fill(FN_CPU_ON, target);
+    ctx.regs[2] = ENTRY;
+    ctx.regs[3] = CONTEXT;
+    before = ctx;
+    starts = 0;
+    return hvc(0);
+}
+
+/* What was printed while the guest was stopped */
+static char printed[16384];
+
+static enum outcome cpu_on_printed(u64 target)
+{
+    FILE *f = tmpfile();
+    int out = dup(1);
+    enum outcome ret;
+    size_t len;
+
+    fflush(stdout);
+    dup2(fileno(f), 1);
+    ret = cpu_on(target);
+    fflush(stdout);
+    dup2(out, 1);
+    close(out);
+    rewind(f);
+    len = fread(printed, 1, sizeof(printed) - 1, f);
+    printed[len] = 0;
+    fclose(f);
+    return ret;
+}
+
+static int count_lines(const char *start)
+{
+    int n = 0;
+
+    for (const char *p = printed; *p; p = strchr(p, '\n') + 1) {
+        if (!strncmp(p, start, strlen(start)))
+            n++;
+        if (!strchr(p, '\n'))
+            break;
+    }
+    return n;
+}
+
+static void cpu_on_tests(void)
+{
+    /* Every core, in the order the kernel starts them (MADT: 6 first, then 7, 8, 9, 0...) */
+    reset_cpus();
+    for (int i = 1; i < M4_CPUS; i++) {
+        int cpu = (M4_BOOT + i) % M4_CPUS;
+
+        CHECK_ANSWER(cpu_on(m4_mpidr[cpu]), 0);
+        CHECK(starts == 1 && start_cpu == cpu);
+        CHECK(start_entry == (void *)ENTRY);
+        CHECK(start_regs[0] == CONTEXT);
+        /* Nothing of the caller's in the registers after x0 */
+        CHECK(!start_regs[1] && !start_regs[2] && !start_regs[3]);
+        /* Those that were not asked for stay where they are */
+        for (int j = 0; j < M4_CPUS; j++)
+            CHECK(hv_started_cpus[j] == ((j + M4_CPUS - M4_BOOT) % M4_CPUS <= i));
+    }
+
+    /* They are all in the guest, the caller too: ALREADY_ON, in all of x0 */
+    for (int cpu = 0; cpu < M4_CPUS; cpu++) {
+        CHECK_ANSWER(cpu_on(m4_mpidr[cpu]), ALREADY_ON);
+        CHECK(!starts);
+    }
+
+    /* One that has left the guest starts again like the first time */
+    hv_started_cpus[3] = false;
+    CHECK_ANSWER(cpu_on(m4_mpidr[3]), 0);
+    CHECK(starts == 1 && start_cpu == 3 && start_entry == (void *)ENTRY);
+    CHECK_ANSWER(cpu_on(m4_mpidr[3]), ALREADY_ON);
+
+    /* Only the affinity fields count, not what else MPIDR_EL1 has (RES1, U, MT) */
+    reset_cpus();
+    CHECK_ANSWER(cpu_on(0x81000000UL | m4_mpidr[8]), 0);
+    CHECK(starts == 1 && start_cpu == 8);
+    CHECK_ANSWER(cpu_on(0xffffff0040000000UL | m4_mpidr[8]), ALREADY_ON);
+    CHECK_ANSWER(cpu_on(0x80000000UL | m4_mpidr[M4_BOOT]), ALREADY_ON);
+    CHECK(!starts);
+}
+
+/* A core that EL2 does not have: the guest stops, and what it asked for and what there is is
+ * there to be read */
+static void cpu_on_stop_tests(void)
+{
+    /* The last one is 1.0.0.1, which is not 0.0.0.1 */
+    static const u64 unknown[] = {0x6, 0x10104, 0x100, 0x10000, 0xffffff, 0x100000001UL};
+    char line[80];
+
+    for (size_t i = 0; i < COUNT(unknown); i++) {
+        reset_cpus();
+        hv_started_cpus[7] = true;
+        CHECK_STOPPED(cpu_on_printed(unknown[i]), HV_GUEST_HVC);
+        CHECK(proxy_calls == 1 && !starts);
+        snprintf(line, sizeof(line), "HV: MPIDR 0x%lx (x1 = 0x%lx) is none of the CPUs in EL2",
+                 unknown[i], unknown[i]);
+        CHECK(count_lines(line) == 1);
+        CHECK(count_lines("HV: CPU ") == M4_CPUS);
+        for (int cpu = 0; cpu < M4_CPUS; cpu++) {
+            snprintf(line, sizeof(line), "HV: CPU %d: MPIDR 0x%lx, %s\n", cpu, m4_mpidr[cpu],
+                     cpu == M4_BOOT || cpu == 7 ? "in the guest" : "waiting in EL2");
+            CHECK(count_lines(line) == 1);
+        }
+        /* A host that says "handled" does not get the guest going again either */
+        proxy_handled = 3;
+        CHECK_STOPPED(cpu_on_printed(unknown[i]), HV_GUEST_HVC);
+        CHECK(proxy_calls == 4 && !starts);
+        proxy_handled = 0;
+    }
+
+    /* A core that does not run m1n1 is not one of them, nor are the indices that have none */
+    reset_cpus();
+    absent_cpu[0] = true;
+    CHECK_STOPPED(cpu_on_printed(m4_mpidr[0]), HV_GUEST_HVC);
+    CHECK(proxy_calls == 1 && !starts);
+    CHECK(count_lines("HV: CPU ") == M4_CPUS - 1 && !count_lines("HV: CPU 0:"));
+
+    /* One that EL2 has and cannot let in, say because the watchdog runs on it */
+    reset_cpus();
+    start_works = false;
+    CHECK_STOPPED(cpu_on_printed(m4_mpidr[2]), HV_GUEST_HVC);
+    CHECK(proxy_calls == 1 && starts == 1 && start_cpu == 2);
+    CHECK(count_lines("HV: MPIDR 0x2 (x1 = 0x2) is a CPU that cannot be started") == 1);
+    CHECK(count_lines("HV: CPU ") == M4_CPUS);
+}
+
 static void stop_tests(void)
 {
     static const struct {
@@ -194,8 +381,7 @@ static void stop_tests(void)
     } calls[] = {
         {FN_SYSTEM_RESET, HV_GUEST_RESET},
         {FN_SYSTEM_OFF, HV_GUEST_OFF},
-        /* Until the hypervisor can start and stop cores: no answer is better than a wrong one */
-        {FN_CPU_ON, HV_GUEST_HVC},
+        /* Until the hypervisor can stop cores: no answer is better than a wrong one */
         {FN_CPU_OFF, HV_GUEST_HVC},
     };
 
@@ -246,6 +432,8 @@ int main(void)
     version_tests();
     features_tests();
     absent_tests();
+    cpu_on_tests();
+    cpu_on_stop_tests();
     stop_tests();
     immediate_tests();
     hv_psci_report();

@@ -37,7 +37,8 @@
 #                      [--no-host] (R37)
 #   make qemu-nohost   stoptest.bin under an EL2 of its own that links the real code for a
 #                      guest that has to be stopped (nohost-qemu.c), with a host and without
-#                      one, for hvc #1, SYSTEM_OFF and SYSTEM_RESET
+#                      one, for hvc #1, SYSTEM_OFF, SYSTEM_RESET and CPU_ON of a CPU that is
+#                      not there
 #   make qemu-nohost-broken ...against hv_stop.c with one thing wrong in it at a time
 #                      (../nohost-model/broken.mk): it must fail on each of QEMU_NOHOST_BROKEN
 #   make anstest       build/anstest.bin: the disk controller core of the SiliconNT drivers
@@ -350,7 +351,7 @@ build/nohost-qemu-%.elf: build/stoptest-el2-head.o build/nohost-qemu-%.o $(NOHOS
 
 # QEMU ends by itself where a host is told; without one the core stays in EL2, and QEMU is
 # stopped after a while. check_nohost_qemu.sh says what each run is to show.
-NOHOST_RUNS := host-0 host-1 host-2 nohost-0 nohost-1 nohost-2
+NOHOST_RUNS := host-0 host-1 host-2 host-3 nohost-0 nohost-1 nohost-2 nohost-3
 define NOHOST_RUN
 { timeout 10 $(QEMU) $(QEMU_XI_EL2_FLAGS) -smp 1 -no-reboot -kernel $(2) > $(3) 2>&1; \
 bash check_nohost_qemu.sh $(1) $(3) $$?; }

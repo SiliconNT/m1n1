@@ -605,6 +605,14 @@ void mmu_init(void)
 
 static void mmu_secondary_setup(void)
 {
+    /*
+     * The core has kept the MMU and the caches on since the last time. Below, the stack is
+     * invalidated in the caches, which is only right while nothing of it is in them: what the
+     * core has on it now would be lost.
+     */
+    if (read_sctlr() & SCTLR_M)
+        return;
+
     mmu_configure();
     if (cpu_features->mmu_sprr)
         mmu_init_sprr();

@@ -1354,6 +1354,36 @@ static void test_directed(void)
     check(!hv_xtrack_iabort(&ctx) && state[3] == HV_XPAGE_UNSCANNED,
           "an external abort on page 3 is tried again");
 
+    /*
+     * A core that keeps faulting on a page that is executable stops the guest; one that starts
+     * the guest again is not charged with what it did before, and the others are
+     */
+    test_esr = 0x8200000f;
+    test_far = ipa_of(2, 0);
+    for (int cpu = 3; cpu <= 4; cpu++) {
+        ctx.cpu_id = cpu;
+        for (int i = 0; i < XTRACK_MAX_REPEATS; i++)
+            check(hv_xtrack_iabort(&ctx), "core %d: fault %d on a page that runs", cpu, i);
+    }
+    hv_xtrack_init_cpu(3);
+    ctx.cpu_id = 3;
+    for (int i = 0; i < XTRACK_MAX_REPEATS; i++)
+        check(hv_xtrack_iabort(&ctx), "core 3, started again: fault %d on a page that runs", i);
+    check(!hv_xtrack_iabort(&ctx), "core 3, started again, faults again and again and goes on");
+    ctx.cpu_id = 4;
+    check(!hv_xtrack_iabort(&ctx), "core 4 faults again and again and goes on");
+    hv_xtrack_init_cpu(3);
+    hv_xtrack_init_cpu(4);
+    ctx.cpu_id = 0;
+
+    /* What hv_init() asks every core for */
+    for (u64 log = 2; log < 8; log++) {
+        test_CTR_EL0 = (0x9444c004 & ~0xf0000UL) | (log << 16);
+        check(hv_xtrack_line() == 4UL << log, "DminLine %ld: a line of %ld bytes", log,
+              hv_xtrack_line());
+    }
+    test_CTR_EL0 = 4UL << 16;
+
     /* The instruction cannot be read */
     c.x[1] = ipa_of(1, 0);
     test_insn_unreadable = true;

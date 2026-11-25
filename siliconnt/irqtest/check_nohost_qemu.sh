@@ -6,11 +6,11 @@
 #   check_nohost_qemu.sh <run> <log> <exit status of timeout>
 #
 # <run> is host-<n> or nohost-<n>, n the STOP_ARG of stoptest.S: 0 hvc #1, 1 SYSTEM_OFF,
-# 2 SYSTEM_RESET. With a host the host is told, with the event of src/hv/hv.h (HV_GUEST_HVC
-# 10, HV_GUEST_OFF 9, HV_GUEST_RESET 8), and nothing is shown on the screen. Without one the
-# devices of nohost-qemu.c do not answer: what is tried is tried and given up on, the screen
-# says why and has the guest's registers, and the core stays in EL2, so that QEMU has to be
-# stopped (timeout says 124).
+# 2 SYSTEM_RESET, 3 CPU_ON of a CPU that is not there. With a host the host is told, with the
+# event of src/hv/hv.h (HV_GUEST_HVC 10, HV_GUEST_OFF 9, HV_GUEST_RESET 8), and nothing is
+# shown on the screen. Without one the devices of nohost-qemu.c do not answer: what is tried is
+# tried and given up on, the screen says why and has the guest's registers, and the core stays
+# in EL2, so that QEMU has to be stopped (timeout says 124).
 set -u
 run=$1
 log=$2
@@ -28,12 +28,18 @@ hasnt() {
 }
 
 has "^nohost-qemu: start"
-hasnt "went on after the call|m1n1 restarts|an exception of|an interrupt|IOMMU|out of heap|did not take the hvc|would copy past"
+hasnt "went on after the call|hv_start_secondary\(\) was called|m1n1 restarts|an exception of|an interrupt|IOMMU|out of heap|did not take the hvc|would copy past"
 
 case $run in
 host-*)
     [ "$status" = 0 ] || fail "QEMU did not end by itself (status $status)"
-    has "^nohost-qemu: the host was told: reason 3, event $((10 - ${run#host-}))$"
+    case $run in
+    host-0 | host-3) event=10 ;;
+    host-1) event=9 ;;
+    host-2) event=8 ;;
+    *) fail "not a run" ;;
+    esac
+    has "^nohost-qemu: the host was told: reason 3, event $event$"
     hasnt "^SCREEN>"
     hasnt "^LOG> HV: (restarting|powering)"
     ;;
@@ -66,6 +72,16 @@ nohost-*)
         has "^SCREEN> HV: power: PMU byte 0xf801 was not written"
         has "^SCREEN> HV: the watchdog has not restarted the machine within 500 ms"
         hasnt "powering"
+        ;;
+    nohost-3)
+        has "^SCREEN> HV: PSCI: CPU_ON from the guest on CPU 0"
+        has "^SCREEN> HV: MPIDR 0x10104 \(x1 = 0x10104\) is none of the CPUs in EL2"
+        has "^SCREEN> HV: CPU 0: MPIDR 0x0, in the guest"
+        has "^SCREEN> HV: CPU 1: MPIDR 0x1, waiting in EL2"
+        hasnt "^SCREEN> HV: CPU 2:"
+        has "^SCREEN> HV: the guest made a call that the hypervisor cannot carry out"
+        has "^SCREEN> x0-x3: 00000000c4000003 0000000000010104 "
+        hasnt "^SCREEN> HV: (restarting|powering)"
         ;;
     *)
         fail "not a run"

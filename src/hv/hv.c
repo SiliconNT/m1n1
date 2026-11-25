@@ -18,9 +18,18 @@
 #define HV_TICK_RATE      1000
 #define HV_SLOW_TICK_RATE 1
 
+/*
+ * Where a core starts the guest at PSCI CPU_ON (Arm DEN 0022 F.b 6.4.1, 6.4.3.3): at EL1 with
+ * its own stack pointer, and all four exception masks set
+ */
+#define HV_CPU_ON_SPSR (SPSR_D | SPSR_A | SPSR_I | SPSR_F | SPSR_M_EL1H)
+
+/* How long a core with nothing left to do may take to get back to where it waits */
+#define HV_IDLE_TIMEOUT_US 10000
+
 DECLARE_SPINLOCK(bhl);
 
-void hv_enter_guest(u64 x0, u64 x1, u64 x2, u64 x3, void *entry);
+void hv_enter_guest(u64 x0, u64 x1, u64 x2, u64 x3, void *entry, u64 spsr);
 void hv_exit_guest(void) __attribute__((noreturn));
 
 extern char _hv_vectors_start[0];
@@ -35,10 +44,21 @@ enum hv_sptm_mode hv_sptm_mode = SPTM_NONE;
 bool hv_genter_trap_enabled = false;
 
 static bool hv_has_ecv;
+static bool hv_leaving; // the boot core has left the guest, and the other cores are made to
 static bool hv_should_exit[MAX_CPUS];
 bool hv_started_cpus[MAX_CPUS];
 u64 hv_cpus_in_guest;
 u64 hv_saved_sp[MAX_CPUS];
+
+/* Why a core of the device tree did not come into EL2 at hv_init(), NULL if it did */
+static const char *hv_cpu_missing[MAX_CPUS];
+
+/* What a core is let into the guest with. It reads this once it is on its way there. */
+static struct hv_cpu_entry {
+    void *entry;
+    u64 regs[4];
+    u64 count; // how often it was let in since hv_init()
+} hv_cpu_entry[MAX_CPUS];
 
 static u64 hv_cpu_state_regs[MAX_CPUS];
 
@@ -145,6 +165,80 @@ void hv_sptm_set_mode(enum hv_sptm_mode mode)
     hv_sptm_mode = mode;
 }
 
+/*
+ * Whether a core that runs m1n1 waits for something to do. One that has just left the guest may
+ * not be back where it waits yet (hv_enter_secondary()); one that m1n1 uses for something else,
+ * as hv_wdt.c does, will not be.
+ */
+static bool hv_cpu_waits(int cpu)
+{
+    for (int us = 0; us < HV_IDLE_TIMEOUT_US; us++) {
+        if (smp_is_idle(cpu))
+            return true;
+        udelay(1);
+    }
+    return false;
+}
+
+/*
+ * Have every core of the device tree run m1n1, where it waits in EL2 for the guest's CPU_ON
+ * (hv_psci.c). What did not work is kept for hv_start(), and said here as well: this is where
+ * the screen is still m1n1's.
+ */
+static void hv_start_cpus(void)
+{
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        u64 line;
+
+        hv_cpu_missing[cpu] = NULL;
+        hv_cpu_entry[cpu].count = 0;
+        if (!smp_has_cpu(cpu))
+            continue;
+
+        hv_cpu_missing[cpu] = smp_try_start(cpu);
+        if (!hv_cpu_missing[cpu] && cpu != boot_cpu_idx && !hv_cpu_waits(cpu))
+            hv_cpu_missing[cpu] = "it is busy with something else of m1n1";
+        if (hv_cpu_missing[cpu])
+            continue;
+
+        if (cpu == boot_cpu_idx) {
+            line = hv_xtrack_line();
+        } else {
+            smp_call0(cpu, hv_xtrack_line);
+            line = smp_wait(cpu);
+        }
+        if (line < HV_XTRACK_LINE) {
+            printf("HV: CPU %d: the smallest data cache line is %ld bytes, and cache maintenance "
+                   "here goes by %ld\n",
+                   cpu, line, HV_XTRACK_LINE);
+            hv_cpu_missing[cpu] = "its data cache lines are too small";
+        }
+    }
+
+    hv_cpus_ready();
+}
+
+/* Whether hv_init() has every core of the device tree in EL2. Says which are not, and why. */
+bool hv_cpus_ready(void)
+{
+    bool ready = true;
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (!hv_cpu_missing[cpu])
+            continue;
+        printf("HV: CPU %d is not in EL2: %s\n", cpu, hv_cpu_missing[cpu]);
+        ready = false;
+    }
+
+    if (smp_cpus_beyond()) {
+        printf("HV: %d CPUs are not in EL2: m1n1 has room for CPUs 0 to %d only\n",
+               smp_cpus_beyond(), MAX_CPUS - 1);
+        ready = false;
+    }
+
+    return ready;
+}
+
 void hv_init(void)
 {
     pcie_shutdown();
@@ -153,8 +247,10 @@ void hv_init(void)
         display_shutdown(DCP_QUIESCED);
     // reenable hpm interrupts for the guest for unused iodevs
     usb_hpm_restore_irqs(0);
-    // The secondary CPUs are started by the host before this, if it wants them at all
+    // Before any core waits: M4 loses CPU state in WFI (src/kboot.c)
     smp_set_wfe_mode(true);
+    // Before hv_vgic_init(), which gives a Redistributor to every core that runs m1n1
+    hv_start_cpus();
     hv_wdt_init();
 
     hv_pt_init();
@@ -242,6 +338,11 @@ void hv_start(void *entry, u64 regs[4])
         return;
     }
 
+    if (!hv_cpus_ready()) {
+        printf("HV: the guest would not have all its CPUs; can't start the hypervisor\n");
+        return;
+    }
+
     if (!hv_vgic_ranges_free()) {
         printf("HV: the guest would not find its GIC; can't start the hypervisor\n");
         return;
@@ -288,6 +389,7 @@ void hv_start(void *entry, u64 regs[4])
     memset(hv_should_exit, 0, sizeof(hv_should_exit));
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
 
+    hv_leaving = false;
     hv_started_cpus[boot_cpu_idx] = true;
 
     msr(VMPIDR_EL2, mrs(MPIDR_EL1));
@@ -325,10 +427,13 @@ void hv_start(void *entry, u64 regs[4])
     hv_cpus_in_guest = BIT(smp_id());
 
     hv_vgic_start();
-    hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
+    hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry, mrs(DAIF) | SPSR_M_EL1H);
 
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
     spin_lock(&bhl);
+
+    /* Below, a core that is not in the guest is not looked at again: none is to go in now */
+    hv_leaving = true;
 
     hv_wdt_stop();
 
@@ -366,8 +471,15 @@ void hv_start(void *entry, u64 regs[4])
     spin_unlock(&bhl);
 }
 
+/*
+ * On a core that is about to be let into the guest, every time: the EL2 settings of the boot
+ * core, and for EL1 what a core that PSCI has just turned on has, whatever is left there from
+ * m1n1 or from the last time the guest ran on it.
+ */
 static void hv_init_secondary(struct hv_secondary_info_t *info)
 {
+    int cpu = smp_id();
+
     if (cpu_features->apple_sysregs_unlocked)
         gxf_init();
 
@@ -415,6 +527,15 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
 
     hv_enable_sme_zt0();
 
+    /* Little endian, stage 1 MMU and caches off (Arm DEN 0022 F.b 6.4.3.2, 6.4.3.4) */
+    msr(SYS_SCTLR_EL12, mrs(SYS_SCTLR_EL12) & ~(SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_EE));
+    /* As on the boot core: no guest vectors. What was there may be m1n1's (src/exception.c). */
+    msr(VBAR_EL12, 0);
+
+    hv_xtrack_init_cpu(cpu);
+    hv_dbg_init_cpu(cpu);
+    hv_pmu_init_cpu(cpu);
+
     // For M3 and up, CNTHCTL_EL2 must be written after the counter redirection
     sysop("isb");
     msr(CNTHCTL_EL2, info->cnthctl);
@@ -425,45 +546,78 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     hv_arm_tick(true);
 }
 
-static void hv_enter_secondary(void *entry, u64 regs[4])
+static void hv_enter_secondary(void)
 {
-    hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
+    const struct hv_cpu_entry *e = &hv_cpu_entry[smp_id()];
 
+    hv_enter_guest(e->regs[0], e->regs[1], e->regs[2], e->regs[3], e->entry, HV_CPU_ON_SPSR);
+
+    /* Before the lock, as in hv_start(): who has it may wait for this in hv_rendezvous() */
+    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
     spin_lock(&bhl);
 
     printf("HV: Exiting from CPU %d\n", smp_id());
-
-    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
 
     hv_started_cpus[smp_id()] = false;
     spin_unlock(&bhl);
 }
 
-void hv_start_secondary(int cpu, void *entry, u64 regs[4])
+/*
+ * Let a core that waits in EL2 into the guest, for PSCI CPU_ON and for the host. Called with
+ * the hypervisor lock held; the core has everything it is to have when this returns, and is on
+ * its way into the guest. Returns false if that core cannot be let in.
+ */
+bool hv_start_secondary(int cpu, void *entry, u64 regs[4])
 {
-    if (!smp_is_alive(cpu)) {
-        printf("HV: CPU %d is not running m1n1, cannot enter the guest on it\n", cpu);
-        return;
+    struct hv_cpu_entry *e;
+
+    /*
+     * The boot core has left the guest and makes the others leave it (hv_start()). The one
+     * that asks for another now, whichever that is, leaves on its way back.
+     */
+    if (hv_leaving) {
+        hv_should_exit[smp_id()] = true;
+        return true;
     }
 
-    printf("HV: Initializing secondary %d\n", cpu);
-    iodev_console_flush();
+    /* Not the boot core either: it is not one that waits for smp_call4() */
+    if (!smp_is_alive(cpu)) {
+        printf("HV: CPU %d is not waiting in m1n1, cannot enter the guest on it\n", cpu);
+        return false;
+    }
+
+    if (hv_started_cpus[cpu]) {
+        printf("HV: CPU %d is in the guest already\n", cpu);
+        return false;
+    }
+
+    if (!hv_cpu_waits(cpu)) {
+        printf("HV: CPU %d is busy with something else of m1n1\n", cpu);
+        return false;
+    }
+
+    e = &hv_cpu_entry[cpu];
+    e->entry = entry;
+    memcpy(e->regs, regs, sizeof(e->regs));
+    e->count++;
+    /* The first few times: printing takes long, and the caller has the hypervisor lock */
+    if (!(e->count & (e->count - 1)))
+        printf("HV: CPU %d (MPIDR 0x%lx) enters the guest at %p, x0 = 0x%lx (#%ld)\n", cpu,
+               smp_get_mpidr(cpu), entry, regs[0], e->count);
 
     if (hv_sptm_mode == SPTM_EMULATION)
         hv_sprr_init_secondary(cpu);
 
     mmu_init_secondary(cpu);
-    iodev_console_flush();
     smp_call4(cpu, hv_init_secondary, (u64)&hv_secondary_info, 0, 0, 0);
     smp_wait(cpu);
-    iodev_console_flush();
 
-    printf("HV: Entering guest secondary %d at %p\n", cpu, entry);
+    hv_should_exit[cpu] = false;
     hv_started_cpus[cpu] = true;
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);
 
-    iodev_console_flush();
-    smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0);
+    smp_call0(cpu, hv_enter_secondary);
+    return true;
 }
 
 void hv_exit_cpu(int cpu)

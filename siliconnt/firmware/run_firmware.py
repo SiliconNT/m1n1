@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Load the SiliconNT UEFI firmware (SILICONNT_EFI.fd of the siliconnt-firmware
-repository) and run it as the guest of the hypervisor, on the boot CPU only.
+repository) and run it as the guest of the hypervisor. It is entered on the boot CPU. The
+others come into EL2 when the hypervisor starts, and into the guest when the guest calls PSCI
+CPU_ON (src/hv/hv_psci.c).
 
 The m1n1 on the target has to be built from this tree: the firmware needs the emulated GIC
 (src/hv/hv_vgic.c) and the WFI trap (src/hv/hv_wfi.c), and Windows, which the firmware starts
@@ -670,8 +672,8 @@ GUEST_STOPS = {
     "GUEST_OFF": "the guest called PSCI SYSTEM_OFF",
     "GUEST_RESET": "the guest called PSCI SYSTEM_RESET",
     "GUEST_HVC": "the guest made a call that the hypervisor cannot carry out and that must "
-                 "not return: PSCI CPU_ON or CPU_OFF, or an hvc other than #0 (m1n1 has "
-                 "printed which)",
+                 "not return: PSCI CPU_ON for a core that EL2 does not have, or an hvc other "
+                 "than #0 (m1n1 has printed which)",
 }
 timed_out = threading.Event()
 
@@ -960,7 +962,7 @@ if guest_cpus != m1n1_cpus:
              f"({' '.join(guest_cpus)}), m1n1's own has {len(m1n1_cpus)}: the firmware would "
              "not see the machine as it does when m1n1 loads it. The guest has not run.")
 print(f"/cpus of the guest's device tree: all {len(guest_cpus)} nodes of m1n1's own; "
-      "only the boot CPU runs")
+      "the guest starts on the boot CPU, the others wait in EL2 for its CPU_ON")
 
 dump_state("after hypervisor init, before the firmware")
 

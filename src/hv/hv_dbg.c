@@ -47,6 +47,12 @@ void hv_dbg_init(void)
     memset(hv_dbg, 0, sizeof(hv_dbg));
 }
 
+/* A core is about to start the guest again: its debug registers are as after a reset */
+void hv_dbg_init_cpu(int cpu)
+{
+    memset(hv_dbg[cpu].regs, 0, sizeof(hv_dbg[cpu].regs));
+}
+
 /*
  * iss: the syndrome of the trapped MRS or MSR (D24.2.45, exception class 0x18). Returns
  * whether the access was answered; the caller moves the guest past the instruction.

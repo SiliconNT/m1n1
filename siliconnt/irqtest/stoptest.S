@@ -14,6 +14,8 @@
  *      docs/findings/0068, R37).
  *   1  PSCI SYSTEM_OFF
  *   2  PSCI SYSTEM_RESET
+ *   3  PSCI CPU_ON of a CPU that is not there: without a host the screen also has the CPUs
+ *      that are
  *
  * None of them returns. If one does, the guest says so with hvc #0x5155 (STOP_RETURNED),
  * which nobody carries out either: the QEMU shell of src/hv/hv_stop.c (nohost-qemu.c) fails
@@ -25,6 +27,8 @@
 
 #define PSCI_SYSTEM_OFF   0x84000008
 #define PSCI_SYSTEM_RESET 0x84000009
+#define PSCI_CPU_ON       0xc4000003
+#define NO_MPIDR          0x10104
 #define STOP_RETURNED     0x5155
 
     .text
@@ -52,6 +56,8 @@ entry:
     b.eq    2f
     cmp     x2, #2
     b.eq    3f
+    cmp     x2, #3
+    b.eq    5f
     b       .
 
 1:  ldr     x0, =0x0001000100010001    /* what a hypercall input value could look like */
@@ -67,6 +73,13 @@ entry:
 
 4:  hvc     #STOP_RETURNED
     b       .
+
+5:  ldr     x0, =PSCI_CPU_ON
+    ldr     x1, =NO_MPIDR
+    adr     x2, _start
+    mov     x3, #0
+    hvc     #0
+    b       4b
 
     .ltorg
     /* The image is a whole number of 16 KB pages */

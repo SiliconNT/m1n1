@@ -17,6 +17,14 @@
  *  - It stops with a bug check if SYSTEM_RESET, SYSTEM_OFF or CPU_OFF return, or if CPU_ON
  *    returns anything but 0, ALREADY_ON or ON_PENDING.
  *
+ * CPU_ON: every core of the machine is in EL2 since hv_init(), where it waits or is let into
+ * the guest; there is nothing in between. So the answers are 0 and ALREADY_ON, and a core that
+ * CPU_ON said 0 about is on its way to its entry point by then (hv_start_secondary()). The
+ * entry point is not looked at: if there is nothing to execute, execution tracking stops the
+ * guest there (hv_xtrack.c). A core that EL2 does not have means that the firmware's tables
+ * are not those of this machine. The guest would only find that a call failed; it is stopped
+ * instead, and what it asked for and what there is is printed.
+ *
  * The firmware calls SYSTEM_RESET and SYSTEM_OFF from its ResetSystem service and asks
  * PSCI_FEATURES about SYSTEM_RESET2 before a warm reset; nothing else.
  *
@@ -27,8 +35,8 @@
  * SYSTEM_RESET and SYSTEM_OFF stop the guest for good (hv_exc_proxy()). With a host, the host
  * of the hypervisor is told, and the machine does not restart or power off: that is where a
  * machine that is run from another one over USB wants to end up. Without one, the machine
- * restarts or powers off (hv_stop.c). CPU_ON and CPU_OFF are not written yet. A guest that
- * calls one of them is stopped the same way, because no answer it could be given is true.
+ * restarts or powers off (hv_stop.c). CPU_OFF is not written yet. A guest that calls it is
+ * stopped the same way, because no answer it could be given is true.
  *
  * An hvc with another immediate is not PSCI ("the immediate value used with an SMC (or HVC)
  * instruction must be 0", DEN 0022 5.2.1). Windows has two: hvc #1 is a hypercall to the
@@ -36,9 +44,12 @@
  * either would be taken for an answer, so the guest is stopped there too.
  *
  * Everything here runs with the hypervisor lock held, on whichever core the guest called from.
+ *
+ * Tested on the build machine by siliconnt/vgic-model (psci_test.c).
  */
 
 #include "hv.h"
+#include "smp.h"
 #include "utils.h"
 
 /* DEN 0022 5.1. Bit 30 of a function ID says its parameters are 64 bits wide */
@@ -52,13 +63,23 @@
 /* Major version in bits 31:16, minor version in bits 15:0 (5.3) */
 #define PSCI_VERSION_1_1 0x00010001L
 
+/* 5.2.2 */
+#define PSCI_SUCCESS 0L
 /* Also the "Unknown Function Identifier" of DEN 0028 5.2 */
 #define PSCI_NOT_SUPPORTED (-1L)
+#define PSCI_ALREADY_ON    (-4L)
+
+/* Aff3 and Aff2 to Aff0 in the target_cpu of CPU_ON, as in MPIDR_EL1 (5.1.4) */
+#define PSCI_AFFINITY (GENMASK(39, 32) | GENMASK(23, 0))
 
 /* How many calls of functions that are not there get a line of their own */
 #define PSCI_LOG_ABSENT 8
 
+extern bool hv_started_cpus[MAX_CPUS];
+
 static struct {
+    u64 cpu_on;         // CPU_ON calls...
+    u64 cpu_on_already; // ...of which were for a core the guest runs on
     u64 version;
     u64 features;        // PSCI_FEATURES calls...
     u64 features_absent; // ...of which were about a function that is not there
@@ -68,6 +89,8 @@ static struct {
 
 void hv_psci_init(void)
 {
+    psci_stats.cpu_on = 0;
+    psci_stats.cpu_on_already = 0;
     psci_stats.version = 0;
     psci_stats.features = 0;
     psci_stats.features_absent = 0;
@@ -97,6 +120,50 @@ static void __attribute__((noreturn)) hv_psci_stop(struct exc_info *ctx, u32 eve
 {
     for (;;)
         hv_exc_proxy(ctx, START_HV, event, NULL);
+}
+
+/* smp_is_alive() is about the cores that the boot core has started */
+static bool hv_psci_has_cpu(int cpu)
+{
+    return cpu == boot_cpu_idx || smp_is_alive(cpu);
+}
+
+/* The core with these affinity fields, or -1 if it is none of those in EL2 */
+static int hv_psci_find_cpu(u64 affinity)
+{
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        if (hv_psci_has_cpu(cpu) && smp_get_mpidr(cpu) == affinity)
+            return cpu;
+    return -1;
+}
+
+static void hv_psci_print_cpus(void)
+{
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        if (hv_psci_has_cpu(cpu))
+            printf("HV: CPU %d: MPIDR 0x%lx, %s\n", cpu, smp_get_mpidr(cpu),
+                   hv_started_cpus[cpu] ? "in the guest" : "waiting in EL2");
+}
+
+static s64 hv_psci_cpu_on(struct exc_info *ctx)
+{
+    u64 affinity = ctx->regs[1] & PSCI_AFFINITY;
+    int cpu = hv_psci_find_cpu(affinity);
+    u64 regs[4] = {ctx->regs[3]}; /* context_id */
+
+    psci_stats.cpu_on++;
+    if (cpu >= 0 && hv_started_cpus[cpu]) {
+        psci_stats.cpu_on_already++;
+        return PSCI_ALREADY_ON;
+    }
+    if (cpu >= 0 && hv_start_secondary(cpu, (void *)ctx->regs[2], regs))
+        return PSCI_SUCCESS;
+
+    printf("HV: PSCI: CPU_ON from the guest on CPU %ld at 0x%lx:\n", ctx->cpu_id, ctx->elr - 4);
+    printf("HV: MPIDR 0x%lx (x1 = 0x%lx) is %s, stopping the guest\n", affinity, ctx->regs[1],
+           cpu < 0 ? "none of the CPUs in EL2" : "a CPU that cannot be started");
+    hv_psci_print_cpus();
+    hv_psci_stop(ctx, HV_GUEST_HVC);
 }
 
 /*
@@ -138,11 +205,12 @@ bool hv_psci_hvc(struct exc_info *ctx, u16 imm)
                    ctx->cpu_id);
             hv_psci_stop(ctx, HV_GUEST_OFF);
         case PSCI_FN_CPU_ON:
+            ret = hv_psci_cpu_on(ctx);
+            break;
         case PSCI_FN_CPU_OFF:
-            printf("HV: PSCI: %s from the guest on CPU %ld, x1 = 0x%lx x2 = 0x%lx x3 = 0x%lx: "
-                   "not written yet, stopping the guest\n",
-                   fn == PSCI_FN_CPU_ON ? "CPU_ON" : "CPU_OFF", ctx->cpu_id, ctx->regs[1],
-                   ctx->regs[2], ctx->regs[3]);
+            printf("HV: PSCI: CPU_OFF from the guest on CPU %ld: not written yet, stopping the "
+                   "guest\n",
+                   ctx->cpu_id);
             hv_psci_stop(ctx, HV_GUEST_HVC);
         default:
             if (psci_stats.absent++ < PSCI_LOG_ABSENT)
@@ -160,6 +228,8 @@ bool hv_psci_hvc(struct exc_info *ctx, u16 imm)
 
 void hv_psci_report(void)
 {
+    printf("HV: PSCI: %ld CPU_ON (%ld said already on)\n", psci_stats.cpu_on,
+           psci_stats.cpu_on_already);
     printf("HV: PSCI: %ld PSCI_VERSION, %ld PSCI_FEATURES (%ld said not supported), %ld calls of "
            "functions that are not there",
            psci_stats.version, psci_stats.features, psci_stats.features_absent, psci_stats.absent);

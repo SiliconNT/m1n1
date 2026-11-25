@@ -12,7 +12,8 @@
  *      This is what QEMU's own PSCI is held to (`make qemu-psci`, `make qemu-psci-reset`),
  *      which checks the guest itself.
  *   1  exactly the answers of the hypervisor: version 1.1, the six functions and no others,
- *      -1 for everything else, only x0 changed, the upper halves of x0 and x1 ignored.
+ *      -1 for everything else, only x0 changed, the upper halves of x0 and x1 ignored, and
+ *      only the affinity fields of CPU_ON's target_cpu looked at.
  *
  * Bits 3:0 of the argument choose the call it ends with, see enum last_call.
  *
@@ -35,8 +36,8 @@ enum last_call {
     LAST_SYSTEM_OFF,
     LAST_SYSTEM_RESET,
     LAST_HVC_1,   // hvc #1 with PSCI_VERSION in x0: not PSCI, the hypervisor must not answer
-    LAST_CPU_ON,  // only under the hypervisor, which cannot do it yet and must not answer
-    LAST_CPU_OFF, // the same
+    LAST_CPU_ON,  // a CPU that is not there. Only under the hypervisor, which must not answer
+    LAST_CPU_OFF, // only under the hypervisor, which cannot do it yet and must not answer
     LAST_NONE,
 };
 
@@ -57,6 +58,10 @@ void uart_putc(int c);
 #define FN_SYSTEM_RESET  0x84000009UL
 #define FN_PSCI_FEATURES 0x8400000aUL
 #define FN_SMCCC_VERSION 0x80000000UL
+
+/* 5.2.2, and the fields of MPIDR_EL1 that the target_cpu of CPU_ON has (5.1.4) */
+#define ALREADY_ON     (-4)
+#define MPIDR_AFFINITY 0xff00ffffffUL
 
 /* The six the kernel takes for granted on PSCI 1.1 (PsciPlatformInfo_v1_1, state 2) */
 static const u32 taken_for_granted[] = {
@@ -391,6 +396,30 @@ static void test_features(void)
            kept);
 }
 
+/* The one CPU there is for this guest is on: there is nothing to turn on, and it says so */
+static void test_cpu_on(void)
+{
+    u64 self = read_sysreg(mpidr_el1) & MPIDR_AFFINITY;
+    int ok, reg;
+
+    call(FN_CPU_ON, self);
+    answered("CPU_ON", self);
+    ok = strict ? after.x[0] == (u64)ALREADY_ON : (int)w0() == ALREADY_ON;
+    reg = changed(first_kept());
+    if (strict) {
+        /* Bits that MPIDR_EL1 has and target_cpu has not (RES1, U, MT) do not count */
+        call(FN_CPU_ON, self | 0xc1000000UL);
+        answered("CPU_ON", self | 0xc1000000UL);
+        ok = ok && after.x[0] == (u64)ALREADY_ON;
+        if (!reg)
+            reg = changed(first_kept());
+    }
+    result("CPU_ON of the CPU that calls answers ALREADY_ON", ok);
+    result(strict ? "CPU_ON changed nothing but x0" : "CPU_ON left x4 to x30 alone", !reg);
+    if (reg)
+        changed_reg(reg);
+}
+
 /* Only under the hypervisor */
 static void test_strict(void)
 {
@@ -492,6 +521,7 @@ void boot_main(void)
 
     test_version();
     test_features();
+    test_cpu_on();
     if (strict)
         test_strict();
 

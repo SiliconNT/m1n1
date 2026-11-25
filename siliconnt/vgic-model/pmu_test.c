@@ -452,6 +452,32 @@ static void test_windows(void)
               RD(0, PMXEVCNTR_EL0) == 0,
           "identification");
 
+    /* hv_pmu_init_cpu() starts one core over, as after a reset, and leaves the others alone */
+    for (int again = 0; again < 2; again++) {
+        hv_pmu_init();
+        for (int cpu = 0; cpu < 2; cpu++) {
+            WR(cpu, PMCR_EL0, 0x51);
+            WR(cpu, PMCNTENSET_EL0, 0x80000000);
+            WR(cpu, PMINTENSET_EL1, 0x80000000);
+            WR(cpu, PMOVSSET_EL0, 0x80000000);
+            WR(cpu, PMSELR_EL0, 31);
+            WR(cpu, PMUSERENR_EL0, 4);
+            WR(cpu, PMCCFILTR_EL0, 0x8000000);
+        }
+        hv_pmu_init_cpu(again);
+        for (int cpu = 0; cpu < 2; cpu++) {
+            bool kept = cpu != again;
+
+            CHECK(RD(cpu, PMCR_EL0) == (kept ? 0x51 : 0), "PMCR_EL0, core %d", cpu);
+            CHECK(RD(cpu, PMCNTENSET_EL0) == (kept ? 0x80000000 : 0), "enable, core %d", cpu);
+            CHECK(RD(cpu, PMINTENSET_EL1) == (kept ? 0x80000000 : 0), "interrupt, core %d", cpu);
+            CHECK(RD(cpu, PMOVSSET_EL0) == (kept ? 0x80000000 : 0), "overflow, core %d", cpu);
+            CHECK(RD(cpu, PMSELR_EL0) == (kept ? 31 : 0), "PMSELR_EL0, core %d", cpu);
+            CHECK(RD(cpu, PMUSERENR_EL0) == (kept ? 4 : 0), "PMUSERENR_EL0, core %d", cpu);
+            CHECK(RD(cpu, PMCCFILTR_EL0) == (kept ? 0x8000000 : 0), "PMCCFILTR_EL0, core %d", cpu);
+        }
+    }
+
     /* hv_pmu_init() starts over */
     hv_pmu_init();
     CHECK(RD(0, PMCR_EL0) == 0 && RD(3, PMUSERENR_EL0) == 0 && RD(0, PMCCFILTR_EL0) == 0, "reset");

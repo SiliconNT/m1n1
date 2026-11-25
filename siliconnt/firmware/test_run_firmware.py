@@ -722,7 +722,8 @@ rec, out, code = run({"stop_code": "GUEST_HVC"}, *image_args)
 check("a guest stopped for a call that cannot be carried out ends the run, with the reason",
       code == 0 and rec.stopped == "EXIT_GUEST" and not rec.context_printed and
       "Run ended: the guest made a call that the hypervisor cannot carry out" in out and
-      "(HV/GUEST_HVC)" in out, out[-900:])
+      "PSCI CPU_ON for a core that EL2 does not have, or an hvc other than #0" in out and
+      "CPU_OFF" not in out and "(HV/GUEST_HVC)" in out, out[-900:])
 
 # 15. an exception nobody handled, as in 9
 rec, out, code = run({"stop_reason": "EXCEPTION_LOWER"}, *image_args)
@@ -1505,7 +1506,7 @@ with tempfile.TemporaryDirectory() as bc_tmp:
 
 # ---- /cpus of the device tree the host's loader hands the firmware ----
 
-# 52. every core of the machine is there, as when m1n1 loads; only the boot CPU runs
+# 52. every core of the machine is there, as when m1n1 loads; it is m1n1 that starts them
 ALL_CPUS = [(f"cpu{i}", "running" if i == M4_BOOT_CPU else "waiting") for i in range(M4_CPUS)]
 rec, out, code = run({}, "--seconds", "1", *image_args)
 check("host loader: the firmware gets every node of /cpus, each as m1n1 has it",
@@ -1513,8 +1514,10 @@ check("host loader: the firmware gets every node of /cpus, each as m1n1 has it",
 check("host loader: the secondary CPUs are not started",
       rec.secondaries_started is False and rec.smp_at_start is False,
       f"{rec.secondaries_started} {rec.smp_at_start}")
-check("host loader: it says how many nodes the guest gets",
-      f"/cpus of the guest's device tree: all {M4_CPUS} nodes" in out, out[-1500:])
+check("host loader: it says how many nodes the guest gets, and where the cores are",
+      f"/cpus of the guest's device tree: all {M4_CPUS} nodes" in out and
+      "the guest starts on the boot CPU, the others wait in EL2 for its CPU_ON" in out,
+      out[-1500:])
 
 # 53. an HV.init() that leaves fewer nodes than m1n1 has: the guest is not entered
 rec, out, code = run({"hv_drops_cpu": "cpu3"}, "--seconds", "1", *image_args)

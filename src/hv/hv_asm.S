@@ -178,6 +178,7 @@ _v_hv_serr:
 
 .extern hv_saved_sp
 
+/* void hv_enter_guest(u64 x0, u64 x1, u64 x2, u64 x3, void *entry, u64 spsr) */
 .globl hv_enter_guest
 .type hv_enter_guest, @function
 hv_enter_guest:
@@ -191,14 +192,10 @@ hv_enter_guest:
 
     mrs x7, tpidr_el2
     ldr x6, =hv_saved_sp
-    mov x5, sp
-    str x5, [x6, x7, LSL #3]
+    mov x8, sp
+    str x8, [x6, x7, LSL #3]
 
-    mrs x5, daif
-    mov x6, #5
-    orr x5, x5, x6 // EL1h
     msr spsr_el2, x5
-
     msr elr_el2, x4
     mov x5, #0
     msr sp_el0, x5

@@ -114,7 +114,7 @@
 #define XT_WORDS (XT_PAGE / 4)
 
 /* The lines that cache maintenance by address goes by, as memory.c has them */
-#define XT_LINE 64UL
+#define XT_LINE HV_XTRACK_LINE
 
 /*
  * CTR_EL0.DminLine (Arm DDI 0487 M.d, D24.2.41): log2 of the words in the smallest line of the
@@ -229,6 +229,13 @@ static void xt_free_all(void)
     xt_nr_free = XT_MAX_PAGES;
 }
 
+/* A core is about to start the guest: no instruction abort of it counts as a repeat */
+void hv_xtrack_init_cpu(int cpu)
+{
+    xtrack_last[cpu].page = 0;
+    xtrack_last[cpu].repeats = 0;
+}
+
 void hv_xtrack_init(void)
 {
     for (u32 i = 0; i < XT_MAX_PAGES; i++)
@@ -263,10 +270,19 @@ void hv_xtrack_init(void)
     xt_stats.pcs_lost = 0;
     xt_stats.stops = 0;
 
-    for (int i = 0; i < MAX_CPUS; i++) {
-        xtrack_last[i].page = 0;
-        xtrack_last[i].repeats = 0;
-    }
+    for (int i = 0; i < MAX_CPUS; i++)
+        hv_xtrack_init_cpu(i);
+}
+
+/*
+ * The size of the smallest data cache line of this core. Cleaning by address steps by XT_LINE
+ * bytes, here and in memory.c, and an instruction affects at least the line of the smallest
+ * data cache that holds its address (D7.5.9.4): with smaller lines, some would be left as they
+ * are, and nothing would show it. So hv_init() asks every core.
+ */
+u64 hv_xtrack_line(void)
+{
+    return 4UL << FIELD_GET(CTR_DMINLINE, mrs(CTR_EL0));
 }
 
 /*
@@ -275,14 +291,11 @@ void hv_xtrack_init(void)
  * runs. Returns -1 if there is no room for them; memalign() of m1n1 stops m1n1 itself when
  * the heap runs out, so on m1n1 that is where it ends.
  *
- * Also -1 if the data caches have lines smaller than XT_LINE. Cleaning by address steps by
- * XT_LINE bytes, here and in memory.c, and an instruction affects at least the line of the
- * smallest data cache that holds its address (D7.5.9.4): with smaller lines, some would be left
- * as they are, and nothing would show it.
+ * Also -1 if the data caches have lines smaller than XT_LINE, see hv_xtrack_line().
  */
 int hv_xtrack_start(void)
 {
-    u64 line = 4UL << FIELD_GET(CTR_DMINLINE, mrs(CTR_EL0));
+    u64 line = hv_xtrack_line();
 
     if (line < XT_LINE) {
         printf("HV: execution tracking: the smallest data cache line is %ld bytes, and cache "

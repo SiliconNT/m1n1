@@ -146,6 +146,7 @@ struct hv_vgic_pcpu {
     u64 sgi_writes;   // writes to ICC_SGI1R_EL1 by the guest on this core
     u64 sgi_deferred; // returns to the guest with SGIs left waiting for a list register
     u64 spi_deferred; // ...and with SPIs left waiting
+    u64 inits;        // hv_vgic_init() on this core
     u64 affinity;     // what the guest on this core reads from MPIDR_EL1, affinity fields only
     u32 sgi_pending;  // SGIs 0-15 for the guest on this core that are not in a list register
     u32 ppi_level;    // PPIs whose source is high
@@ -358,6 +359,7 @@ static void vgic_init_global(void)
         p->injected = p->maintenance = p->unmapped = p->spurious = p->retracted = 0;
         p->forwarded = p->late = p->spurious_run = 0;
         p->sgi_writes = p->sgi_deferred = p->spi_deferred = 0;
+        p->inits = 0;
     }
 
     /*
@@ -481,8 +483,10 @@ void hv_vgic_init(void)
     msr(SYS_ICH_HCR_EL2, ICH_HCR_EN);
     sysop("isb");
 
-    printf("HV: vGIC: CPU %d: %d list registers, ICH_VTR_EL2=0x%lx, ICC_SRE_EL2 was 0x%lx\n",
-           smp_id(), nr_lr, vtr, sre);
+    /* Once for each time the guest starts the core, with the hypervisor lock held */
+    if (vgic_should_log(++VGIC_PERCPU(inits)))
+        printf("HV: vGIC: CPU %d: %d list registers, ICH_VTR_EL2=0x%lx, ICC_SRE_EL2 was 0x%lx\n",
+               smp_id(), nr_lr, vtr, sre);
 }
 
 /*

@@ -16,6 +16,7 @@ void smp_secondary_prep_el3(void);
 int smp_init(void);
 void smp_start_secondaries(void);
 bool smp_start_secondary(int cpu);
+const char *smp_try_start(int cpu);
 void smp_stop_secondaries(bool deep_sleep);
 
 #define smp_call0(i, f)          smp_call4(i, f, 0, 0, 0, 0)
@@ -28,6 +29,9 @@ void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
 u64 smp_wait(int cpu);
 
 bool smp_is_alive(int cpu);
+bool smp_is_idle(int cpu);
+bool smp_has_cpu(int cpu);
+int smp_cpus_beyond(void);
 uint64_t smp_get_mpidr(int cpu);
 u64 smp_get_release_addr(int cpu);
 void smp_set_wfe_mode(bool new_mode);

@@ -112,17 +112,22 @@ static struct {
     u16 last_unknown;
 } pmu_stats;
 
+/* A core is about to start the guest: its PMU registers are as after a reset */
+void hv_pmu_init_cpu(int cpu)
+{
+    pmu_cpu[cpu].pmcr = 0;
+    pmu_cpu[cpu].cnten = 0;
+    pmu_cpu[cpu].inten = 0;
+    pmu_cpu[cpu].ovs = 0;
+    pmu_cpu[cpu].selr = 0;
+    pmu_cpu[cpu].userenr = 0;
+    pmu_cpu[cpu].ccfiltr = 0;
+}
+
 void hv_pmu_init(void)
 {
-    for (int i = 0; i < MAX_CPUS; i++) {
-        pmu_cpu[i].pmcr = 0;
-        pmu_cpu[i].cnten = 0;
-        pmu_cpu[i].inten = 0;
-        pmu_cpu[i].ovs = 0;
-        pmu_cpu[i].selr = 0;
-        pmu_cpu[i].userenr = 0;
-        pmu_cpu[i].ccfiltr = 0;
-    }
+    for (int i = 0; i < MAX_CPUS; i++)
+        hv_pmu_init_cpu(i);
     pmu_stats.pages = 0;
     pmu_stats.patched = 0;
     pmu_stats.ccntr = 0;

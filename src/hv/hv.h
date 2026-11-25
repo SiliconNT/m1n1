@@ -166,6 +166,7 @@ void hv_psci_report(void);
 
 /* The PMUv3 registers for the guest: accesses replaced by hvc with bit 15 of the immediate set */
 void hv_pmu_init(void);
+void hv_pmu_init_cpu(int cpu);
 bool hv_pmu_is_access(u32 insn);
 u32 hv_pmu_patch_word(u32 insn);
 u32 hv_pmu_unpatch_word(u32 insn);
@@ -176,6 +177,7 @@ void hv_pmu_report(void);
 
 /* The breakpoint and watchpoint registers for the guest: kept per core, never armed */
 void hv_dbg_init(void);
+void hv_dbg_init_cpu(int cpu);
 bool hv_dbg_handle_msr(struct exc_info *ctx, u64 iss);
 void hv_dbg_report(void);
 
@@ -195,7 +197,11 @@ int hv_pt_set_scanned(u64 ipa, int state, u64 pa);
 #define HV_XTRACK_RETRY 1
 #define HV_XTRACK_STOP  2
 #define HV_XTRACK_SKIP  3
+/* The smallest data cache line that cache maintenance here can do with, see hv_xtrack_line() */
+#define HV_XTRACK_LINE 64UL
 void hv_xtrack_init(void);
+void hv_xtrack_init_cpu(int cpu);
+u64 hv_xtrack_line(void);
 int hv_xtrack_start(void);
 bool hv_xtrack_iabort(struct exc_info *ctx);
 int hv_xtrack_dabort(struct exc_info *ctx, u64 ipa, bool is_write);
@@ -266,9 +272,10 @@ void hv_disable_genter_trap(void);
 
 /* HV main */
 void hv_init(void);
+bool hv_cpus_ready(void);
 bool hv_cpu_power_init(void);
 void hv_start(void *entry, u64 regs[4]);
-void hv_start_secondary(int cpu, void *entry, u64 regs[4]);
+bool hv_start_secondary(int cpu, void *entry, u64 regs[4]);
 void hv_exit_cpu(int cpu);
 void hv_rendezvous(void);
 bool hv_switch_cpu(int cpu);

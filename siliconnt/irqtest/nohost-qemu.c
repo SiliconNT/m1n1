@@ -12,6 +12,7 @@
  *    asks hv_stop.c first; past that, the host is told, which here ends the run;
  *  - the exception entry: an hvc of the guest becomes the struct exc_info that hv_exc_sync()
  *    makes, for hv_psci_hvc();
+ *  - the cores: this one, in the guest, and another that waits (src/smp.c, hv.c);
  *  - the consoles: the UART, which a host listens on or not (HOST), and the screen of
  *    fb_init_unbuffered() (src/fb.c, which has siliconnt/nohost-model/fb_test.c), which
  *    prints what it is given to the serial port of QEMU, every line after "SCREEN> ";
@@ -26,8 +27,8 @@
  * to QEMU's serial port after "LOG> ", whether a console takes it or not.
  *
  * HOST: whether a host listens on the port of the proxy. STOP_ARG: what the guest does
- * (stoptest.S): 0 hvc #1, 1 SYSTEM_OFF, 2 SYSTEM_RESET. Without a host the core stays in EL2,
- * and QEMU runs until the Makefile stops it.
+ * (stoptest.S): 0 hvc #1, 1 SYSTEM_OFF, 2 SYSTEM_RESET, 3 CPU_ON of a CPU that is not there.
+ * Without a host the core stays in EL2, and QEMU runs until the Makefile stops it.
  */
 
 #include <stdarg.h>
@@ -41,6 +42,7 @@
 #include "iova.h"
 #include "malloc.h"
 #include "sart.h"
+#include "smp.h"
 #include "string.h"
 #include "uartproxy.h"
 #include "utils.h"
@@ -168,7 +170,7 @@ void spin_unlock(spinlock_t *lock)
     UNUSED(lock);
 }
 
-int boot_cpu_idx = -1;
+int boot_cpu_idx = 0;
 u64 boot_cpu_mpidr;
 
 void flush_and_reboot(void)
@@ -328,6 +330,28 @@ void hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type
     shim_off();
 }
 
+bool hv_started_cpus[MAX_CPUS] = {true};
+
+bool smp_is_alive(int cpu)
+{
+    return cpu == 1;
+}
+
+uint64_t smp_get_mpidr(int cpu)
+{
+    return cpu;
+}
+
+bool hv_start_secondary(int cpu, void *entry, u64 regs[4])
+{
+    UNUSED(cpu);
+    UNUSED(entry);
+    UNUSED(regs);
+    shim_puts("nohost-qemu: hv_start_secondary() was called\n");
+    shim_off();
+    return false;
+}
+
 static const struct fake_adt_places places = {
     .smc = FAKE_SMC,
     .smc_size = 0x88000,
@@ -341,6 +365,8 @@ static const struct fake_adt_places places = {
 u64 shim_main(void)
 {
     shim_puts(HOST ? "nohost-qemu: start, with a host\n" : "nohost-qemu: start, without a host\n");
+
+    boot_cpu_mpidr = mrs(MPIDR_EL1);
 
     /* Devices that are not there */
     memset((void *)FAKE_SMC, 0xff, 0x88000);

@@ -4,8 +4,9 @@
 # functions of src/aic.c (aic_test.c, with the stand-in headers of aic/) and for
 # src/hv/hv_psci.c (psci_test.c), src/hv/hv_pmu.c (pmu_test.c), the page tables of
 # src/hv/hv_vm.c (pt_test.c), src/hv/hv_xtrack.c (xtrack_test.c) and src/hv/hv_xinsn.c
-# (xinsn_test.c, test_xinsn.py). They compile the real files for the build machine against
-# stand-in headers and play the hardware, the guest and the host around them.
+# (xinsn_test.c, test_xinsn.py), and src/hv/hv.c with src/smp.c (cpus_test.c). They compile
+# the real files for the build machine against stand-in headers and play the hardware, the
+# guest and the host around them.
 #
 #   make        build them and run them
 #   make pt     only the page table one
@@ -19,6 +20,12 @@
 #   make aic    only the one for aic_mask(), aic_unmask() and aic_mask_all() of src/aic.c
 #   make psci   only the PSCI one, and test_hv_events.py: that the host has a handler for
 #               every event the hypervisor sends (needs the Python of the proxy client)
+#   make psci-broken  the PSCI one against hv_psci.c with one thing wrong in CPU_ON at a
+#               time: it must fail on each
+#   make cpus   only the one for how the cores get into EL2 and into the guest: src/hv/hv.c and
+#               src/smp.c, and two functions of src/memory.c (cpus_test.c, with what is in cpus/)
+#   make cpus-broken  ...against one of those with one thing wrong at a time: it must fail on
+#               each, with a failed check or by hanging
 #   make tsan   test.c under ThreadSanitizer, with fewer rounds
 #   make vgic-broken  test.c against hv_vgic.c with one thing wrong in how it forwards AIC
 #               lines at a time: it must fail on each
@@ -29,9 +36,9 @@ SRC := ../../src
 CFLAGS := -O2 -g -Wall -Werror -pthread -I. -Ibuild
 ROUNDS ?= 200000
 
-.PHONY: all psci pmu pt pt-broken xtrack xtrack-broken xinsn dbg aic tsan vgic-broken clean
+.PHONY: all psci psci-broken pmu pt pt-broken xtrack xtrack-broken xinsn dbg aic cpus cpus-broken tsan vgic-broken clean
 
-all: build/model psci pmu pt pt-broken xinsn xtrack xtrack-broken dbg aic vgic-broken
+all: build/model psci psci-broken cpus cpus-broken pmu pt pt-broken xinsn xtrack xtrack-broken dbg aic vgic-broken
 	build/model $(ROUNDS)
 
 # The breakpoint and watchpoint registers of the guest, src/hv/hv_dbg.c
@@ -42,7 +49,7 @@ build/hv_dbg.c: $(SRC)/hv/hv_dbg.c
 	@mkdir -p build
 	cp $< $@
 
-build/dbg-model: dbg_test.c $(wildcard *.h) build/hv_dbg.c build/arm_cpu_regs.h
+build/dbg-model: dbg_test.c $(wildcard *.h) build/hv_dbg.c build/arm_cpu_regs.h build/hv_aicmap.h
 	$(CC) $(CFLAGS) -o $@ dbg_test.c build/hv_dbg.c
 
 # The stage 2 page tables of src/hv/hv_vm.c
@@ -70,7 +77,7 @@ build/hv_xtrack.inc: $(SRC)/hv/hv_xtrack.c
 	sed -e '/^#include /d' $< > $@
 
 XTRACK_DEPS := xtrack_test.c $(wildcard *.h) build/hv_xpage.h build/hv_pmu.c build/hv_xinsn.c \
-	build/hv_xinsn.h build/arm_cpu_regs.h
+	build/hv_xinsn.h build/arm_cpu_regs.h build/hv_aicmap.h
 
 build/xtrack-model: $(XTRACK_DEPS) build/hv_xtrack.inc
 	$(CC) $(CFLAGS) -o $@ xtrack_test.c build/hv_pmu.c build/hv_xinsn.c
@@ -160,12 +167,157 @@ build/hv_pmu.c: $(SRC)/hv/hv_pmu.c
 	@mkdir -p build
 	cp $< $@
 
-build/pmu-model: pmu_test.c $(wildcard *.h) build/hv_pmu.c
+build/pmu-model: pmu_test.c $(wildcard *.h) build/hv_pmu.c build/hv_aicmap.h
 	$(CC) $(CFLAGS) -o $@ pmu_test.c build/hv_pmu.c
 
 psci: build/psci-model
 	build/psci-model
 	$(PYTHON) test_hv_events.py
+
+# Every change must change something (cmp), or the source has moved on
+PSCI_BROKEN := every-index no-boot-cpu whole-x1 no-aff3 not-already-on wrong-cpu wrong-entry \
+	wrong-context failure-ignored unknown-returns no-table start-forgotten
+BREAK_PSCI_every-index := s/return cpu == boot_cpu_idx || smp_is_alive(cpu);/return true;/
+BREAK_PSCI_no-boot-cpu := s/return cpu == boot_cpu_idx || smp_is_alive(cpu);/return smp_is_alive(cpu);/
+BREAK_PSCI_whole-x1 := s/u64 affinity = ctx->regs\[1\] & PSCI_AFFINITY;/u64 affinity = ctx->regs[1];/
+BREAK_PSCI_no-aff3 := s/(GENMASK(39, 32) | GENMASK(23, 0))/GENMASK(23, 0)/
+BREAK_PSCI_not-already-on := s/if (cpu >= 0 \&\& hv_started_cpus\[cpu\]) {/if (0) {/
+BREAK_PSCI_wrong-cpu := s/hv_start_secondary(cpu, /hv_start_secondary(cpu ^ 1, /
+BREAK_PSCI_wrong-entry := s/(void \*)ctx->regs\[2\], regs/(void *)ctx->regs[3], regs/
+BREAK_PSCI_wrong-context := s/u64 regs\[4\] = {ctx->regs\[3\]};/u64 regs[4] = {ctx->regs[2]};/
+BREAK_PSCI_failure-ignored := s/    if (cpu >= 0 \&\& hv_start_secondary(\(.*\)))$$/    if (cpu >= 0 \&\& (hv_start_secondary(\1) || 1))/
+BREAK_PSCI_unknown-returns := /^    hv_psci_print_cpus();$$/,/^}/s/hv_psci_stop(ctx, HV_GUEST_HVC);/return -2;/
+BREAK_PSCI_no-table := /^    hv_psci_print_cpus();$$/d
+BREAK_PSCI_start-forgotten := s/hv_start_secondary(cpu, (void \*)ctx->regs\[2\], regs)/1/
+
+build/hv_psci-broken-%.c: build/hv_psci.c Makefile
+	sed -e '$(BREAK_PSCI_$*)' $< > $@
+	! cmp -s $< $@
+
+build/psci-broken-%: psci_test.c $(wildcard *.h) build/hv_psci-broken-%.c build/hv_aicmap.h
+	$(CC) $(CFLAGS) -Wno-error -o $@ psci_test.c build/hv_psci-broken-$*.c
+
+psci-broken: $(PSCI_BROKEN:%=build/psci-broken-%)
+	@for n in $(PSCI_BROKEN); do \
+		if timeout 60 build/psci-broken-$$n > build/psci-broken-$$n.log 2>&1; then \
+			echo "psci-broken-$$n: the test passes and must not"; exit 1; \
+		fi; \
+		grep -q -m1 '^FAIL' build/psci-broken-$$n.log || \
+			{ echo "psci-broken-$$n: ended without a failed check"; exit 1; }; \
+	done
+	@$(foreach n,$(PSCI_BROKEN),echo "psci-broken: $(n): $$(grep -m1 '^FAIL' build/psci-broken-$(n).log)";)
+	@echo "psci-broken: all $(words $(PSCI_BROKEN)) failed, as they must"
+
+# hv.c and smp.c as m1n1 compiles them, with its own headers (BASE_CFLAGS of its Makefile), for
+# the build machine: cpus/hw.h, which comes first, takes the place of utils.h
+CPUS_CFLAGS := -O2 -g -Wall -Wundef -fno-common -ffreestanding -fno-stack-protector -nostdinc \
+	-isystem $(shell $(CC) -print-file-name=include) -isystem ../../sysinc -I$(SRC) -I$(SRC)/hv \
+	-include cpus/hw.h
+
+# m1n1's utils.h, but for the instructions of the CPU. Every one that is named has to be there
+build/cpus/utils.h: $(SRC)/utils.h
+	@mkdir -p build/cpus
+	test $$(grep -c -E '^#define (__mrs\(reg\)|__msr\(reg, val\)|sysop\(op\)) ' $<) = 3
+	sed -e '/^#define __mrs(reg) /,/^    })$$/c\#define __mrs(reg) mock_mrs(#reg)' \
+	    -e '/^#define __msr(reg, val) /,/^    })$$/c\#define __msr(reg, val) mock_msr(#reg, (u64)(val))' \
+	    -e 's/^#define sysop(op) .*/#define sysop(op) mock_sysop(op)/' \
+	    -e 's/^#define USEC_PER_SEC .*/&\nu64 mock_mrs(const char *name);\nvoid mock_msr(const char *name, u64 val);\nvoid mock_sysop(const char *op);/' \
+	    $< > $@
+	grep -q 'mock_mrs(const char' $@
+
+build/cpus/hv.c: $(SRC)/hv/hv.c
+	@mkdir -p build/cpus
+	cp $< $@
+
+build/cpus/smp.c: $(SRC)/smp.c
+	@mkdir -p build/cpus
+	cp $< $@
+
+build/cpus/stubs.c: cpus/stubs.c
+	@mkdir -p build/cpus
+	cp $< $@
+
+# The two functions of memory.c that turn on the MMU of a core that has come up
+build/cpus/mmu.c: cpus/mmu_head.c $(SRC)/memory.c
+	@mkdir -p build/cpus
+	cp $< $@
+	sed -n '/^static void mmu_secondary_setup(void)/,/^void mmu_shutdown(void)/p' $(SRC)/memory.c | sed '$$d' >> $@
+	test $$(grep -c '^\(static void mmu_secondary_setup\|void mmu_init_secondary\|    dc_ivac_range\)(' $@) = 3
+
+build/cpus/%.o: build/cpus/%.c build/cpus/utils.h cpus/hw.h $(wildcard $(SRC)/*.h $(SRC)/hv/*.h)
+	$(CC) -c $(CPUS_CFLAGS) -Werror -o $@ $<
+
+build/cpus-model: cpus_test.c build/cpus/hv.o build/cpus/smp.o build/cpus/mmu.o build/cpus/stubs.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+cpus: build/cpus-model
+	build/cpus-model
+
+# Every change must change something (cmp), or the source has moved on
+CPUS_BROKEN_hv := not-started after-vgic before-wfe-mode ready-ignored line-ignored busy-ignored \
+	beyond-ignored no-idle-wait not-copied no-leaving exit-kept masks sctlr-kept vbar-kept \
+	dbg-kept pmu-kept aborts-kept bit-after-lock started-not-set twice-in not-in-guest-bit \
+	log-all no-reason
+CPUS_BROKEN_smp := rvbar-ignored start-again no-wait-result beyond-not-counted idle-always \
+	invalid-started boot-rvbar-kept boot-rvbar-locked
+CPUS_BROKEN_mmu := mmu-again
+CPUS_BROKEN := $(CPUS_BROKEN_hv) $(CPUS_BROKEN_smp) $(CPUS_BROKEN_mmu)
+BREAK_CPUS_not-started := /^void hv_init(void)/,/^}/{/^    hv_start_cpus();$$/d}
+BREAK_CPUS_after-vgic := /^void hv_init(void)/,/^}/{/^    hv_start_cpus();$$/d;s/^    hv_vgic_init();$$/&\n    hv_start_cpus();/}
+BREAK_CPUS_before-wfe-mode := /^void hv_init(void)/,/^}/{s/^    smp_set_wfe_mode(true);$$/    hv_start_cpus();\n&/;/^    hv_start_cpus();$$/d}
+BREAK_CPUS_ready-ignored := s/    if (!hv_cpus_ready()) {/    if (0) {/
+BREAK_CPUS_line-ignored := s/if (line < HV_XTRACK_LINE) {/if (0) {/
+BREAK_CPUS_busy-ignored := s/if (!hv_cpu_missing\[cpu\] \&\& .* !hv_cpu_waits(cpu))/if (0)/
+BREAK_CPUS_beyond-ignored := s/    if (smp_cpus_beyond()) {/    if (0) {/
+BREAK_CPUS_no-idle-wait := s/    if (!hv_cpu_waits(cpu)) {/    if (0) {/
+BREAK_CPUS_not-copied := /^    memcpy(e->regs, regs, sizeof(e->regs));$$/d
+BREAK_CPUS_no-leaving := s/    if (hv_leaving) {/    if (0) {/
+BREAK_CPUS_exit-kept := /^    hv_should_exit\[cpu\] = false;$$/d
+BREAK_CPUS_masks := s/(SPSR_D | SPSR_A | SPSR_I | SPSR_F | SPSR_M_EL1H)/(SPSR_I | SPSR_F | SPSR_M_EL1H)/
+BREAK_CPUS_sctlr-kept := s/\& ~(SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_EE)/\& ~(SCTLR_M | SCTLR_C | SCTLR_EE)/
+BREAK_CPUS_vbar-kept := /^static void hv_init_secondary(/,/^}/{/^    msr(VBAR_EL12, 0);$$/d}
+BREAK_CPUS_dbg-kept := /^    hv_dbg_init_cpu(cpu);$$/d
+BREAK_CPUS_pmu-kept := /^    hv_pmu_init_cpu(cpu);$$/d
+BREAK_CPUS_aborts-kept := /^    hv_xtrack_init_cpu(cpu);$$/d
+BREAK_CPUS_bit-after-lock := /^static void hv_enter_secondary(/,/^}/{/^    __atomic_and_fetch(/d;s/^    hv_started_cpus\[smp_id()\] = false;$$/&\n    __atomic_and_fetch(\&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);/}
+BREAK_CPUS_started-not-set := /^    hv_started_cpus\[cpu\] = true;$$/d
+BREAK_CPUS_twice-in := /^bool hv_start_secondary(/,/^}/{s/    if (hv_started_cpus\[cpu\]) {/    if (0) {/}
+BREAK_CPUS_not-in-guest-bit := /^    __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);$$/d
+BREAK_CPUS_log-all := s/    if (!(e->count \& (e->count - 1)))/    if (1)/
+BREAK_CPUS_no-reason := s/printf("HV: CPU %d is not in EL2: %s\\n", cpu, hv_cpu_missing\[cpu\]);/;/
+BREAK_CPUS_rvbar-ignored := /^const char \*smp_try_start(/,/^}/{s/if (!cpu_features->apple_sysregs_unlocked \&\& .*{/if (0) {/}
+BREAK_CPUS_start-again := /^const char \*smp_try_start(/,/^}/{/if (smp_is_alive(cpu))/,+1d};/^static void smp_start_cpu(/,/^}/{s/if (spin_table\[index\].flag)/if (0)/}
+BREAK_CPUS_no-wait-result := s/return smp_is_alive(cpu) ? NULL : "it did not come up after it was started";/return NULL;/
+BREAK_CPUS_beyond-not-counted := /^            cpus_beyond++;$$/d
+BREAK_CPUS_idle-always := s/    return !spin_table\[cpu\].target;/    return true;/
+BREAK_CPUS_invalid-started := /^const char \*smp_try_start(/,/^}/{/if (!cpu_info\[cpu\].valid)/,+1d}
+BREAK_CPUS_boot-rvbar-kept := /^        smp_set_boot_rvbar(&cpu_info\[cpu\]);$$/d
+BREAK_CPUS_boot-rvbar-locked := /if (FIELD_GET(RVBAR_LOCK, read64(cpu->impl_reg)))/,+1d
+BREAK_CPUS_mmu-again := s/    if (read_sctlr() \& SCTLR_M)/    if (0)/
+
+define CPUS_BROKEN_RULES
+build/cpus/$(1)-broken-%.c: build/cpus/$(1).c Makefile
+	sed -e '$$(BREAK_CPUS_$$*)' $$< > $$@
+	! cmp -s $$< $$@
+$(foreach n,$(CPUS_BROKEN_$(1)),build/cpus-broken-$(n)): build/cpus-broken-%: cpus_test.c \
+		build/cpus/$(1)-broken-%.o $(foreach o,$(filter-out $(1),hv smp mmu stubs),build/cpus/$(o).o)
+	$$(CC) $$(CFLAGS) -o $$@ $$^
+endef
+$(eval $(call CPUS_BROKEN_RULES,hv))
+$(eval $(call CPUS_BROKEN_RULES,smp))
+$(eval $(call CPUS_BROKEN_RULES,mmu))
+$(foreach f,hv smp mmu,$(CPUS_BROKEN_$(f):%=build/cpus/$(f)-broken-%.o)): CPUS_CFLAGS += -Wno-error -Wno-unused
+
+cpus-broken: $(CPUS_BROKEN:%=build/cpus-broken-%)
+	@for n in $(CPUS_BROKEN); do \
+		if CPUS_TIMEOUT=10 timeout 300 build/cpus-broken-$$n > build/cpus-broken-$$n.log 2>&1; then \
+			echo "cpus-broken-$$n: the test passes and must not"; exit 1; \
+		fi; \
+		grep -q -m1 '^FAIL' build/cpus-broken-$$n.log || \
+			{ echo "cpus-broken-$$n: ended without a failed check"; exit 1; }; \
+	done
+	@$(foreach n,$(CPUS_BROKEN),echo "cpus-broken: $(n): $$(grep -m1 '^FAIL' build/cpus-broken-$(n).log)";)
+	@echo "cpus-broken: all $(words $(CPUS_BROKEN)) failed, as they must"
 
 tsan: build/model-tsan
 	build/model-tsan 3000
@@ -218,7 +370,7 @@ build/hv_aicmap.h: $(SRC)/hv/hv.h
 MODEL_DEPS := test.c $(wildcard *.h) build/hv_wfi.c build/arm_cpu_regs.h build/aic.h \
 	build/aic_regs.h build/hv_aicmap.h
 
-build/psci-model: psci_test.c $(wildcard *.h) build/hv_psci.c
+build/psci-model: psci_test.c $(wildcard *.h) build/hv_psci.c build/hv_aicmap.h
 	$(CC) $(CFLAGS) -o $@ psci_test.c build/hv_psci.c
 
 build/model: $(MODEL_DEPS) build/hv_vgic.c
