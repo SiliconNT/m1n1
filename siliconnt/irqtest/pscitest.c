@@ -9,8 +9,6 @@
  *
  *   0  what the Windows kernel needs from any PSCI: a version of 0.2 or later, PSCI_FEATURES
  *      that says the six functions are there, x4 to x30 left alone (Arm DEN 0028 1.7 H 2.7).
- *      This is what QEMU's own PSCI is held to (`make qemu-psci`, `make qemu-psci-reset`),
- *      which checks the guest itself.
  *   1  exactly the answers of the hypervisor: version 1.1, the six functions and no others,
  *      -1 for everything else, only x0 changed, the upper halves of x0 and x1 ignored, and
  *      only the affinity fields of CPU_ON's target_cpu looked at.

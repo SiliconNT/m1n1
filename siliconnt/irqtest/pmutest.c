@@ -5,20 +5,12 @@
  * brings code into being the ways an operating system does, for src/hv/hv_pmu.c and
  * src/hv/hv_xtrack.c. Under the hypervisor with execution tracking on, on a core without
  * PMUv3 registers, every one of its accesses has been replaced before it runs, at EL1 and at
- * EL0: a read of the cycle counter by a read of CNTVCT_EL0, anything else by an hvc. On
- * QEMU's virt machine the registers are real and nothing is replaced. The guest passes on
- * both; with ARG_STRICT it insists that the cycle counter is the count of the generic timer,
- * which it is only if the read of it was replaced. Either way it reads its own code back as
- * data, from the page the code is in and from others, and insists that it is what it wrote:
- * what was replaced is the hypervisor's to keep out of sight.
- *
- * Under the EL2 of xtrack-qemu.c it also plays a device that writes into a page of code
- * (ARG_DEVICE): the code changes, and the core must come to execute the new code. With DC
- * IVAC after the write, as Windows does after DMA, at once; without, once EL2 next reads the
- * page for the guest and finds that the copy it executes is out of date. That needs the hvc
- * of xtrack-qemu.c that writes as a device would, which the hypervisor of m1n1 does not have:
- * without ARG_DEVICE (on the M4, and on QEMU with no EL2) the test is skipped, and counts
- * neither way.
+ * EL0: a read of the cycle counter by a read of CNTVCT_EL0, anything else by an hvc. On a
+ * core that has the registers nothing is replaced. The guest passes on both; with ARG_STRICT
+ * it insists that the cycle counter is the count of the generic timer, which it is only if
+ * the read of it was replaced. Either way it reads its own code back as data, from the page
+ * the code is in and from others, and insists that it is what it wrote: what was replaced is
+ * the hypervisor's to keep out of sight.
  *
  * The instructions under test must not sit in this image as they are: the image's own code
  * and constants share pages that execute, and those pages are scanned. So the test code is
@@ -26,8 +18,7 @@
  * run time into pages of an arena that nothing has executed.
  *
  * Raw image, MMU off, EL1h, entry points and image header of sgitest (sgitest-head.S). It
- * ends with PSCI SYSTEM_OFF, which does not return on QEMU and stops the guest under the
- * hypervisor.
+ * ends with PSCI SYSTEM_OFF, which stops the guest under the hypervisor.
  */
 
 #include "sgitest.h"
@@ -36,14 +27,6 @@
 extern u64 hdr_arg;
 
 #define ARG_STRICT 0x100 /* the code must have been replaced */
-#define ARG_DEVICE 0x400 /* the EL2 is the one of xtrack-qemu.c, which has HVC_DEVICE */
-
-/* The hvc of xtrack-qemu.c alone, and x0 for its two calls */
-#define HVC_DEVICE_WRITE  0 /* x1: an address, x2: the word that a device writes there */
-#define HVC_DEVICE_COUNTS 1 /* x1: an address; back: stale, ivac, and the state of its page */
-/* States of a page in stage 2 (HV_XPAGE_* of src/hv/hv.h) */
-#define XPAGE_DATA  0
-#define XPAGE_XONLY 3
 
 void uart_putc(int c);
 u64 run_el0(u64 entry, u64 sp, u64 *esr);
@@ -83,9 +66,7 @@ enum {
 };
 /* The image is built for the tiny code model: all of it within 1 MB, the arena included */
 #define NR_TIMING 32
-#define PG_DEVICE       (PG_TIMING + NR_TIMING) /* code that a device writes into; DC IVAC */
-#define PG_DEVICE_STALE (PG_DEVICE + 1)         /* ...and with no DC IVAC */
-#define NR_PAGES        (PG_DEVICE_STALE + 1)
+#define NR_PAGES    (PG_TIMING + NR_TIMING)
 #define NR_REWRITES 16
 #define NR_STORES   1000
 
@@ -158,11 +139,6 @@ static const u32 tpl_read[] = {K(0x58000100), K(I_RET),     K(0x98000100),      
 #define READ_STORE  12
 #define READ_SPARE  14
 #define C64         0x8877665544332211UL
-
-/* mrs x0, PMCCNTR_EL0; ret; slot: mov x0, #0x1de5; ret. A device writes over the slot */
-static const u32 tpl_device[] = {K(I_MRS_X0_PMCCNTR), K(I_RET), K(0xd283bca0), K(I_RET)};
-#define DEVICE_SLOT 2
-#define DEVICE_MARK 0x1de5
 
 /* The transmit register of the UART, from its base in the image header (sgitest-head.S) */
 #define UTXH 0x20
@@ -633,124 +609,6 @@ static void test_read_code(void)
     result("its code writes to a device register", 1);
 }
 
-/* ---- a device writes into code (ARG_DEVICE) ---- */
-
-struct device_counts {
-    u64 stale; /* shadow pages found out of date */
-    u64 ivac;  /* pages that DC IVAC made data */
-    u64 state; /* of the page */
-};
-
-static u64 hvc_device(u64 fn, const u32 *at, u64 word, u64 *x1, u64 *x2)
-{
-    register u64 r0 asm("x0") = fn;
-    register u64 r1 asm("x1") = (u64)at;
-    register u64 r2 asm("x2") = word;
-
-    asm volatile("hvc #0x7e57" : "+r"(r0), "+r"(r1), "+r"(r2) : : "memory");
-    *x1 = r1;
-    *x2 = r2;
-    return r0;
-}
-
-/* A device writes this word at this address: into the guest's page, past stage 2 */
-static void device_write(u32 *at, u32 word)
-{
-    u64 x1, x2;
-
-    hvc_device(HVC_DEVICE_WRITE, at, word, &x1, &x2);
-}
-
-static struct device_counts device_counts(const u32 *at)
-{
-    struct device_counts c;
-
-    c.stale = hvc_device(HVC_DEVICE_COUNTS, at, 0, &c.ivac, &c.state);
-    return c;
-}
-
-/*
- * Runs the slot that a device wrote a read of the cycle counter into, twice: it must read a
- * count that goes up, and with ARG_STRICT the count of the generic timer, which it is only if
- * the core executes a copy of the new code with the read replaced.
- */
-static void device_runs_new(u32 *pg)
-{
-    u64 t0 = read_sysreg(cntvct_el0);
-    u64 a = call0(pg + DEVICE_SLOT);
-    u64 t1 = read_sysreg(cntvct_el0);
-    spin(1000);
-    u64 b = call0(pg + DEVICE_SLOT);
-
-    value("first", a);
-    value("second", b);
-    result("...and the core executes what the device wrote: a count that goes up",
-           a != DEVICE_MARK && b > a);
-    if (strict)
-        result("...replaced: the count of the generic timer", t0 <= a && a <= t1);
-}
-
-/* A device writes into code, and DC IVAC after it, as Windows does after DMA */
-static void test_device_ivac(void)
-{
-    u32 *pg = page(PG_DEVICE);
-    u32 insn = U(K(I_MRS_X0_PMCCNTR));
-
-    EMIT(pg, tpl_device);
-    call0(pg);
-
-    struct device_counts c0 = device_counts(pg);
-
-    result("device, DC IVAC: a page with an access runs, and is execute-only",
-           call0(pg + DEVICE_SLOT) == DEVICE_MARK && c0.state == XPAGE_XONLY);
-
-    device_write(pg + DEVICE_SLOT, insn);
-    asm volatile("dc ivac, %0" : : "r"(pg + DEVICE_SLOT) : "memory");
-
-    struct device_counts c1 = device_counts(pg);
-
-    result("...DC IVAC on it after the device wrote makes it data",
-           c1.state == XPAGE_DATA && c1.ivac == c0.ivac + 1);
-    device_runs_new(pg);
-
-    int as_written = as_expected(pg + DEVICE_SLOT, K(I_MRS_X0_PMCCNTR));
-    struct device_counts c2 = device_counts(pg);
-
-    result("...the slot reads as the device wrote it, and no shadow page was found out of date",
-           as_written && c2.stale == c0.stale);
-}
-
-/* A device writes into code, and nothing tells EL2: a read through EL2 is what finds out */
-static void test_device_stale(void)
-{
-    u32 *pg = page(PG_DEVICE_STALE);
-    u32 insn = U(K(I_MRS_X0_PMCCNTR));
-
-    EMIT(pg, tpl_device);
-    call0(pg);
-
-    struct device_counts c0 = device_counts(pg);
-
-    result("device, no DC IVAC: a page with an access runs, and is execute-only",
-           call0(pg + DEVICE_SLOT) == DEVICE_MARK && c0.state == XPAGE_XONLY);
-
-    device_write(pg + DEVICE_SLOT, insn);
-
-    struct device_counts c1 = device_counts(pg);
-
-    result("...the core goes on executing what was there before, and nothing has noticed",
-           call0(pg + DEVICE_SLOT) == DEVICE_MARK && c1.state == XPAGE_XONLY &&
-               c1.stale == c0.stale);
-
-    u32 word = *(volatile u32 *)(pg + DEVICE_SLOT);
-    struct device_counts c2 = device_counts(pg);
-
-    result("...a read of the slot as data gets what the device wrote", word == insn);
-    result("...and EL2 finds the shadow page out of date and makes the page data",
-           c2.stale == c0.stale + 1 && c2.state == XPAGE_DATA && c2.ivac == c0.ivac);
-    device_runs_new(pg);
-}
-
 static void test_timing(void)
 {
     u64 freq = read_sysreg(cntfrq_el0);
@@ -813,12 +671,6 @@ void boot_main(void)
     test_el0();
     test_el0_read();
     test_read_code();
-    if (hdr_arg & ARG_DEVICE) {
-        test_device_ivac();
-        test_device_stale();
-    } else {
-        line("     a device that writes into code: skipped, no EL2 here plays one\n");
-    }
     test_timing();
     test_untouched();
 

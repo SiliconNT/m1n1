@@ -2,9 +2,9 @@
 #
 # src/hv/hv_xtrack.c with one thing wrong in it at a time, as sed expressions on the file
 # without its #include lines. The tests of execution tracking must fail on each: that is what
-# shows that they look. Used by vgic-model/Makefile (make xtrack-broken) and by
-# irqtest/Makefile (make qemu-xi-broken). The numbers stay what they were when a change goes:
-# 1 and 3 went with the replaced words that were kept in the guest's memory.
+# shows that they look. Used by vgic-model/Makefile (make xtrack-broken). The numbers stay
+# what they were when a change goes: 1 and 3 went with the replaced words that were kept in
+# the guest's memory.
 
 BREAK_2 := s/^            ctx->regs\[d->rn\] += d->imm;$$/            ;/
 BREAK_2_IS := no writeback to the base register

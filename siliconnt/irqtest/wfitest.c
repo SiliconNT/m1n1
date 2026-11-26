@@ -14,9 +14,6 @@
  * was a little late. The other CPUs have such a tick once a second: there a wakeup that takes
  * longer than LATE_MS fails the test.
  *
- * The same image runs on QEMU's virt machine with an emulated GICv3 (`make qemu-wfi`,
- * `make qemu-wfi-smp`), where WFI is QEMU's own.
- *
  * Only the boot CPU prints, on the hypervisor's virtual UART; lines start with "HVLOG: " so
  * that the hypervisor copies them to its own console. Entry points and vectors are those of
  * sgitest (sgitest-head.S).

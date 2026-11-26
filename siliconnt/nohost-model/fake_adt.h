@@ -2,9 +2,8 @@
 /*
  * A device tree for the files under test: the functions of src/adt.h that they call, over a
  * table of the nodes they look at, as the M4 has them (R35, adt-1.bin: SiliconNT
- * docs/findings/0067, evidence 5). For the model tests of this directory and for the QEMU
- * shell of siliconnt/irqtest (nohost-qemu.c); nothing in it needs more of the C library than
- * memcpy(), strcmp(), strncmp() and strlen().
+ * docs/findings/0067, evidence 5). For the model tests of this directory; nothing in it needs
+ * more of the C library than memcpy(), strcmp(), strncmp() and strlen().
  *
  * adt_get_reg() answers with the addresses of the CPU that the table has, where the devices
  * of the test are: there are no ranges to go through. adt_getprop_copy() is as

@@ -25,10 +25,6 @@
  * end, and across the boundary to the page before and to the page behind; with a tag in the
  * top byte of the address; and, if it stores, with values that are accesses themselves.
  *
- * On QEMU without an EL2 (`make qemu-xi`) all three runs are the core's own and this checks
- * nothing but itself. Under the EL2 of xtrack-qemu.c it is the test (`make qemu-xi-el2`,
- * `make qemu-xi-el2-nosyn`).
- *
  * Raw image, entry points and image header of sgitest (sgitest-head.S), EL1h. Unlike the other
  * guests it turns its MMU on, with every address mapped to itself: only then may an access be
  * unaligned, and Windows never runs without. It ends with PSCI SYSTEM_OFF, with SCTLR_EL1 and

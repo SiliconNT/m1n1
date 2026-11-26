@@ -54,9 +54,6 @@ Exit status, decided in this order:
   2  it came up, but something else did not hold (reads, data, the way down, the counts, the
      interrupts, the SART, or what --expect-* asked for)
   0  all as expected
-
---qemu-image OUT writes the image with QEMU's addresses in the parameter block instead (RAM
-where the controller would be, see the Makefile, qemu-ans) and needs no target.
 """
 import sys, os, pathlib, argparse, signal, struct, threading, hashlib, collections, traceback
 
@@ -102,12 +99,6 @@ STATES = {0: "ANS_OFF", 1: "ANS_STARTING", 2: "ANS_READY", 3: "ANS_STOPPING", 4:
           5: "ANS_CRASHED"}
 CMDLOG_WORDS = 29
 RGN_NAMES = ("NVMe", "coprocessor and mailbox", "SART", "power manager register")
-
-# QEMU: RAM where the controller's ranges would be (Makefile: ANS_QEMU_ASC, ANS_QEMU_PMGR)
-QEMU_RANGES = ((0x48000000, 0x60000), (0x48100000, 0x88000), (0x48200000, 0xc000),
-               (0x48300538, 4))
-QEMU_SPIS = (40, 41)
-QEMU_POOL = (0x2000000, 0x4000000)
 
 ADMIN_NAMES = {0x00: "delete I/O SQ", 0x01: "create I/O SQ", 0x04: "delete I/O CQ",
                0x05: "create I/O CQ", 0x06: "identify"}
@@ -302,11 +293,6 @@ def run(args):
     if image[MAGIC_OFF:MAGIC_OFF + len(HDR_MAGIC)] != HDR_MAGIC:
         not_run(f"{args.payload}: not an image with the header of sgitest-head.S")
     result_off = find_block(image, RESULT_MAGIC, "result block")
-
-    if args.qemu_image:
-        fill_params(args, image, QEMU_RANGES, QEMU_SPIS, 3, True, QEMU_POOL, FLAG_TRACE_WRITES)
-        args.qemu_image.write_bytes(bytes(image))
-        return EXIT_OK
 
     if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
         not_run(f"{args.payload}: UART base already filled in")
@@ -573,8 +559,6 @@ def main():
     parser.add_argument("--no-trace", action="store_true",
                         help="do not have the guest print the register writes outside "
                              "ANS_READY")
-    parser.add_argument("--qemu-image", type=pathlib.Path, metavar="OUT",
-                        help="write the image with QEMU's addresses to OUT and exit")
     parser.add_argument("payload", type=pathlib.Path, nargs="?",
                         default=HERE / "build" / "anstest.bin")
     args = parser.parse_args()

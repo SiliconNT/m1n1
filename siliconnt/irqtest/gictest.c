@@ -7,9 +7,6 @@
  * once it is, with the priority the guest gave it; an SPI that the guest requests by writing
  * GICD_ISPENDR must arrive at the CPU GICD_IROUTER names.
  *
- * The same image runs on QEMU's virt machine with an emulated GICv3 (`make qemu-gic`,
- * `make qemu-gic-smp`), which is where the expected results come from.
- *
  * Only the boot CPU prints, on the hypervisor's virtual UART; lines start with "HVLOG: " so
  * that the hypervisor copies them to its own console. Nothing here waits with WFI. Entry
  * points and vectors are those of sgitest (sgitest-head.S).

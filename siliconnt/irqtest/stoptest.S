@@ -19,8 +19,8 @@
  *   4  PSCI CPU_OFF: the guest runs on no other CPU, so this is SYSTEM_OFF
  *
  * None of them returns. If one does, the guest says so with hvc #0x5155 (STOP_RETURNED),
- * which nobody carries out either: the QEMU shell of src/hv/hv_stop.c (nohost-qemu.c) fails
- * on it, and on the machine it stops the guest a second time, with its own line.
+ * which nobody carries out either: on the machine it stops the guest a second time, with its
+ * own line.
  *
  * It touches no device, the UART least of all: without a host the guest has none. MMU off,
  * EL1h, at an address it does not know.

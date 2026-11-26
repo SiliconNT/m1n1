@@ -11,9 +11,6 @@
  *
  * Only the boot CPU prints, on the hypervisor's virtual UART; lines start with "HVLOG: " so
  * that the hypervisor copies them to its own console. Nothing here waits with WFI.
- *
- * The same image runs on QEMU's virt machine with an emulated GICv3 (`make qemu-sgi`,
- * `make qemu-sgi-smp`), which is where the expected results come from.
  */
 
 #include "sgitest.h"
