@@ -11,8 +11,6 @@
  *
  * What is the same for every guest, where the devices of the machine are and whether the
  * guest can have its GIC where it is, is src/hv/hv_layout.c.
- *
- * Tested on the build machine by siliconnt/selfboot-model (run_test.c).
  */
 
 #include "../build/build_cfg.h"

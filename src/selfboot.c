@@ -3,8 +3,6 @@
 /*
  * See selfboot.h. Each function here says where it has its counterpart in
  * siliconnt/firmware/run_firmware.py or proxyclient/m1n1/hv/__init__.py.
- *
- * Tested on the build machine by siliconnt/selfboot-model.
  */
 
 #include "selfboot.h"

@@ -20,8 +20,6 @@
  *
  * m1n1 failing itself (an exception in EL2, a failed assertion) does not come here: m1n1
  * restarts then, host or not, as upstream has it.
- *
- * Tested on the build machine by siliconnt/nohost-model (stop_test.c).
  */
 
 #include "hv.h"

@@ -6,8 +6,6 @@
 //! chainload.rs reads a file into a `Vec` on the heap of m1n1, which a second stage m1n1 fits
 //! in and a disk image of hundreds of megabytes does not. Here the file goes straight to its
 //! destination; the only buffer in between is the one sector of nvme.rs.
-//!
-//! Tested on the build machine by siliconnt/readfile-model.
 
 use crate::c_size_t;
 use crate::gpt;

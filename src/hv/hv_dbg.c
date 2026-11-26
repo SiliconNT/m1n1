@@ -18,8 +18,6 @@
  * Every other access is left to whoever else handles trapped accesses.
  *
  * A core only ever touches its own registers here, so none of this needs the hypervisor lock.
- *
- * Tested on the build machine by siliconnt/vgic-model (dbg_test.c).
  */
 
 #include "hv.h"

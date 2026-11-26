@@ -27,9 +27,6 @@
  * Each returns only if the machine is still running: 0.5 s after the watchdog was set, 1 s
  * after off1, or at once when a step before off1 fails. Nothing becomes a restart instead:
  * hv_stop.c shows what happened on the screen.
- *
- * Tested on the build machine by siliconnt/nohost-model (power_test.c), against an SMC, an
- * SPMI bus with the PMU on it and a watchdog that the test plays.
  */
 
 #include "hv.h"

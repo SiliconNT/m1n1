@@ -13,8 +13,6 @@
  *
  * Which SPI of that GIC each line of AIC is, is read from the device tree too: hv_aicmap().
  * hv_vgic.c forwards the lines by it, and the firmware is handed the same table.
- *
- * Tested on the build machine by siliconnt/selfboot-model (layout_test.c, run_test.c).
  */
 
 #include "hv.h"

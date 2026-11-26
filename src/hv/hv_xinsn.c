@@ -24,9 +24,7 @@
  * architecture calls CONSTRAINED UNPREDICTABLE.
  *
  * The encodings are those of Arm DDI 0487 M.d, C4.1 "A64 instruction set encoding", the group
- * "Loads and Stores", bits 27 and 25 of the word being 1 and 0. siliconnt/vgic-model/test_xinsn.py
- * compares this decoder with the disassembler of binutils, word by word: whatever is taken here is
- * what that says it is.
+ * "Loads and Stores", bits 27 and 25 of the word being 1 and 0.
  *
  * Nothing here touches the guest or the hardware.
  */
