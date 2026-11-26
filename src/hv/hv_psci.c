@@ -48,8 +48,6 @@
  * either would be taken for an answer, so the guest is stopped there too.
  *
  * Everything here runs with the hypervisor lock held, on whichever core the guest called from.
- *
- * Tested on the build machine by siliconnt/vgic-model (psci_test.c).
  */
 
 #include "hv.h"

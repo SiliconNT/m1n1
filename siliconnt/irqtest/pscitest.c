@@ -18,7 +18,7 @@
  * Bits 31:16 are a number of times: so often each other CPU is turned on and turns itself off,
  * and then the boot CPU turns itself off and is turned on by another one. 0: the test stays on
  * the boot CPU. The other CPUs are those that have a Redistributor, and are off when this
- * starts; one of them is on at a time (`make qemu-psci-smp`).
+ * starts; one of them is on at a time.
  *
  * It runs with interrupts masked, and of the GIC and the timer it only reads GICR_TYPER and the
  * counter. It prints on the hypervisor's virtual UART; lines start with "HVLOG: " so that the
