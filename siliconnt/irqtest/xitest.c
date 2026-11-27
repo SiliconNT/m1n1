@@ -31,9 +31,12 @@
  * CPACR_EL1 as it found them: the hypervisor hands the next guest what this one leaves.
  */
 
+#define GUEST_NAME "xitest"
+
 #include "sgitest.h"
 #include "gic.h" /* for u64 and u32 */
 #include "xitest.h"
+#include "guest.h"
 
 typedef long s64;
 
@@ -42,15 +45,8 @@ extern u64 hdr_uart_base;
 
 #define ARG_STOP 0x200 /* end at the first instruction that fails */
 
-void uart_putc(int c);
 void psci_system_off(void);
 
-#define read_sysreg(r)                                                                             \
-    ({                                                                                             \
-        u64 _v;                                                                                    \
-        asm volatile("mrs %0, " #r : "=r"(_v));                                                    \
-        _v;                                                                                        \
-    })
 #define write_sysreg(r, v)                                                                         \
     do {                                                                                           \
         u64 _v = (v);                                                                              \
@@ -125,37 +121,6 @@ static volatile u32 key = 0xa5a5a5a5;
 static u32 nr_pass, nr_fail, nr_cases, nr_runs, nr_details;
 static u64 sctlr_at_start, cpacr_at_start;
 
-static void put(const char *s)
-{
-    while (*s)
-        uart_putc(*s++);
-}
-
-static void put_hex(u64 v, int digits)
-{
-    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-        uart_putc("0123456789abcdef"[(v >> shift) & 0xf]);
-}
-
-static void put_dec(u64 v)
-{
-    char buf[20];
-    int n = 0;
-
-    do {
-        buf[n++] = '0' + v % 10;
-        v /= 10;
-    } while (v);
-    while (n)
-        uart_putc(buf[--n]);
-}
-
-static void line(const char *s)
-{
-    put("HVLOG: xitest: ");
-    put(s);
-}
-
 static void finish(void)
 {
     line("     instructions cases runs = ");
@@ -192,25 +157,6 @@ u64 sync_handler(u64 esr, u64 elr)
     (void)esr;
     (void)elr;
     return 0;
-}
-
-void bad_exception(u64 vector)
-{
-    line("EXCEPTION cpu vector ESR ELR FAR SPSR = ");
-    put_hex(read_sysreg(tpidr_el1), 2);
-    put(" ");
-    put_hex(vector, 2);
-    put(" ");
-    put_hex(read_sysreg(esr_el1), 8);
-    put(" ");
-    put_hex(read_sysreg(elr_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(far_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(spsr_el1), 8);
-    put("\n");
-    for (;;)
-        ;
 }
 
 void secondary_main(int slot)

@@ -13,7 +13,7 @@
  * is how long CPU_ON took, as the CPU itself saw it. That count is the same on every CPU while
  * nothing has changed CNTVOFF_EL2 in between, which is the case without the host's part.
  *
- * Every function here prints, if at all, through uart_putc() with lines that start with
+ * Every function here prints, if at all, through put() of guest.h with lines that start with
  * "HVLOG: cpuon: ", so that each guest can use them with its own output.
  */
 
@@ -21,6 +21,7 @@
 #define CPUON_H
 
 #include "gic.h"
+#include "guest.h"
 #include "sgitest.h"
 
 /* Written by the loader, see sgitest-head.S */
@@ -29,8 +30,6 @@ extern u64 hdr_cpu_entry[MAX_CPUS];
 extern volatile u64 cpu_first_insn[MAX_CPUS];
 extern char image_start[];
 extern char secondary_start[];
-
-void uart_putc(int c);
 
 /* Arm DEN 0022 F.b 5.1, 5.2.2 */
 #define CPUON_FN_CPU_ON  0xc4000003UL
@@ -117,31 +116,6 @@ static inline int cpuon_start(u64 slot, volatile u64 *online)
     return 0;
 }
 
-static inline void cpuon_put(const char *s)
-{
-    while (*s)
-        uart_putc(*s++);
-}
-
-static inline void cpuon_put_hex(u64 v, int digits)
-{
-    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-        uart_putc("0123456789abcdef"[(v >> shift) & 0xf]);
-}
-
-static inline void cpuon_put_dec(u64 v)
-{
-    char buf[20];
-    int n = 0;
-
-    do {
-        buf[n++] = '0' + v % 10;
-        v /= 10;
-    } while (v);
-    while (n)
-        uart_putc(buf[--n]);
-}
-
 /*
  * Once the CPUs of slots 1 to nr_cpus - 1 are there: CPU_ON of each again, and of the caller,
  * must say ALREADY_ON. Prints one line per slot and the slowest. Returns whether every CPU
@@ -162,32 +136,32 @@ static inline int cpuon_report(u64 nr_cpus, u64 self_mpidr)
         }
         if (c->took > CPUON_SLOW_MS * per_ms || c->again != CPUON_ALREADY_ON)
             ok = 0;
-        cpuon_put("HVLOG: cpuon: cpu ");
-        cpuon_put_dec(slot);
-        cpuon_put(" MPIDR ");
-        cpuon_put_hex(c->mpidr, 10);
-        cpuon_put(": CPU_ON ");
-        cpuon_put_dec(c->answer);
-        cpuon_put(", first instruction after ");
-        cpuon_put_dec(c->took * 1000 / per_ms);
-        cpuon_put(" us, there after ");
-        cpuon_put_dec(c->arrived_in * 1000 / per_ms);
-        cpuon_put(" us; CPU_ON again ");
-        cpuon_put_hex((u32)c->again, 8);
-        cpuon_put("\n");
+        put("HVLOG: cpuon: cpu ");
+        put_dec(slot);
+        put(" MPIDR ");
+        put_hex(c->mpidr, 10);
+        put(": CPU_ON ");
+        put_dec(c->answer);
+        put(", first instruction after ");
+        put_dec(c->took * 1000 / per_ms);
+        put(" us, there after ");
+        put_dec(c->arrived_in * 1000 / per_ms);
+        put(" us; CPU_ON again ");
+        put_hex((u32)c->again, 8);
+        put("\n");
     }
     self = cpuon_call(self_mpidr, cpuon_entry(0), 0);
     if (self != CPUON_ALREADY_ON)
         ok = 0;
-    cpuon_put("HVLOG: cpuon: slowest ");
-    cpuon_put_dec(slowest * 1000 / per_ms);
-    cpuon_put(" us (cpu ");
-    cpuon_put_dec(slowest_slot);
-    cpuon_put("), limit ");
-    cpuon_put_dec(CPUON_SLOW_MS * 1000);
-    cpuon_put(" us; CPU_ON of the caller ");
-    cpuon_put_hex((u32)self, 8);
-    cpuon_put("\n");
+    put("HVLOG: cpuon: slowest ");
+    put_dec(slowest * 1000 / per_ms);
+    put(" us (cpu ");
+    put_dec(slowest_slot);
+    put("), limit ");
+    put_dec(CPUON_SLOW_MS * 1000);
+    put(" us; CPU_ON of the caller ");
+    put_hex((u32)self, 8);
+    put("\n");
     return ok;
 }
 

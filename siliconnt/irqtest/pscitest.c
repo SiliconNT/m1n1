@@ -31,8 +31,11 @@
  * (sgitest-head.S).
  */
 
+#define GUEST_NAME "pscitest"
+
 #include "sgitest.h"
 #include "gic.h" /* for u64 and u32 */
+#include "guest.h"
 
 /* Written by the loader, see sgitest-head.S */
 extern u64 hdr_arg;
@@ -54,18 +57,11 @@ enum last_call {
     LAST_NONE,
 };
 
-void uart_putc(int c);
 
 /* sgitest-head.S: where the image is, and the word of its header that says where a CPU enters */
 extern char image_start[];
 #define HDR_SECONDARY_OFF 0x20
 
-#define read_sysreg(r)                                                                             \
-    ({                                                                                             \
-        u64 _v;                                                                                    \
-        asm volatile("mrs %0, " #r : "=r"(_v));                                                    \
-        _v;                                                                                        \
-    })
 
 /* Arm DEN 0022 F.b 5.1, DEN 0028 1.7 H 7.2 to 7.5 */
 #define FN_PSCI_VERSION  0x84000000UL
@@ -237,37 +233,6 @@ static u32 w0(void)
 
 /* ---- output ---- */
 
-static void put(const char *s)
-{
-    while (*s)
-        uart_putc(*s++);
-}
-
-static void put_hex(u64 v, int digits)
-{
-    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-        uart_putc("0123456789abcdef"[(v >> shift) & 0xf]);
-}
-
-static void put_dec(u64 v)
-{
-    char buf[20];
-    int n = 0;
-
-    do {
-        buf[n++] = '0' + v % 10;
-        v /= 10;
-    } while (v);
-    while (n)
-        uart_putc(buf[--n]);
-}
-
-static void line(const char *s)
-{
-    put("HVLOG: pscitest: ");
-    put(s);
-}
-
 static void result(const char *name, int ok)
 {
     line(ok ? "PASS " : "FAIL ");
@@ -314,25 +279,6 @@ u64 sync_handler(u64 esr, u64 elr)
     (void)esr;
     (void)elr;
     return 0;
-}
-
-void bad_exception(u64 vector)
-{
-    line("EXCEPTION cpu vector ESR ELR FAR SPSR = ");
-    put_hex(read_sysreg(tpidr_el1), 2);
-    put(" ");
-    put_hex(vector, 2);
-    put(" ");
-    put_hex(read_sysreg(esr_el1), 8);
-    put(" ");
-    put_hex(read_sysreg(elr_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(far_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(spsr_el1), 8);
-    put("\n");
-    for (;;)
-        ;
 }
 
 /* ---- the tests ---- */

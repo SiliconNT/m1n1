@@ -23,9 +23,12 @@
  * those of sgitest (sgitest-head.S).
  */
 
+#define GUEST_NAME "xtstress"
+
 #include "gic.h"
 #include "cpuon.h"
 #include "sgitest.h"
+#include "guest.h"
 
 #define HOT_WORDS 32
 /* mrs x9, pmccntr_el0, as xtstress-hot.S has it */
@@ -41,14 +44,7 @@ extern volatile u32 hot_pmu[4];
 extern volatile u64 hot_data[HOT_WORDS];
 u64 ld1_pair(const volatile void *p, u64 *hi);
 
-void uart_putc(int c);
 
-#define read_sysreg(r)                                                                             \
-    ({                                                                                             \
-        u64 _v;                                                                                    \
-        asm volatile("mrs %0, " #r : "=r"(_v));                                                    \
-        _v;                                                                                        \
-    })
 #define write_sysreg(r, v) asm volatile("msr " #r ", %0" : : "r"((u64)(v)))
 #define isb()              asm volatile("isb")
 
@@ -73,37 +69,6 @@ static u64 ticks_per_ms;
 static u32 nr_pass, nr_fail;
 
 /* ---- output ---- */
-
-static void put(const char *s)
-{
-    while (*s)
-        uart_putc(*s++);
-}
-
-static void put_hex(u64 v, int digits)
-{
-    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-        uart_putc("0123456789abcdef"[(v >> shift) & 0xf]);
-}
-
-static void put_dec(u64 v)
-{
-    char buf[20];
-    int n = 0;
-
-    do {
-        buf[n++] = '0' + v % 10;
-        v /= 10;
-    } while (v);
-    while (n)
-        uart_putc(buf[--n]);
-}
-
-static void line(const char *s)
-{
-    put("HVLOG: xtstress: ");
-    put(s);
-}
 
 static void result(const char *name, int ok)
 {
@@ -143,25 +108,6 @@ u64 sync_handler(u64 esr, u64 elr)
     (void)esr;
     (void)elr;
     return 0;
-}
-
-void bad_exception(u64 vector)
-{
-    line("EXCEPTION cpu vector ESR ELR FAR SPSR = ");
-    put_hex(read_sysreg(tpidr_el1), 2);
-    put(" ");
-    put_hex(vector, 2);
-    put(" ");
-    put_hex(read_sysreg(esr_el1), 8);
-    put(" ");
-    put_hex(read_sysreg(elr_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(far_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(spsr_el1), 8);
-    put("\n");
-    for (;;)
-        ;
 }
 
 /* ---- the writing core ---- */

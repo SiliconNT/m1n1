@@ -21,9 +21,12 @@
  * sgitest (sgitest-head.S).
  */
 
+#define GUEST_NAME "cputest"
+
 #include "gic.h"
 #include "cpuon.h"
 #include "sgitest.h"
+#include "guest.h"
 
 /* As in cputest-regs.S */
 #define REG_NAME_SIZE 32
@@ -39,16 +42,9 @@ extern u64 hdr_nr_cpus;
 extern u32 reg_code[], reg_code_late[], reg_code_end[];
 extern const char reg_names[], reg_names_late[];
 
-void uart_putc(int c);
 void mmio_write32(u64 addr, u32 val);
 void mailbox_write(u64 dev, u64 wb, u64 val, u64 words, u64 ttbr, u64 tcr, u64 mair);
 
-#define read_sysreg(r)                                                                             \
-    ({                                                                                             \
-        u64 _v;                                                                                    \
-        asm volatile("mrs %0, " #r : "=r"(_v));                                                    \
-        _v;                                                                                        \
-    })
 #define isb() asm volatile("isb")
 
 /* Commands for a CPU, see run_on() */
@@ -108,37 +104,6 @@ static struct cpu *me(void)
 
 /* ---- output ---- */
 
-static void put(const char *s)
-{
-    while (*s)
-        uart_putc(*s++);
-}
-
-static void put_hex(u64 v, int digits)
-{
-    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-        uart_putc("0123456789abcdef"[(v >> shift) & 0xf]);
-}
-
-static void put_dec(u64 v)
-{
-    char buf[20];
-    int n = 0;
-
-    do {
-        buf[n++] = '0' + v % 10;
-        v /= 10;
-    } while (v);
-    while (n)
-        uart_putc(buf[--n]);
-}
-
-static void line(const char *s)
-{
-    put("HVLOG: cputest: ");
-    put(s);
-}
-
 static void result(const char *name, int ok)
 {
     line(ok ? "PASS " : "FAIL ");
@@ -172,25 +137,6 @@ u64 sync_handler(u64 esr, u64 elr)
         return 0;
     c->esr = esr | (1UL << 63);
     return elr + 4;
-}
-
-void bad_exception(u64 vector)
-{
-    line("EXCEPTION cpu vector ESR ELR FAR SPSR = ");
-    put_hex(read_sysreg(tpidr_el1), 2);
-    put(" ");
-    put_hex(vector, 2);
-    put(" ");
-    put_hex(read_sysreg(esr_el1), 8);
-    put(" ");
-    put_hex(read_sysreg(elr_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(far_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(spsr_el1), 8);
-    put("\n");
-    for (;;)
-        ;
 }
 
 /* ---- registers ---- */

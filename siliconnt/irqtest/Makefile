@@ -50,7 +50,7 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/pscitest.o build/pmutest.o build/aictest.o build/aicroute.o build/cputest.o build/xtstress.o: build/%.o: %.c sgitest.h gic.h cpuon.h
+build/sgitest.o build/gictest.o build/pscitest.o build/pmutest.o build/aictest.o build/aicroute.o build/cputest.o build/xtstress.o: build/%.o: %.c sgitest.h gic.h cpuon.h guest.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
@@ -77,7 +77,7 @@ build/el2probe.elf: build/el2probe.o
 
 # xitest: its instructions are assembled (LSE and RCPC among them), and nothing of it that is
 # written to shares a page with what is executed (xitest.ld)
-build/xitest.o: xitest.c sgitest.h gic.h xitest.h
+build/xitest.o: xitest.c sgitest.h gic.h xitest.h guest.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 

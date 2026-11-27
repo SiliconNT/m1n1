@@ -22,8 +22,11 @@
  * sgitest (sgitest-head.S). Nothing here waits with WFI.
  */
 
+#define GUEST_NAME "aictest"
+
 #include "gic.h"
 #include "sgitest.h"
+#include "guest.h"
 
 /* Written by the loader, see sgitest-head.S */
 extern u64 hdr_aic_set;
@@ -31,15 +34,8 @@ extern u64 hdr_aic_clr;
 extern u64 hdr_aic_bit;
 extern u64 hdr_aic_spi;
 
-void uart_putc(int c);
 void mmio_write32(u64 addr, u32 val);
 
-#define read_sysreg(r)                                                                             \
-    ({                                                                                             \
-        u64 _v;                                                                                    \
-        asm volatile("mrs %0, " #r : "=r"(_v));                                                    \
-        _v;                                                                                        \
-    })
 #define write_sysreg(r, v) asm volatile("msr " #r ", %0" : : "r"((u64)(v)))
 #define isb()              asm volatile("isb")
 #define irq_mask()         asm volatile("msr daifset, #2")
@@ -67,37 +63,6 @@ static volatile u32 lower_at;   // lower the line when `taken` reaches this; 0: 
 static volatile int disable_in_handler;
 
 /* ---- output ---- */
-
-static void put(const char *s)
-{
-    while (*s)
-        uart_putc(*s++);
-}
-
-static void put_hex(u64 v, int digits)
-{
-    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
-        uart_putc("0123456789abcdef"[(v >> shift) & 0xf]);
-}
-
-static void put_dec(u64 v)
-{
-    char buf[20];
-    int n = 0;
-
-    do {
-        buf[n++] = '0' + v % 10;
-        v /= 10;
-    } while (v);
-    while (n)
-        uart_putc(buf[--n]);
-}
-
-static void line(const char *s)
-{
-    put("HVLOG: aictest: ");
-    put(s);
-}
 
 static void result(const char *name, int ok)
 {
@@ -192,24 +157,6 @@ u64 sync_handler(u64 esr, u64 elr)
     (void)esr;
     (void)elr;
     return 0;
-}
-
-void bad_exception(u64 vector)
-{
-    irq_mask();
-    line("EXCEPTION vector ESR ELR FAR SPSR = ");
-    put_hex(vector, 2);
-    put(" ");
-    put_hex(read_sysreg(esr_el1), 8);
-    put(" ");
-    put_hex(read_sysreg(elr_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(far_el1), 16);
-    put(" ");
-    put_hex(read_sysreg(spsr_el1), 8);
-    put("\n");
-    for (;;)
-        ;
 }
 
 void secondary_main(int slot)
