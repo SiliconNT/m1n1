@@ -165,10 +165,10 @@ err_free:
 
 int dcp_ib_shutdown(dcp_iboot_if_t *iboot)
 {
-    afk_epic_shutdown_ep(iboot->epic);
+    int ret = afk_epic_shutdown_ep(iboot->epic);
 
     free(iboot);
-    return 0;
+    return ret;
 }
 
 int dcp_ib_open(dcp_iboot_if_t *iboot, u32 settle)

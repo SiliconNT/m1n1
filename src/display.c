@@ -267,6 +267,12 @@ const display_config_t *display_get_config(void)
     return conf;
 }
 
+static void display_dcp_shutdown(bool sleep)
+{
+    if (dcp_shutdown(dcp, sleep) < 0)
+        printf("display: failed to shut down DCP\n");
+}
+
 static int display_do_start_dcp(bool v2)
 {
     if (iboot)
@@ -310,14 +316,14 @@ static int display_do_start_dcp(bool v2)
     if (DART_IS_ERR(fb_dva)) {
         printf("display: failed to find display DVA\n");
         fb_dva = 0;
-        dcp_shutdown(dcp, false);
+        display_dcp_shutdown(false);
         return -1;
     }
 
     iboot = dcp_ib_init(dcp, v2);
     if (!iboot) {
         printf("display: failed to initialize DCP iBoot interface\n");
-        dcp_shutdown(dcp, false);
+        display_dcp_shutdown(false);
         return -1;
     }
 
@@ -745,22 +751,23 @@ void display_shutdown(dcp_shutdown_mode mode)
         return;
 
     if (iboot) {
-        dcp_ib_shutdown(iboot);
+        if (dcp_ib_shutdown(iboot) < 0)
+            printf("display: failed to shut down the DCP iBoot interface\n");
         switch (mode) {
             case DCP_QUIESCED:
                 printf("display: Quiescing DCP (unconditional)\n");
-                dcp_shutdown(dcp, false);
+                display_dcp_shutdown(false);
                 break;
             case DCP_SLEEP_IF_EXTERNAL:
                 if (!display_is_external)
                     printf("display: Quiescing DCP (internal)\n");
                 else
                     printf("display: Sleeping DCP (external)\n");
-                dcp_shutdown(dcp, display_is_external);
+                display_dcp_shutdown(display_is_external);
                 break;
             case DCP_SLEEP:
                 printf("display: Sleeping DCP (unconditional)\n");
-                dcp_shutdown(dcp, true);
+                display_dcp_shutdown(true);
                 break;
         }
         iboot = NULL;

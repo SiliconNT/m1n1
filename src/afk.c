@@ -790,7 +790,7 @@ afk_epic_ep_t *afk_epic_start_ep(afk_epic_t *afk, int endpoint, const afk_epic_s
     while (!epic->started) {
         int ret = afk_epic_poll(epic->afk, endpoint, true);
         if (ret < 0)
-            break;
+            goto err;
         else if (ret > 0)
             printf("EPIC: received unexpected message during init\n");
     }
@@ -811,10 +811,14 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
         return -1;
     }
 
+    int err = 0;
+
     while (epic->started) {
         int ret = afk_epic_poll(epic->afk, epic->ep, true);
-        if (ret < 0)
+        if (ret < 0) {
+            err = ret;
             break;
+        }
     }
 
     rtkit_free_buffer(epic->afk->rtk, &epic->buf);
@@ -824,7 +828,7 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
     epic->afk->endpoint[epic->ep - 0x20] = NULL;
 
     free(epic);
-    return 0;
+    return err;
 }
 
 static const afk_epic_service_ops_t *afk_match_service(afk_epic_ep_t *ep, const char *name)
@@ -1096,11 +1100,13 @@ afk_epic_t *afk_epic_init(rtkit_dev_t *rtkit)
 int afk_epic_shutdown(afk_epic_t *afk)
 {
 
+    int ret = 0;
+
     for (int i = 0; i < 0x10; i++)
-        if (afk->endpoint[i])
-            afk_epic_shutdown_ep(afk->endpoint[i]);
+        if (afk->endpoint[i] && afk_epic_shutdown_ep(afk->endpoint[i]) < 0)
+            ret = -1;
 
     free(afk);
 
-    return 0;
+    return ret;
 }

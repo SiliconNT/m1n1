@@ -256,12 +256,12 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
     dcp_dptx_shutdown(dcp->dptx_ep);
     dcp_dpav_shutdown(dcp->dpav_ep);
     free(dcp->phy);
-    afk_epic_shutdown(dcp->afk);
+    bool ok = afk_epic_shutdown(dcp->afk) == 0;
     if (sleep) {
-        rtkit_sleep(dcp->rtkit);
-        pmgr_reset(dcp_die, dcp_pmgr_dev);
+        ok &= rtkit_sleep(dcp->rtkit);
+        ok &= pmgr_reset(dcp_die, dcp_pmgr_dev) == 0;
     } else {
-        rtkit_quiesce(dcp->rtkit);
+        ok &= rtkit_quiesce(dcp->rtkit);
     }
     rtkit_free(dcp->rtkit);
     dart_shutdown(dcp->dart_disp);
@@ -269,5 +269,5 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
     dart_shutdown(dcp->dart_dcp);
     free(dcp);
 
-    return 0;
+    return ok ? 0 : -1;
 }
