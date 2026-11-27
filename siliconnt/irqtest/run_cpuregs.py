@@ -112,7 +112,7 @@ def main():
         print(f"Device tree: {args.adt}")
     memory = {"phys_base": u.ba.phys_base, "mem_size": u.ba.mem_size,
               "top_of_kernel_data": u.ba.top_of_kernel_data,
-              "mem_size_actual": getattr(u.ba, "mem_size_actual", 0)}
+              "mem_size_actual": u.ba.mem_size_actual}
     print("Boot arguments: " + ", ".join(f"{k} 0x{v:x}" for k, v in memory.items()))
     if args.check_only:
         return
@@ -143,9 +143,9 @@ def main():
 
     def report(index, values):
         node = cpus[index]
-        result["cores"][str(index)] = {
+        result["cores"].setdefault(str(index), {}).update({
             "reg": node.reg, "type": getattr(node, "cluster_type", "?"),
-            "values": {name: list(v) for name, v in values.items()}}
+            "values": {name: list(v) for name, v in values.items()}})
         print(f"==== CPU {index} ({getattr(node, 'cluster_type', '?')}, reg 0x{node.reg:x}) ====")
         for name, where in regs:
             print(f"  {name:18s} {where:4s} {show(values[name])}")
@@ -168,10 +168,8 @@ def main():
         if not alive:
             save()
             sys.exit("Not going on. Any CPU that did start stays in m1n1's idle loop.")
-        start_ms = took
         values = run_probe(lambda buf: p.smp_call_sync(index, code, buf))
         report(index, values)
-        result["cores"][str(index)]["start_ms"] = start_ms
     print(f"heap top with every CPU running m1n1: 0x{p.heapblock_alloc(0):x}")
 
     freq = result["cores"][str(boot)]["values"]["CNTFRQ_EL0"][0]
