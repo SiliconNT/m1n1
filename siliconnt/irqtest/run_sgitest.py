@@ -12,7 +12,7 @@ pmutest needs --xtrack: no memory of the guest is executable then until the hype
 scanned it and replaced the accesses to PMUv3 registers, which the M4 does not have, whether
 the code runs at EL1 or at EL0. With --guest-arg 0x100 pmutest also insists that its accesses
 were replaced: that the cycle counter it reads is the count of the generic timer. It ends
-with SYSTEM_OFF, as pscitest does.
+with SYSTEM_OFF.
 
 build/xitest.bin (xitest.c) is a fifth guest that this script loads, also with --xtrack: it
 executes every load and store that src/hv/hv_xinsn.c takes apart, where the hypervisor has
@@ -27,10 +27,9 @@ one that no device of the machine raises meanwhile. The script asks m1n1 for the
 AIC the software trigger of the line is set and cleared, worked out from the device tree and
 the registers of AIC the way aic_init() of src/aic.c does. aictest ends with SYSTEM_OFF.
 
-pscitest takes an argument, --guest-arg: 0x100 makes it expect exactly the answers of the
-hypervisor's PSCI, and the low four bits choose the call it ends with (0 SYSTEM_OFF,
-1 SYSTEM_RESET, 2 hvc #1, 3 CPU_ON, 4 CPU_OFF). None of those calls comes back: the
-hypervisor stops the guest and says why, and this script leaves the guest right then.
+pscitest turns the other CPUs on and off, the boot CPU too. --guest-arg: bits 31:16 how
+often each other CPU, bits 15:9 how often the boot CPU (0: as often). It ends with DONE and
+spins: give it --stop-after-done.
 
 build/cputest.bin (cputest.c) is a seventh: what a guest reads in the identification registers
 of every core, and what a core that has just started sees of what the boot core wrote before
