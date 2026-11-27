@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Run the sgitest guest (sgitest.c) under the hypervisor, or, given build/gictest.bin,
-build/wfitest.bin, build/pscitest.bin or build/pmutest.bin as the payload, the gictest guest
-(gictest.c), the wfitest guest (wfitest.c), the pscitest guest (pscitest.c) or the pmutest
-guest (pmutest.c): the five share their entry code and image header.
+build/pscitest.bin or build/pmutest.bin as the payload, the gictest guest (gictest.c), the
+pscitest guest (pscitest.c) or the pmutest guest (pmutest.c): the four share their entry
+code and image header.
 
 The m1n1 on the target has to be built from this tree: the tests are about src/hv/hv_vgic.c,
 src/hv/hv_wfi.c, src/hv/hv_psci.c, src/hv/hv_pmu.c and src/hv/hv_xtrack.c.
@@ -14,11 +14,11 @@ the code runs at EL1 or at EL0. With --guest-arg 0x100 pmutest also insists that
 were replaced: that the cycle counter it reads is the count of the generic timer. It ends
 with SYSTEM_OFF, as pscitest does.
 
-build/xitest.bin (xitest.c) is a sixth guest that this script loads, also with --xtrack: it
+build/xitest.bin (xitest.c) is a fifth guest that this script loads, also with --xtrack: it
 executes every load and store that src/hv/hv_xinsn.c takes apart, where the hypervisor has
 no part in it and where the hypervisor carries it out, and compares. It ends with SYSTEM_OFF.
 
-build/aictest.bin (aictest.c) is a seventh, for how the hypervisor forwards an AIC line as
+build/aictest.bin (aictest.c) is a sixth, for how the hypervisor forwards an AIC line as
 an SPI (src/hv/hv_vgic.c). It needs --aic-line N: the line it raises and lowers with the
 software trigger of AIC, as die * max_irq + line, which has to be one of the table of AIC
 lines and SPIs that m1n1 makes from its device tree (hv_aicmap(), src/hv/hv_layout.c), and
@@ -32,13 +32,13 @@ hypervisor's PSCI, and the low four bits choose the call it ends with (0 SYSTEM_
 1 SYSTEM_RESET, 2 hvc #1, 3 CPU_ON, 4 CPU_OFF). None of those calls comes back: the
 hypervisor stops the guest and says why, and this script leaves the guest right then.
 
-build/cputest.bin (cputest.c) is an eighth: what a guest reads in the identification registers
+build/cputest.bin (cputest.c) is a seventh: what a guest reads in the identification registers
 of every core, and what a core that has just started sees of what the boot core wrote before
-(SiliconNT R50). build/aicroute.bin (aicroute.c) is a ninth, about which core AIC reports a
+(SiliconNT R50). build/aicroute.bin (aicroute.c) is an eighth, about which core AIC reports a
 line to. It takes --aic-line as aictest does, up to three times, and --guest-arg: bit 0 the
 cores spin while they wait, bit 1 they are in WFI, bits 2 and 3 the same with the line held over
 the first end, bit 4 the lines raised at once, bit 5 the boot core turned off; bits 31:8 the
-rounds for each pair of cores. build/xtstress.bin (xtstress.c) is a tenth, execution tracking on
+rounds for each pair of cores. build/xtstress.bin (xtstress.c) is a ninth, execution tracking on
 several cores at once (R51): it needs --xtrack and 3 CPUs or more; --guest-arg bits 15:0 the
 seconds it runs, bits 23:16 how often it prints.
 
@@ -135,8 +135,8 @@ GICR_BASE = 0x51_0000_0000
 
 image = bytearray(args.payload.read_bytes())
 if image[MAGIC_OFF:MAGIC_OFF + len(MAGIC)] != MAGIC:
-    sys.exit(f"{args.payload}: not an sgitest, gictest, wfitest, pscitest, pmutest, xitest, "
-             "aictest, cputest, aicroute or xtstress image of this tree")
+    sys.exit(f"{args.payload}: not an sgitest, gictest, pscitest, pmutest, xitest, aictest, "
+             "cputest, aicroute or xtstress image of this tree")
 if struct.unpack_from("<Q", image, UART_BASE_OFF)[0] != 0:
     sys.exit(f"{args.payload}: UART base already filled in")
 

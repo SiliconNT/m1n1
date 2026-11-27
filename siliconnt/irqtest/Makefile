@@ -4,7 +4,7 @@
 # with src/hv/hv_xtrack.c and src/hv/hv_xinsn.c.
 #
 #   make               build/irqtest.bin, build/sgitest.bin, build/gictest.bin,
-#                      build/wfitest.bin, build/pscitest.bin, build/pmutest.bin,
+#                      build/pscitest.bin, build/pmutest.bin,
 #                      build/xitest.bin, build/aictest.bin, build/cputest.bin,
 #                      build/aicroute.bin and build/xtstress.bin, the raw images that
 #                      run_irqtest.py and run_sgitest.py load under the hypervisor;
@@ -25,7 +25,7 @@ CC := $(ARCH)gcc
 LD := $(ARCH)ld
 OBJCOPY := $(ARCH)objcopy
 
-# sgitest.c, gictest.c, wfitest.c and pscitest.c run with the MMU off (unaligned accesses fault) at an address
+# sgitest.c, gictest.c and pscitest.c run with the MMU off (unaligned accesses fault) at an address
 # they do not know
 SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 	-mgeneral-regs-only -mstrict-align -mcmodel=tiny -fno-pic -fno-pie \
@@ -34,7 +34,7 @@ SGI_CFLAGS := -O1 -Wall -Werror -ffreestanding -fno-builtin -nostdinc \
 .PHONY: anstest all clean
 .SECONDARY:
 
-all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin build/cputest.bin build/aicroute.bin build/xtstress.bin build/el2probe.bin build/stoptest.bin
+all: build/irqtest.bin build/sgitest.bin build/gictest.bin build/pscitest.bin build/pmutest.bin build/xitest.bin build/aictest.bin build/cputest.bin build/aicroute.bin build/xtstress.bin build/el2probe.bin build/stoptest.bin
 
 build/irqtest.o: irqtest.S
 	@mkdir -p build
@@ -50,14 +50,14 @@ build/sgitest-head.o: sgitest-head.S sgitest.h
 	@mkdir -p build
 	$(CC) -c -Wall -Werror -o $@ $<
 
-build/sgitest.o build/gictest.o build/wfitest.o build/pscitest.o build/pmutest.o build/aictest.o build/aicroute.o build/cputest.o build/xtstress.o: build/%.o: %.c sgitest.h gic.h cpuon.h
+build/sgitest.o build/gictest.o build/pscitest.o build/pmutest.o build/aictest.o build/aicroute.o build/cputest.o build/xtstress.o: build/%.o: %.c sgitest.h gic.h cpuon.h
 	@mkdir -p build
 	$(CC) -c $(SGI_CFLAGS) -o $@ $<
 
-build/sgitest.elf build/gictest.elf build/wfitest.elf build/pscitest.elf build/pmutest.elf build/aictest.elf build/aicroute.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
+build/sgitest.elf build/gictest.elf build/pscitest.elf build/pmutest.elf build/aictest.elf build/aicroute.elf: build/%.elf: build/sgitest-head.o build/%.o sgitest.ld
 	$(LD) -T sgitest.ld --build-id=none --no-warn-rwx-segments -o $@ build/sgitest-head.o build/$*.o
 
-build/sgitest.bin build/gictest.bin build/wfitest.bin build/pscitest.bin build/pmutest.bin build/aictest.bin build/aicroute.bin build/cputest.bin build/el2probe.bin: build/%.bin: build/%.elf
+build/sgitest.bin build/gictest.bin build/pscitest.bin build/pmutest.bin build/aictest.bin build/aicroute.bin build/cputest.bin build/el2probe.bin: build/%.bin: build/%.elf
 	$(OBJCOPY) -O binary $< $@
 
 # cputest reads the registers of cpuregs.h at EL1, and el2probe, which is no guest, at EL2

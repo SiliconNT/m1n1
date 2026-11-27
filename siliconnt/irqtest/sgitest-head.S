@@ -1,15 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * Entry points, exception vectors and the few things of sgitest, gictest and wfitest that
- * have to be exact instructions. The tests themselves are sgitest.c, gictest.c and wfitest.c.
+ * Entry points, exception vectors and the few things of sgitest and gictest that have to be
+ * exact instructions. The tests themselves are sgitest.c and gictest.c.
  * pscitest.c and aictest.c use the entry points, the vectors and the header.
  *
  * Raw image, position independent, MMU off, EL1h. The boot CPU enters at offset 0. Every
  * other CPU enters at the offset stored at SECONDARY_OFF, with its slot number in x0: the guest
  * turns it on with PSCI CPU_ON (cpuon.h) and gives the slot as the context of the call.
- * Nothing in this file executes WFI, and of the tests only wfitest does: M4 loses CPU state
- * there (src/kboot.c) unless the hypervisor traps it (src/hv/hv_wfi.c).
+ * Nothing in this file executes WFI. A guest that does (aicroute) relies on the hypervisor
+ * trapping it (src/hv/hv_wfi.c): M4 loses CPU state there otherwise (src/kboot.c).
  */
 
 #include "sgitest.h"
