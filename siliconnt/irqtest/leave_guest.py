@@ -10,7 +10,7 @@ import pathlib, sys
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / "proxyclient"))
 
-from m1n1.proxy import *
+from m1n1.proxy import UartInterface, M1N1Proxy, EXC_RET, START
 
 USER_INTERRUPT = 3 # HV_EVENT, m1n1/hv/types.py
 

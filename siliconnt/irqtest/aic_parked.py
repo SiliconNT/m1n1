@@ -49,43 +49,43 @@ class Parked:
         self.p.write32(self.regs["mask_clr"], self.regs["bit"])
 
 
-def probe(parked, trials, waits=(0.0, 0.1, 1.0), out=print, sleep=time.sleep):
+def probe(parked, trials, waits=(0.0, 0.1, 1.0)):
     """Raise the line `trials` times. Each time: who has an IRQ at each of `waits` seconds, with
     nobody reading the event; then the event read on each of them, the first again if there
     are several; then who still has one. Returns a list of dictionaries, one per trial, or
     None if a core had an IRQ before anything was raised (then nothing is raised)."""
     parked.quiet()
-    sleep(0.01)
+    time.sleep(0.01)
     before = parked.with_irq()
-    out(f"AIC, the line lowered and masked: cores with an IRQ {before}")
+    print(f"AIC, the line lowered and masked: cores with an IRQ {before}")
     if before:
-        out("  an IRQ that is not of this test: it is left alone, and nothing is raised")
+        print("  an IRQ that is not of this test: it is left alone, and nothing is raised")
         return None
     results = []
     for n in range(trials):
         parked.raise_unmasked()
         seen = []
         for wait in waits:
-            sleep(wait)
+            time.sleep(wait)
             seen.append(parked.with_irq())
         events = [(cpu, parked.event(cpu)) for cpu in seen[-1]]
         after = parked.with_irq()
         parked.quiet()
-        sleep(0.005)
+        time.sleep(0.005)
         left = parked.with_irq()
         results.append({"seen": seen, "events": events, "after": after, "left": left})
-        out(f"  raised #{n}: cores with an IRQ after {', '.join(f'{w:g}' for w in waits)} s (one "
+        print(f"  raised #{n}: cores with an IRQ after {', '.join(f'{w:g}' for w in waits)} s (one "
             f"after the other): {seen}; events " +
             " ".join(f"CPU {c}: 0x{e:x}" for c, e in events) +
             f"; after that {after}; lowered and masked {left}")
         sys.stdout.flush()
         if left:
-            out("  an IRQ is left after the line has been lowered and masked: stopping here")
+            print("  an IRQ is left after the line has been lowered and masked: stopping here")
             break
     counts = {}
     for r in results:
         key = tuple(r["seen"][0])
         counts[key] = counts.get(key, 0) + 1
-    out("Cores with an IRQ right after the raise, and how often: " +
+    print("Cores with an IRQ right after the raise, and how often: " +
         ", ".join(f"{list(k)}: {v}" for k, v in sorted(counts.items())))
     return results
