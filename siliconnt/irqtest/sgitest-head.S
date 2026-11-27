@@ -187,16 +187,6 @@ mmio_write32:
     str     w1, [x0]
     ret
 
-/*
- * u64 read_sgi1r(void): MRS of the write-only ICC_SGI1R_EL1, which the assembler would refuse
- * by name. UNDEFINED; sync_handler() skips it.
- */
-    .globl  read_sgi1r
-read_sgi1r:
-    mov     x0, #0
-    mrs     x0, s3_0_c12_c11_5
-    ret
-
     .bss
     .balign 16
     .globl  cpu_first_insn
