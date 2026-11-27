@@ -79,7 +79,8 @@ static bool hv_stack_marked[MAX_CPUS];
 static void hv_stack_range(int cpu, u64 *low, u64 *high)
 {
     if (cpu == boot_cpu_idx) {
-        *low = (u64)_stack_top;
+        /* The lowest page is a guard page: mmu_add_default_mappings() unmaps it (src/memory.c) */
+        *low = (u64)_stack_top + get_page_size();
         *high = (u64)_stack_bot;
     } else {
         *low = (u64)secondary_stacks[cpu];
