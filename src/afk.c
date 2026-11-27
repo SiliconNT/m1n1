@@ -112,17 +112,14 @@ enum AFKV2Category {
 enum AFKV2Report {
     V2_ANNOUNCE = 0x11,
     V2_OPEN = 0x12,
-    V2_TERMINATE = 0x14,
 };
 
 #define V2_INTERNAL  BIT(0)
-#define V2_CMD_OOB   BIT(0)
 #define V2_MAX_REPLY 0x1000
 
 struct afk_epic {
     rtkit_dev_t *rtk;
     bool v2;
-    bool failed; // an endpoint did not start, or did not shut down
 
     afk_epic_ep_t *endpoint[0x10];
 };
@@ -185,22 +182,13 @@ enum RBEP_MSG {
 
 #define EPIC_DATA_READY 13
 
-#define AFK_TIMEOUT (5 * USEC_PER_SEC)
-
 bool afk_rb_init(afk_epic_ep_t *epic, struct afk_rb *rb, u64 base, u64 size)
 {
-    if (!epic->buf.bfr || base + size > epic->buf.sz) {
-        printf("AFK: ring buffer is not inside of the buffer\n");
-        return false;
-    }
-
     struct afk_rb_hdr *hdr = epic->buf.bfr + base;
-    u32 bufsz = hdr->bufsz;
-    u32 block = (size - bufsz) / 3;
+    u32 block = (size - hdr->bufsz) / 3;
 
     /* V1: always 0x40 */
-    if (bufsz >= size || bufsz + 3 * block != size || block < (1 << BLOCK_SHIFT) ||
-        (block & (block - 1)) || size % block || (!epic->afk->v2 && block != (1 << BLOCK_SHIFT))) {
+    if (!epic->afk->v2 && hdr->bufsz + 3 * (1 << BLOCK_SHIFT) != size) {
         printf("AFK: ring buffer size mismatch\n");
         return false;
     }
@@ -208,14 +196,8 @@ bool afk_rb_init(afk_epic_ep_t *epic, struct afk_rb *rb, u64 base, u64 size)
     rb->rptr = (void *)hdr + block;
     rb->wptr = (void *)hdr + 2 * block;
     rb->buf = (void *)hdr + 3 * block;
-    rb->bufsz = bufsz;
+    rb->bufsz = hdr->bufsz;
     rb->block = block;
-
-    if (*rb->rptr >= bufsz || *rb->rptr % block || *rb->wptr >= bufsz || *rb->wptr % block) {
-        printf("AFK: bad ring buffer pointers\n");
-        return false;
-    }
-
     rb->ready = true;
 
     return true;
@@ -302,10 +284,6 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
         case RBEP_RECV: {
             dma_rmb();
             struct afk_rb *rb = &epic->rx;
-            if (!rb->ready) {
-                printf("EPIC: received data before the ring buffer\n");
-                break;
-            }
             if (*rb->rptr != *rb->wptr) {
                 if (endpoint == epic->ep)
                     return EPIC_DATA_READY;
@@ -315,10 +293,6 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
             break;
         }
         case RBEP_START_ACK:
-            if (!epic->rx.ready || !epic->tx.ready) {
-                printf("EPIC: started without the ring buffers\n");
-                return -1;
-            }
             epic->started = true;
             break;
 
@@ -346,15 +320,11 @@ static int afk_epic_rx(afk_epic_ep_t *epic, struct afk_qe **qe)
         return -1;
     }
 
-    if (hdr->size > rb->bufsz - rptr - sizeof(*hdr)) {
+    if (rptr + hdr->size > rb->bufsz) {
         rptr = 0;
         hdr = rb->buf + rptr;
         if (hdr->magic != QE_MAGIC) {
             printf("EPIC: bad queue entry magic!\n");
-            return -1;
-        }
-        if (hdr->size > rb->bufsz - sizeof(*hdr)) {
-            printf("EPIC: bad queue entry size!\n");
             return -1;
         }
         *rb->rptr = rptr;
@@ -491,68 +461,33 @@ static afk_epic_service_t *afk_epic_find_service(afk_epic_ep_t *epic, u32 channe
     return NULL;
 }
 
-/* NULL if it is none, or only a part of one */
-static struct afk_v2_msg *afk_v2_msg(struct afk_qe *qe)
+/* 1 and the next entry of the endpoint's ring, 0 when there is none yet */
+static int afk_v2_next(afk_epic_ep_t *epic, struct afk_qe **qe)
 {
-    struct afk_v2_msg *msg = (void *)qe->data;
+    int ret = afk_epic_work(epic->afk, epic->ep);
+    if (ret != EPIC_DATA_READY)
+        return ret;
 
-    if (qe->size < sizeof(*msg) || msg->len != qe->size - offsetof(struct afk_v2_msg, timestamp))
-        return NULL;
+    // will not block
+    ret = afk_epic_rx(epic, qe);
+    if (ret < 0)
+        return ret;
 
-    return msg;
-}
-
-static bool afk_v2_is_report(struct afk_v2_msg *msg, u8 type)
-{
-    return msg && msg->category == V2_REPORT && (msg->flags & V2_INTERNAL) && msg->type == type;
-}
-
-/*
- * 1 and the next entry of the endpoint's ring, or 0 at the timeout, or when it is shut down. The
- * time is looked at every round, whatever comes meanwhile, and only this endpoint's ring is.
- */
-static int afk_v2_wait(afk_epic_ep_t *epic, struct afk_qe **qe, u64 timeout)
-{
-    while (epic->started && !timeout_expired(timeout)) {
-        if (*epic->rx.rptr != *epic->rx.wptr) {
-            dma_rmb();
-            return afk_epic_rx(epic, qe);
-        }
-        int ret = afk_epic_poll(epic->afk, epic->ep, false);
-        if (ret < 0)
-            return ret;
-    }
-
-    return 0;
+    return 1;
 }
 
 /* Takes an entry nothing waits for out of the ring */
 static void afk_v2_pass(afk_epic_ep_t *epic, struct afk_qe *qe)
 {
-    struct afk_v2_msg *msg = afk_v2_msg(qe);
+    struct afk_v2_msg *msg = (void *)qe->data;
 
-    if (!msg) {
-        printf("AFK[ep:%02x]: ignoring %d bytes\n", epic->ep, qe->size);
-    } else {
-        printf("AFK[ep:%02x]: ignoring message %d:%02x on interface %d\n", epic->ep, msg->category,
-               msg->type, msg->iface);
-        if (afk_v2_is_report(msg, V2_TERMINATE)) {
-            afk_epic_service_t *service = afk_epic_find_service(epic, msg->iface);
-            if (service)
-                service->enabled = false;
-        }
-    }
-
+    printf("AFK[ep:%02x]: ignoring message %d:%02x on interface %d\n", epic->ep, msg->category,
+           msg->type, msg->iface);
     afk_epic_rx_ack(epic);
 }
 
 static int afk_v2_send(afk_epic_ep_t *epic, struct afk_v2_msg *msg, size_t size)
 {
-    if (!epic->started) {
-        printf("EPIC: endpoint 0x%02x is shut down\n", epic->ep);
-        return -1;
-    }
-
     msg->seq = epic->seq++;
     msg->len = size - offsetof(struct afk_v2_msg, timestamp);
 
@@ -567,12 +502,7 @@ static int afk_v2_command(afk_epic_ep_t *epic, int channel, u8 type, void *txbuf
                           void *rxbuf, size_t *rxsize)
 {
     const size_t hdrsize = sizeof(struct afk_v2_msg) + sizeof(struct afk_v2_cmd);
-
     afk_epic_service_t *service = afk_epic_find_service(epic, channel);
-    if (!service) {
-        printf("EPIC: no service on interface %d\n", channel);
-        return -1;
-    }
 
     struct afk_v2_msg *msg = calloc(1, hdrsize + txsize);
     if (!msg)
@@ -595,41 +525,38 @@ static int afk_v2_command(afk_epic_ep_t *epic, int channel, u8 type, void *txbuf
         return ret;
     }
 
-    u64 timeout = timeout_calculate(AFK_TIMEOUT);
+    struct afk_qe *qe;
 
-    while (service->enabled) {
-        struct afk_qe *qe;
-        ret = afk_v2_wait(epic, &qe, timeout);
+    while (true) {
+        ret = afk_v2_next(epic, &qe);
         if (ret < 0)
             return ret;
         else if (!ret)
+            continue;
+
+        msg = (void *)qe->data;
+        cmd = (void *)msg->data;
+        if (msg->category == V2_REPLY && msg->iface == channel && cmd->tag == tag)
             break;
 
-        msg = afk_v2_msg(qe);
-        cmd = msg ? (void *)msg->data : NULL;
-        if (!msg || msg->category != V2_REPLY || msg->iface != channel || qe->size < hdrsize ||
-            cmd->tag != tag) {
-            afk_v2_pass(epic, qe);
-            continue;
-        }
-
-        if (cmd->value || (cmd->flags & V2_CMD_OOB)) {
-            printf("EPIC: IOP returned 0x%x, flags 0x%x\n", cmd->value, cmd->flags);
-            ret = -1;
-        } else {
-            if (rxsize) {
-                *rxsize = min(*rxsize, qe->size - hdrsize);
-                memcpy(rxbuf, cmd->data, *rxsize);
-            }
-            ret = 0;
-        }
-
-        afk_epic_rx_ack(epic);
-        return ret;
+        afk_v2_pass(epic, qe);
     }
 
-    printf("EPIC: no reply to command\n");
-    return -1;
+    if (cmd->value) {
+        printf("EPIC: IOP returned 0x%x\n", cmd->value);
+        afk_epic_rx_ack(epic);
+        return -1;
+    }
+
+    if (rxsize) {
+        assert(*rxsize >= qe->size - hdrsize);
+        *rxsize = qe->size - hdrsize;
+        memcpy(rxbuf, cmd->data, *rxsize);
+    }
+
+    afk_epic_rx_ack(epic);
+
+    return 0;
 }
 
 struct epic_std_service_ap_call {
@@ -860,24 +787,12 @@ afk_epic_ep_t *afk_epic_start_ep(afk_epic_t *afk, int endpoint, const afk_epic_s
         goto err;
     }
 
-    u64 timeout = timeout_calculate(AFK_TIMEOUT);
-
-    while (!epic->started && !timeout_expired(timeout)) {
-        int ret = afk_epic_poll(epic->afk, endpoint, false);
+    while (!epic->started) {
+        int ret = afk_epic_poll(epic->afk, endpoint, true);
         if (ret < 0)
             break;
         else if (ret > 0)
             printf("EPIC: received unexpected message during init\n");
-    }
-
-    if (!epic->started) {
-        /*
-         * The firmware asserts on RBEP_SHUTDOWN for an endpoint that has not started, and on
-         * another RBEP_INIT (SiliconNT docs/findings/0083, conclusion 4). It keeps its buffer.
-         */
-        printf("EPIC: endpoint 0x%02x did not start\n", endpoint);
-        afk->failed = true;
-        goto err;
     }
 
     return epic;
@@ -891,29 +806,20 @@ err:
 int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
 {
     struct rtkit_message msg = {epic->ep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN)};
-    if (epic->started && !rtkit_send(epic->afk->rtk, &msg)) {
+    if (!rtkit_send(epic->afk->rtk, &msg)) {
         printf("EPIC: failed to send shutdown message\n");
-        epic->afk->failed = true;
         return -1;
     }
 
-    u64 timeout = timeout_calculate(AFK_TIMEOUT);
-
-    while (epic->started && !timeout_expired(timeout)) {
-        int ret = afk_epic_poll(epic->afk, epic->ep, false);
+    while (epic->started) {
+        int ret = afk_epic_poll(epic->afk, epic->ep, true);
         if (ret < 0)
             break;
     }
 
-    if (epic->started) {
-        /* It may use its buffers still */
-        printf("EPIC: endpoint 0x%02x did not shut down\n", epic->ep);
-        epic->afk->failed = true;
-    } else {
-        rtkit_free_buffer(epic->afk->rtk, &epic->buf);
-        rtkit_free_buffer(epic->afk->rtk, &epic->rxbuf);
-        rtkit_free_buffer(epic->afk->rtk, &epic->txbuf);
-    }
+    rtkit_free_buffer(epic->afk->rtk, &epic->buf);
+    rtkit_free_buffer(epic->afk->rtk, &epic->rxbuf);
+    rtkit_free_buffer(epic->afk->rtk, &epic->txbuf);
 
     epic->afk->endpoint[epic->ep - 0x20] = NULL;
 
@@ -943,24 +849,44 @@ static const afk_epic_service_ops_t *afk_match_service(afk_epic_ep_t *ep, const 
 static int afk_v2_start_interface(afk_epic_ep_t *epic, void *intf, int expected)
 {
     int services = 0;
-    u64 timeout = timeout_calculate(AFK_TIMEOUT);
+    struct afk_qe *qe;
 
-    while (services < expected) {
-        struct afk_qe *qe;
-        int ret = afk_v2_wait(epic, &qe, timeout);
+    while (true) {
+        int ret = afk_epic_work(epic->afk, epic->ep);
+        if (ret < 0)
+            return ret;
+        if (ret == EPIC_DATA_READY)
+            break;
+    }
+
+    u64 timeout = timeout_calculate(500000);
+
+    while (!timeout_expired(timeout)) {
+        int ret = afk_v2_next(epic, &qe);
         if (ret < 0)
             return ret;
         else if (!ret)
-            break;
+            continue;
 
-        struct afk_v2_msg *msg = afk_v2_msg(qe);
-        const afk_epic_service_ops_t *ops = NULL;
-
-        if (afk_v2_is_report(msg, V2_ANNOUNCE) && epic->num_channels < AFK_MAX_CHANNEL &&
-            qe->size >= sizeof(*msg) + sizeof(struct epic_announce))
-            ops = afk_match_service(epic, ((struct epic_announce *)msg->data)->name);
-        if (!ops) {
+        struct afk_v2_msg *msg = (void *)qe->data;
+        if (msg->category != V2_REPORT || !(msg->flags & V2_INTERNAL) || msg->type != V2_ANNOUNCE) {
             afk_v2_pass(epic, qe);
+            continue;
+        }
+
+        if (epic->num_channels >= AFK_MAX_CHANNEL) {
+            printf("AFK[ep:%02x]: Out of free service for service on interface %d\n", epic->ep,
+                   msg->iface);
+            afk_epic_rx_ack(epic);
+            continue;
+        }
+
+        struct epic_announce *announce = (void *)msg->data;
+        const afk_epic_service_ops_t *ops = afk_match_service(epic, announce->name);
+        if (!ops) {
+            printf("AFK[ep:%02x]: unable to match service %s on interface %d\n", epic->ep,
+                   announce->name, msg->iface);
+            afk_epic_rx_ack(epic);
             continue;
         }
 
@@ -975,11 +901,12 @@ static int afk_v2_start_interface(afk_epic_ep_t *epic, void *intf, int expected)
         ops->init(service, NULL, ops->name, -1);
 
         afk_epic_rx_ack(epic);
-        services++;
+        if (++services >= expected)
+            break;
     }
 
     if (!services) {
-        printf("AFK[ep:%02x]: no service announced\n", epic->ep);
+        printf("AFK[ep:%02x]: too many unexpected messages, giving up\n", epic->ep);
         return -1;
     }
 
@@ -1131,22 +1058,14 @@ int afk_epic_open(afk_epic_ep_t *epic, int channel, u32 settle)
         .flags = V2_INTERNAL,
     };
     struct afk_qe *qe;
-    int ret;
+    u64 end = timeout_calculate(settle);
 
-    if (!epic->afk->v2) {
-        printf("EPIC: endpoint 0x%02x does not speak V2\n", epic->ep);
-        return -1;
-    }
-
-    u64 timeout = timeout_calculate(settle);
-    while ((ret = afk_v2_wait(epic, &qe, timeout)) > 0)
-        afk_v2_pass(epic, qe);
-    if (ret < 0)
-        return ret;
-
-    if (!afk_epic_find_service(epic, channel)) {
-        printf("EPIC: no service on interface %d\n", channel);
-        return -1;
+    while (!timeout_expired(end)) {
+        int ret = afk_v2_next(epic, &qe);
+        if (ret < 0)
+            return ret;
+        else if (ret)
+            afk_v2_pass(epic, qe);
     }
 
     return afk_v2_send(epic, &msg, sizeof(msg));
@@ -1155,6 +1074,11 @@ int afk_epic_open(afk_epic_ep_t *epic, int channel, u32 settle)
 void afk_epic_set_v2(afk_epic_t *afk)
 {
     afk->v2 = true;
+}
+
+bool afk_epic_is_v2(afk_epic_t *afk)
+{
+    return afk->v2;
 }
 
 afk_epic_t *afk_epic_init(rtkit_dev_t *rtkit)
@@ -1176,8 +1100,7 @@ int afk_epic_shutdown(afk_epic_t *afk)
         if (afk->endpoint[i])
             afk_epic_shutdown_ep(afk->endpoint[i]);
 
-    bool failed = afk->failed;
     free(afk);
 
-    return failed ? -1 : 0;
+    return 0;
 }

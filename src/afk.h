@@ -39,6 +39,7 @@ afk_epic_t *afk_epic_init(rtkit_dev_t *rtkit);
 int afk_epic_shutdown(afk_epic_t *afk);
 /* Endpoints that are started speak V2 from then on, and not V1 */
 void afk_epic_set_v2(afk_epic_t *afk);
+bool afk_epic_is_v2(afk_epic_t *afk);
 
 afk_epic_ep_t *afk_epic_start_ep(afk_epic_t *afk, int endpoint, const afk_epic_service_ops_t *ops,
                                  bool notify);

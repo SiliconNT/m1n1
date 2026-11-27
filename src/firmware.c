@@ -289,17 +289,21 @@ bool firmware_sfw_in_range(enum fw_version lower_bound, enum fw_version upper_bo
 }
 
 /*
- * OS firmware with which DCP was seen to change the format of the surface iBoot left (SiliconNT
- * docs/findings/0083). Its iBoot interface has no stable ABI: exactly these versions.
+ * Major versions of the OS firmware, the first number after "mBoot-", with which DCP changes the
+ * format of the surface iBoot left (SiliconNT docs/findings/0083). Its iBoot interface has no
+ * stable ABI.
  */
-static const char *const dcp_set_surface_verified[] = {
-    "mBoot-20457.41.3", // macOS 27.2, T8132
+static const u32 dcp_set_surface_verified[] = {
+    20457, // macOS 27.0 to 27.3 beta 1, seen on 27.2
 };
 
 bool firmware_dcp_set_surface_verified(void)
 {
+    u32 ver[IBOOT_VER_COMP];
+
+    firmware_parse_version(os_firmware.iboot, ver);
     for (size_t i = 0; i < ARRAY_SIZE(dcp_set_surface_verified); i++)
-        if (os_firmware.iboot && !strcmp(os_firmware.iboot, dcp_set_surface_verified[i]))
+        if (ver[0] == dcp_set_surface_verified[i])
             return true;
 
     return false;

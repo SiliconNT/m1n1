@@ -41,14 +41,10 @@ typedef struct dcp_dev {
     u32 hdmi_pwr_gpio;
 } dcp_dev_t;
 
-/* It may be awake, or is half set up: not to be touched until the next boot */
-extern bool dcp_abandoned;
-
 int dcp_connect_dptx(dcp_dev_t *dcp);
 int dcp_work(dcp_dev_t *dcp);
 
-/* as_left: what iBoot has set up is not added to, and DCP is not reset */
-dcp_dev_t *dcp_init(const display_config_t *config, bool as_left);
+dcp_dev_t *dcp_init(const display_config_t *config);
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep);
 

@@ -33,7 +33,6 @@ struct dcp_iboot_if {
     afk_epic_ep_t *epic;
     int channel;
     bool enabled;
-    bool v2;
 
     union {
         u8 txbuf[TXBUF_LEN];
@@ -137,7 +136,6 @@ dcp_iboot_if_t *dcp_ib_init(dcp_dev_t *dcp, bool v2)
     if (!iboot)
         return NULL;
 
-    iboot->v2 = v2;
     if (v2)
         afk_epic_set_v2(dcp->afk);
 
@@ -196,7 +194,8 @@ int dcp_ib_set_surface(dcp_iboot_if_t *iboot, dcp_layer_t *layer)
     memset(cmd, 0, sizeof(*cmd));
     cmd->layer = *layer;
 
-    return dcp_ib_cmd(iboot, IBOOT_SET_SURFACE, iboot->v2 ? sizeof(*cmd) : sizeof(*layer));
+    return dcp_ib_cmd(iboot, IBOOT_SET_SURFACE,
+                      afk_epic_is_v2(iboot->dcp->afk) ? sizeof(*cmd) : sizeof(*layer));
 }
 
 int dcp_ib_set_power(dcp_iboot_if_t *iboot, bool power)

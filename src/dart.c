@@ -622,9 +622,6 @@ void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
             return;
         }
     }
-    /* Left there by iBoot */
-    if (!is_heap(l2))
-        return;
     dart->l1[ttbr][l1_index] = 0;
     free(l2);
 }

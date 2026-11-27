@@ -269,11 +269,6 @@ const display_config_t *display_get_config(void)
 
 static int display_do_start_dcp(bool v2)
 {
-    if (dcp_abandoned) {
-        printf("display: DCP failed before, leaving it alone\n");
-        return -1;
-    }
-
     if (iboot)
         return 0;
 
@@ -291,7 +286,7 @@ static int display_do_start_dcp(bool v2)
 
     display_is_dptx = !!disp_cfg->dptx_phy[0];
 
-    dcp = dcp_init(disp_cfg, v2);
+    dcp = dcp_init(disp_cfg);
     if (!dcp) {
         printf("display: failed to initialize DCP\n");
         return -1;
@@ -311,7 +306,7 @@ static int display_do_start_dcp(bool v2)
     fb_dva = dart_search(dcp->dart_disp, (void *)cur_boot_args.video.base);
     // framebuffer is not mapped on the M1 Ultra Mac Studio
     if (DART_IS_ERR(fb_dva) || !fb_dva)
-        fb_dva = v2 ? DART_PTR_ERR : display_map_fb(0, pa, size);
+        fb_dva = display_map_fb(0, pa, size);
     if (DART_IS_ERR(fb_dva)) {
         printf("display: failed to find display DVA\n");
         fb_dva = 0;
@@ -648,14 +643,13 @@ static int display_set_bgra(void)
         return ret;
     }
 
-    int timing_cnt, color_cnt;
-    int hpd = dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt);
+    int hpd = dcp_ib_get_hpd(iboot, NULL, NULL);
     if (hpd < 0) {
         printf("display: failed to get display status\n");
         return hpd;
     }
-    if (!hpd || !timing_cnt || !color_cnt) {
-        printf("display: connected:%d timing_cnt:%d color_cnt:%d\n", hpd, timing_cnt, color_cnt);
+    if (!hpd) {
+        printf("display: not connected\n");
         return -1;
     }
 
@@ -732,12 +726,11 @@ int display_init(void)
 #endif
     } else {
         if (!display_is_external && (cur_boot_args.video.depth & FB_DEPTH_MASK) == 30 &&
-            firmware_dcp_set_surface_verified() && !dcp_abandoned) {
+            firmware_dcp_set_surface_verified()) {
             printf("display: Internal display with 10 bits per color, changing to BGRA\n");
             if (display_set_bgra() > 0)
                 return 1;
             printf("display: failed to change to BGRA, leaving the display as it is\n");
-            dcp_abandoned = true;
         }
         printf("display: Display is already initialized (%ldx%ld)\n", cur_boot_args.video.width,
                cur_boot_args.video.height);
